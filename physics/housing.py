@@ -197,3 +197,17 @@ def fixture_nodes(model, L, fixture):
         sel = (P[:, 2] > zmax - 1e-6) & (r > OD / 2 - 0.75 * h)
         return np.where(sel)[0]
     raise ValueError("fixture must be 'base' or 'flange'")
+
+
+def wetted_face_mask(thermal_model, L):
+    """True for faces that touch oil: cavity walls and bearing bores; False = outside air."""
+    c, n = thermal_model.centres, thermal_model.normals
+    h = thermal_model.m.h
+    probe = c + 0.5 * h * n                       # just outside the face, in the fluid
+    I = L["inner"]
+    in_cav = ((probe[:, 0] > I["x0"]) & (probe[:, 0] < I["x1"]) & (probe[:, 1] > I["y0"])
+              & (probe[:, 1] < I["y1"]) & (probe[:, 2] > I["z0"]) & (probe[:, 2] < I["z1"]))
+    in_bore = np.zeros(len(c), bool)
+    for x, (bore, OD, Bw) in zip(L["shaft_x_mm"], L["bearings"]):
+        in_bore |= np.hypot(probe[:, 0] - x, probe[:, 1]) < OD / 2
+    return in_cav | in_bore
