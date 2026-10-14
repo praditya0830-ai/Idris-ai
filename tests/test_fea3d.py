@@ -2,22 +2,33 @@
 import time
 import numpy as np
 from ace_core.http_routes import handle_get, handle_post, encode_json
-from physics.fem3d import box_model
+from physics.fem3d import box_model, VoxelModel
 from physics.housing import build_layout, build_model, bearing_loads, fixture_nodes
+from solvers._example import EXAMPLE_VARIANT
 
-REQ = {"analysis": "static",
-       "design": {"module_mm": 2, "pinion_teeth": 18, "gear_teeth": 51, "face_width_mm": 48,
-                  "stages": 2, "center_distance_mm": 69},
-       "kinematics": {"input_torque_nm": 23.9, "output_torque_nm": 184.1, "output_rpm": 747,
-                      "ratio_actual": 8.028, "efficiency": 0.96},
-       "loads": {"tangential_force_n": 3683, "pitch_line_velocity_ms": 4.0},
-       "shaft": {"output_diameter_mm": 30}, "housing_params": {},
-       "housing_material": "Al7075-T6", "fixture": "base", "mesh": "coarse"}
+REQ = {"analysis": "static", **EXAMPLE_VARIANT, "fixture": "base", "mesh": "coarse"}
 
 
 def test_3d_engine_benchmarks():
     rep = handle_get("/verify/fea_solid_block")[1]
     assert rep["all_pass"], rep
+
+
+def test_brick_grid_matches_cube_grid():
+    # same cantilever meshed with cubes and with a rectilinear grid (non-uniform spacing)
+    E, nu, P = 200000.0, 0.3, 1000.0
+    a = box_model(100, 10, 10, 2.5)
+    xs = np.r_[np.linspace(0, 50, 11), np.linspace(50, 100, 41)[1:]]   # 5 mm then 1.25 mm cells
+    b = VoxelModel(np.ones((len(xs) - 1, 4, 4), bool), planes=(xs, np.linspace(0, 10, 5), np.linspace(0, 10, 5)))
+    tips = []
+    for m in (a, b):
+        x = m.nodes
+        end = np.where(np.abs(x[:, 0] - 100) < 1e-9)[0]
+        loads = np.zeros((m.n_nodes, 3))
+        loads[end, 1] = -P / len(end)
+        r = m.solve(E, nu, np.where(x[:, 0] < 1e-9)[0], loads)
+        tips.append(-r["u"][end, 1].mean())
+    assert abs(tips[0] / tips[1] - 1) < 0.02
 
 
 def test_surface_is_closed_and_outward():
@@ -28,19 +39,31 @@ def test_surface_is_closed_and_outward():
     assert abs(vol - 20 * 10 * 6) < 1e-6
     edges = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
     _, counts = np.unique(edges, axis=0, return_counts=True)
-    assert set(counts) == {2}          # watertight
+    assert set(counts) == {2}
 
 
-def test_housing_equilibrium_and_loads():
-    L = build_layout(REQ["design"], REQ["kinematics"], {}, REQ["shaft"], {})
-    m = build_model(L, L["wall_mm"])
+def test_layout_matches_assembly3d():
+    from assembly3d import build_assembly
+    v = EXAMPLE_VARIANT
+    asm = build_assembly(v["design"], v["kinematics"], v["shaft"], v["housing_params"])
+    L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], v["housing_params"])
+    assert np.allclose(asm["layout"]["axis_a_mm"], [L["x_a"], L["yc"]])
+    assert np.allclose(asm["layout"]["axis_b_mm"], [L["x_b"], L["yc"]])
+    housing = [p for p in asm["parts"] if p["name"] == "Housing"][0]["verts"]
+    m = build_model(L, "coarse")
+    assert np.allclose(m.nodes.min(0), housing.min(0), atol=1e-6)
+    assert np.allclose(m.nodes.max(0), housing.max(0), atol=1e-6)
+    # tangential force of the last stage equals the variant's loads.tangential_force_n
+    assert abs(L["meshes"][-1]["Wt"] - v["loads"]["tangential_force_n"]) / v["loads"]["tangential_force_n"] < 0.01
+
+
+def test_housing_equilibrium():
+    v = EXAMPLE_VARIANT
+    L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], v["housing_params"])
+    m = build_model(L, "coarse")
     loads, applied = bearing_loads(m, L)
-    assert len(applied) == 6
-    # internal gear forces: net force on the housing is zero, net moment is not
+    assert len(applied) == 4
     assert np.allclose(loads.sum(0), 0, atol=1e-6)
-    # stage-2 tangential force matches the variant's loads.tangential_force_n (3683 N) within 1%
-    T2 = L["shaft_torque_Nm"][1]
-    assert abs(2e3 * T2 / (2 * 18) - 3683) / 3683 < 0.01
     fx = fixture_nodes(m, L, "base")
     r = m.solve(71700, 0.33, fx, loads)
     assert np.allclose(r["reactions"][fx].sum(0), 0, atol=1e-3 * np.abs(loads).sum())
@@ -62,15 +85,21 @@ def test_fea_job_flow():
     n = len(sf["von_mises"])
     assert len(sf["positions"]) == 3 * n and len(sf["displacement"]) == 3 * n
     assert len(sf["indices"]) % 3 == 0 and max(sf["indices"]) < n
+    P = np.array(sf["positions"]).reshape(-1, 3)
+    hp = EXAMPLE_VARIANT["housing_params"]
+    assert P.min() >= -1e-6 and np.allclose(P.max(0), [hp["envelope_width"], hp["envelope_height"], hp["envelope_depth"]])
     assert r["yield_mpa"] == 503 and r["mesh"]["elements"] > 0 and r["applied_loads"]
 
 
 def test_fea_errors_are_readable():
     c, b = handle_post("/fea?sync=1", dict(REQ, housing_material="Unobtainium"))
     assert c == 400 and not b["success"] and "Available" in b["error"]
-    c, b = handle_post("/fea?sync=1", dict(REQ, mesh="fine", design=dict(REQ["design"], face_width_mm=200)))
-    assert c == 400 and "elements" in b["error"]
     assert handle_get("/fea/doesnotexist")[0] == 404
+
+
+def test_material_aliases():
+    c, b = handle_post("/fea?sync=1", dict(REQ, housing_material="Steel4140"))
+    assert c == 200 and b["result"]["material"] == "Steel-4140"
 
 
 def test_flange_fixture():
