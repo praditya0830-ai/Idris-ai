@@ -24,19 +24,23 @@ _FACES = {
 }
 
 
-def cube_conductivity(h, k_W_mK):
-    """8x8 conduction matrix of a cube of edge h [mm], k in W/(m·K) -> W/K."""
+def brick_conductivity(hx, hy, hz, k_W_mK):
+    """8x8 conduction matrix of an hx×hy×hz brick [mm], k in W/(m·K) -> W/K."""
     k = k_W_mK * 1e-3                                   # W/(mm·K)
-    J = h / 2
+    Jd = np.array([hx, hy, hz]) / 2
     g = 1 / math.sqrt(3)
     Ke = np.zeros((8, 8))
     for xi in (-g, g):
         for eta in (-g, g):
             for ze in (-g, g):
                 p = np.array([xi, eta, ze])
-                dN = 0.125 * _LOC * np.prod(1 + _LOC * p, axis=1)[:, None] / (1 + _LOC * p) / J
-                Ke += k * dN @ dN.T * J**3
+                dN = 0.125 * _LOC * np.prod(1 + _LOC * p, axis=1)[:, None] / (1 + _LOC * p) / Jd
+                Ke += k * (dN @ dN.T) * np.prod(Jd)
     return Ke
+
+
+def cube_conductivity(h, k_W_mK):
+    return brick_conductivity(h, h, h, k_W_mK)
 
 
 def boundary_faces(model):
@@ -54,8 +58,9 @@ def boundary_faces(model):
             continue
         c = sel[:, None, :] + np.array(corners)[None]
         gid = (c[..., 0] * (ny + 1) + c[..., 1]) * (nz + 1) + c[..., 2]
-        quads.append(np.searchsorted(model._used, gid))
-        centres.append(model.origin + model.h * (sel + 0.5 + 0.5 * np.array(d)))
+        q = np.searchsorted(model._used, gid)
+        quads.append(q)
+        centres.append(model.nodes[q].mean(axis=1))      # works for stretched voxel grids too
         normals.append(np.repeat(np.array(d, float)[None], len(sel), 0))
     return np.concatenate(quads), np.concatenate(centres), np.concatenate(normals)
 
@@ -63,24 +68,28 @@ def boundary_faces(model):
 class ThermalModel:
     def __init__(self, model, k_W_mK):
         self.m = model
-        self.Ke = cube_conductivity(model.h, k_W_mK)
         self.el = model.elems
-        self.flat = self.el.ravel()
         self.n = model.n_nodes
-        self.diagK = np.bincount(self.flat, weights=np.tile(np.diag(self.Ke), len(self.el)), minlength=self.n)
+        self.G = [(self.el[idx], brick_conductivity(hx, hy, hz, k_W_mK)) for idx, (hx, hy, hz) in model.groups]
+        self.diagK = np.zeros(self.n)
+        for e_g, K_g in self.G:
+            self.diagK += np.bincount(e_g.ravel(), weights=np.tile(np.diag(K_g), len(e_g)), minlength=self.n)
         self.quads, self.centres, self.normals = boundary_faces(model)
-        self.face_area_mm2 = model.h ** 2
+        q = model.nodes[self.quads]                     # (F, 4, 3) rectangle corners
+        self.face_area = np.linalg.norm(np.cross(q[:, 1] - q[:, 0], q[:, 3] - q[:, 0]), axis=1)   # mm²
 
     def node_conductance(self, face_mask, h_W_m2K):
         """Lumped convective conductance per node [W/K] for the selected faces."""
         g = np.zeros(self.n)
-        w = h_W_m2K * 1e-6 * self.face_area_mm2 / 4
-        np.add.at(g, self.quads[face_mask].ravel(), w)
+        w = h_W_m2K * 1e-6 * self.face_area[face_mask] / 4
+        np.add.at(g, self.quads[face_mask].ravel(), np.repeat(w, 4))
         return g
 
     def _A(self, x, G):
-        fe = x[self.el] @ self.Ke
-        return np.bincount(self.flat, weights=fe.ravel(), minlength=self.n) + G * x
+        out = G * x
+        for e_g, K_g in self.G:
+            out += np.bincount(e_g.ravel(), weights=(x[e_g] @ K_g).ravel(), minlength=self.n)
+        return out
 
     def solve_linear(self, G, rhs, x0=None, tol=1e-9, max_iter=20000):
         """(K + diag(G)) x = rhs by Jacobi-PCG."""

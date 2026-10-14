@@ -1,13 +1,14 @@
-"""Gearbox housing model for 3D FEA: geometry (voxels), bearing loads and fixtures.
+"""Gearbox housing model for 3D analyses — SAME geometry and frame as assembly3d.py.
 
-Coordinate frame (MUST match /generate-assembly; see FRAME notes in fea_api.py):
-  shafts run along +z, input shaft axis at x=0, y=0; stage-1 mesh at the front (low z).
-  housing_params may override any dimension and add frame_offset_mm [dx, dy, dz].
+Frame (identical to /generate-assembly STL): housing occupies x∈[0,W], y∈[0,H], z∈[0,D] mm,
+shafts parallel to +z at y = H/2. 1 stage: input axis A, output axis B. 2 stages ("reverted"):
+input and output coaxial on axis A, intermediate shaft on axis B. Bores: front wall at axis A
+(Ø input+2), back wall at the output axis (Ø output+2), exactly as assembly3d.build_housing.
 """
 import math
 import numpy as np
 from .fem3d import VoxelModel
-from .bearings import DEEP_GROOVE, STANDARD_BORES
+from .gears import ALPHA, CLEARANCE, ETA_STAGE, STAGE_GAP, shaft_diameter_mm
 
 HOUSING_MATERIALS = {
     # name: (E MPa, nu, yield MPa, density kg/m3, note)
@@ -24,190 +25,282 @@ HOUSING_MATERIALS = {
 
 
 def find_material(name):
+    """Accepts 'Al7075-T6', 'Steel4140', 'steel 4140', ... -> canonical key or None."""
     if not isinstance(name, str):
         return None
-    key = name.replace(" ", "").lower()
+    norm = lambda s: s.replace(" ", "").replace("-", "").replace("_", "").lower()
     for k in HOUSING_MATERIALS:
-        if k.replace(" ", "").lower() == key:
+        if norm(k) == norm(name):
             return k
     return None
 
 
-def _bearing_for_bore(d):
-    """Medium-series (62xx) deep-groove bearing for a bore >= d; returns (bore, OD, width)."""
-    for b in STANDARD_BORES:
-        if b >= d - 1e-9:
-            for des, (bd, D, B, C, C0) in DEEP_GROOVE.items():
-                if bd == b and des.startswith("62"):
-                    return b, D, B
-    return d, 1.8 * d, 0.4 * d          # beyond catalog: proportional estimate
-
-
-def _shaft_dia_for_torque(T_Nm, tau_allow=40.0):
-    return (16 * abs(T_Nm) * 1e3 / (math.pi * tau_allow)) ** (1 / 3)
-
-
-def _num(d, k, default):
+def _num(d, k, default=None):
     v = d.get(k) if isinstance(d, dict) else None
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else default
 
 
 def build_layout(design, kinematics, loads, shaft, hp):
-    """Shaft positions, gear forces and housing dimensions from a /generate-variants variant."""
+    """Positions, shaft sizes, gear forces and housing box — mirrors assembly3d.build_assembly."""
     m = float(design["module_mm"])
-    Np, Ng = int(design["pinion_teeth"]), int(design["gear_teeth"])
-    F = float(design["face_width_mm"])
+    zp, zg = int(design["pinion_teeth"]), int(design["gear_teeth"])
+    b = float(design["face_width_mm"])
     stages = int(design.get("stages", 1))
     if stages not in (1, 2):
-        raise ValueError("only 1- or 2-stage housings are supported")
-    a = float(design.get("center_distance_mm") or m * (Np + Ng) / 2)
-    eff = float(kinematics.get("efficiency", 0.97))
+        raise ValueError("only 1- or 2-stage gearboxes are supported")
+    a = m * (zp + zg) / 2.0
+    dp, dg = m * zp, m * zg
+    dap, dag = m * (zp + 2), m * (zg + 2)
+    u = zg / zp
     T_in = float(kinematics["input_torque_nm"])
-    i_stage = Ng / Np
-    eff_stage = eff ** (1 / stages)
-    dp, dg = m * Np, m * Ng
-    dpo, dgo = dp + 2 * m, dg + 2 * m
+    d_in = shaft_diameter_mm(T_in)
+    d_out = _num(shaft, "output_diameter_mm") or shaft_diameter_mm(T_in * u ** stages * ETA_STAGE ** stages)
+    d_mid = shaft_diameter_mm(T_in * u * ETA_STAGE) if stages == 2 else None
 
-    layout = (hp.get("layout") if isinstance(hp, dict) else None) or "inline"
-    xs = [0.0, a] if stages == 1 else ([0.0, a, 2 * a] if layout == "inline" else [0.0, a, 0.0])
-    if stages == 2 and layout != "inline":
-        raise ValueError("only inline shaft layout supported for 2 stages (reverted: roadmap)")
+    t = _num(hp, "wall_thickness", 4.0)
+    if stages == 1:
+        x_a = t + CLEARANCE + dap / 2.0
+        x_b = x_a + a
+        x_right = x_b + dag / 2.0 + CLEARANCE + t
+        d_need = b + 2 * CLEARANCE + 2 * t
+    else:
+        x_a = t + CLEARANCE + dag / 2.0
+        x_b = x_a + a
+        x_right = x_b + dag / 2.0 + CLEARANCE + t
+        d_need = 2 * b + STAGE_GAP + 2 * CLEARANCE + 2 * t
+    h_need = max(dap, dag) + 2 * CLEARANCE + 2 * t
+    W = _num(hp, "envelope_width", math.ceil(x_right))
+    H = _num(hp, "envelope_height", math.ceil(h_need))
+    D = _num(hp, "envelope_depth", math.ceil(d_need))
+    if x_right > W + 1.0 or d_need > D + 1.0 or h_need > H + 1.0:
+        raise ValueError("housing envelope is too small for this gear layout")
+    shift = (W - x_right) / 2.0
+    x_a += shift
+    x_b += shift
+    yc = H / 2.0
+    z1 = t + CLEARANCE
+    z2 = z1 + b + STAGE_GAP
 
-    clr = _num(hp, "clearance_mm", max(3.0, 1.5 * m))
-    t = _num(hp, "wall_thickness_mm", max(4.0, round(0.06 * dgo + 1)))
-    gap = _num(hp, "axial_gap_mm", max(4.0, 0.25 * F))
-    depth_in = stages * F + (stages + 1) * gap
-    z_mesh = [gap + F / 2 + s * (F + gap) for s in range(stages)]   # interior z of each mesh
+    # shafts (z extents as in assembly3d)
+    if stages == 1:
+        shafts = [{"name": "Input shaft", "x": x_a, "d": d_in, "z0": -22.0, "z1": z1 + b, "torque": T_in,
+                   "rpm_factor": 1.0},
+                  {"name": "Output shaft", "x": x_b, "d": d_out, "z0": z1, "z1": D + 22.0,
+                   "torque": T_in * u * ETA_STAGE, "rpm_factor": 1 / u}]
+        gears = [{"name": "Pinion", "shaft": 0, "x": x_a, "z0": z1, "d": dp, "tip": dap, "teeth": zp, "stage": 0},
+                 {"name": "Gear", "shaft": 1, "x": x_b, "z0": z1, "d": dg, "tip": dag, "teeth": zg, "stage": 0}]
+        bores = [{"wall": "front", "x": x_a, "d": d_in + 2, "shaft": 0},
+                 {"wall": "back", "x": x_b, "d": d_out + 2, "shaft": 1}]
+    else:
+        shafts = [{"name": "Input shaft", "x": x_a, "d": d_in, "z0": -22.0, "z1": z1 + b, "torque": T_in,
+                   "rpm_factor": 1.0},
+                  {"name": "Intermediate shaft", "x": x_b, "d": d_mid, "z0": 0.4 * t, "z1": D - 0.4 * t,
+                   "torque": T_in * u * ETA_STAGE, "rpm_factor": 1 / u},
+                  {"name": "Output shaft", "x": x_a, "d": d_out, "z0": z2, "z1": D + 22.0,
+                   "torque": T_in * u * u * ETA_STAGE ** 2, "rpm_factor": 1 / u ** 2}]
+        gears = [{"name": "Pinion (stage 1)", "shaft": 0, "x": x_a, "z0": z1, "d": dp, "tip": dap, "teeth": zp, "stage": 0},
+                 {"name": "Gear (stage 1)", "shaft": 1, "x": x_b, "z0": z1, "d": dg, "tip": dag, "teeth": zg, "stage": 0},
+                 {"name": "Pinion (stage 2)", "shaft": 1, "x": x_b, "z0": z2, "d": dp, "tip": dap, "teeth": zp, "stage": 1},
+                 {"name": "Gear (stage 2)", "shaft": 2, "x": x_a, "z0": z2, "d": dg, "tip": dag, "teeth": zg, "stage": 1}]
+        bores = [{"wall": "front", "x": x_a, "d": d_in + 2, "shaft": 0},
+                 {"wall": "back", "x": x_a, "d": d_out + 2, "shaft": 2}]
 
-    # torques per shaft and shaft diameters
-    T = [T_in]
+    # gear mesh forces (on each gear, from its mate). Input turns CCW about +z.
+    meshes = []
     for s in range(stages):
-        T.append(T[-1] * i_stage * eff_stage)
-    d_out = _num(shaft, "output_diameter_mm", _shaft_dia_for_torque(T[-1]))
-    d_sh = [max(10.0, _shaft_dia_for_torque(Ti)) for Ti in T[:-1]] + [d_out]
-    brg = [_bearing_for_bore(d) for d in d_sh]
-
-    # gear forces on shafts (input turns CCW about +z, pinions drive)
-    forces = [[] for _ in xs]                      # per shaft: (z, Fx, Fy)
-    for s in range(stages):
-        p_idx, g_idx = s, s + 1
-        e = np.array([xs[g_idx] - xs[p_idx], 0.0])
+        pin = gears[2 * s]
+        gear = gears[2 * s + 1]
+        T_p = T_in * (u * ETA_STAGE) ** s
+        Wt = 2000.0 * T_p / dp
+        Wr = Wt * math.tan(ALPHA)
+        e = np.array([gear["x"] - pin["x"], 0.0])
         e /= np.linalg.norm(e)
-        tdir = np.array([-e[1], e[0]])             # z x e
-        sign = 1 if s % 2 == 0 else -1             # each stage reverses rotation
-        Wt = 2e3 * T[s] / dp
-        Wr = Wt * math.tan(math.radians(20))
-        f_gear = Wr * e + sign * Wt * tdir
-        forces[g_idx].append((z_mesh[s], *f_gear))
-        forces[p_idx].append((z_mesh[s], *(-f_gear)))
-
-    half_y = dgo / 2 + clr
-    x_min = min(xs[0] - dpo / 2, xs[1] - dgo / 2) - clr
-    x_max = max(x + dgo / 2 for x in xs[1:]) + clr
-    W_in = _num(hp, "inner_width_mm", x_max - x_min)
-    H_in = _num(hp, "inner_height_mm", 2 * half_y)
-    D_in = _num(hp, "inner_depth_mm", depth_in)
-    x0 = x_min - (W_in - (x_max - x_min)) / 2
-    return {
-        "module_mm": m, "stages": stages, "center_distance_mm": a, "shaft_x_mm": xs,
-        "shaft_torque_Nm": T, "shaft_dia_mm": d_sh, "bearings": brg, "forces": forces,
-        "wall_mm": t, "boss_mm": _num(hp, "boss_height_mm", t),
-        "inner": {"x0": x0, "x1": x0 + W_in, "y0": -H_in / 2, "y1": H_in / 2, "z0": 0.0, "z1": D_in},
-        "offset": np.array(hp.get("frame_offset_mm", [0, 0, 0]) if isinstance(hp, dict) else [0, 0, 0], float),
-    }
+        tdir = np.array([-e[1], e[0]])
+        sign = 1.0 if s % 2 == 0 else -1.0
+        f_on_gear = Wr * e + sign * Wt * tdir
+        zc = pin["z0"] + b / 2
+        meshes.append({"stage": s, "z": zc, "Wt": Wt, "Wr": Wr, "pinion": 2 * s, "gear": 2 * s + 1,
+                       "f_on_gear": f_on_gear, "f_on_pinion": -f_on_gear})
+    return {"stages": stages, "module_mm": m, "face_width_mm": b, "teeth": (zp, zg),
+            "center_distance_mm": a, "W": W, "H": H, "D": D, "wall_mm": t, "yc": yc, "z1": z1, "z2": z2,
+            "x_a": x_a, "x_b": x_b, "shafts": shafts, "gears": gears, "bores": bores, "meshes": meshes,
+            "input_torque_Nm": T_in,
+            "inner": {"x0": t, "x1": W - t, "y0": t, "y1": H - t, "z0": t, "z1": D - t},
+            "offset": np.zeros(3)}
 
 
-def voxelize(L, h):
-    """Occupancy grid of the housing: closed box, bearing bores in front/back walls, bosses."""
-    t, b, I = L["wall_mm"], L["boss_mm"], L["inner"]
-    lo = np.array([I["x0"] - t, I["y0"] - t, I["z0"] - t - b])
-    hi = np.array([I["x1"] + t, I["y1"] + t, I["z1"] + t + b])
-    n = np.maximum(1, np.round((hi - lo) / h).astype(int))
-    c = [lo[k] + h * (np.arange(n[k]) + 0.5) for k in range(3)]
-    X, Y, Z = np.meshgrid(*c, indexing="ij")
-    in_outer = ((X > I["x0"] - t) & (X < I["x1"] + t) & (Y > I["y0"] - t) & (Y < I["y1"] + t)
-                & (Z > I["z0"] - t) & (Z < I["z1"] + t))
-    in_cavity = ((X > I["x0"]) & (X < I["x1"]) & (Y > I["y0"]) & (Y < I["y1"])
-                 & (Z > I["z0"]) & (Z < I["z1"]))
-    solid = in_outer & ~in_cavity
-    for x, (bore, OD, Bw) in zip(L["shaft_x_mm"], L["bearings"]):
-        r2 = (X - x) ** 2 + Y**2
-        boss = (r2 < (OD / 2 + t) ** 2) & (((Z > I["z0"] - t - b) & (Z <= I["z0"] - t))
-                                           | ((Z >= I["z1"] + t) & (Z < I["z1"] + t + b)))
-        solid |= boss
-        solid &= ~(r2 < (OD / 2) ** 2)             # through-bore for the bearing outer ring
-    return solid, lo
+MESH_LEVELS = {            # (layers through the wall, in-plane element size in wall thicknesses, min mm)
+    "coarse": (1, 2.0, 6.0),
+    "standard": (2, 1.0, 4.0),
+    "fine": (3, 0.67, 3.0),
+}
 
 
-def build_model(L, h):
-    solid, lo = voxelize(L, h)
-    model = VoxelModel(solid, h, origin=lo)
-    return model
+def _axis_planes(L_len, t, layers, s, extra=()):
+    """Node planes along one axis: `layers` cells through each wall, ~s mm cells inside,
+    plus forced planes (bore edges) so holes come out at their true size."""
+    wall = list(np.linspace(0, t, layers + 1))
+    n_in = max(1, int(round((L_len - 2 * t) / s)))
+    inner = list(np.linspace(t, L_len - t, n_in + 1))
+    pl = sorted(set(np.round(wall + inner + [L_len - t + w for w in np.linspace(0, t, layers + 1)], 6)))
+    forced = sorted(e for e in extra if t < e < L_len - t)
+    for e in forced:
+        pl.append(e)
+    pl = np.array(sorted(set(np.round(pl, 6))))
+    # merge planes closer than 25 % of s (keep wall and forced planes)
+    keep = set(np.round(wall, 6)) | {round(L_len - t + w, 6) for w in np.linspace(0, t, layers + 1)} | set(np.round(forced, 6))
+    out = [pl[0]]
+    for x in pl[1:]:
+        if x - out[-1] < 0.25 * s and round(x, 6) not in keep and round(out[-1], 6) not in keep:
+            continue
+        if x - out[-1] < 1e-6:
+            continue
+        out.append(x)
+    return np.array(out)
+
+
+def build_model(L, mesh="coarse"):
+    """Rectilinear brick model of the assembly housing: exact wall thickness, coarser in-plane."""
+    if isinstance(mesh, (int, float)):           # legacy: uniform element size
+        mesh = "coarse"
+    layers, s_rel, s_min = MESH_LEVELS[mesh]
+    W, H, D, t, yc = L["W"], L["H"], L["D"], L["wall_mm"], L["yc"]
+    s = max(s_rel * t, s_min)
+    xe, ye = [], [yc]
+    for bo in L["bores"]:
+        r = bo["d"] / 2
+        xe += [bo["x"] - r, bo["x"] + r, bo["x"]]
+        ye += [yc - r, yc + r]
+    for sh in L["shafts"]:                       # blind seats: give load patches their own planes
+        xe += [sh["x"] - sh["d"] / 2, sh["x"] + sh["d"] / 2, sh["x"]]
+    # forced planes at bore edges would create many different brick sizes (slow); holes are
+    # stair-stepped on the regular grid instead
+    xs = _axis_planes(W, t, layers, s)
+    ys = _axis_planes(H, t, layers, s)
+    zs = _axis_planes(D, t, layers, s)
+    cx, cy, cz = (0.5 * (pl[1:] + pl[:-1]) for pl in (xs, ys, zs))
+    X, Y, Z = np.meshgrid(cx, cy, cz, indexing="ij")
+    cavity = (X > t) & (X < W - t) & (Y > t) & (Y < H - t) & (Z > t) & (Z < D - t)
+    solid = ~cavity
+    for bo in L["bores"]:
+        r2 = (X - bo["x"]) ** 2 + (Y - yc) ** 2
+        in_wall = (Z < t) if bo["wall"] == "front" else (Z > D - t)
+        solid &= ~(in_wall & (r2 < (bo["d"] / 2) ** 2))
+    return VoxelModel(solid, planes=(xs, ys, zs))
+
+
+def wall_thickness_in_model(L, h):
+    """Through-wall thickness the voxel model actually represents (≈ multiples of h)."""
+    t = L["wall_mm"]
+    return max(1, round(t / h)) * h
+
+
+def shaft_support_loads(L):
+    """Reactions each shaft puts on the housing walls (front wall z=t/2, back wall z=D−t/2).
+
+    Lever rule along each shaft between the two wall planes. Coaxial input/output shafts of a
+    2-stage reverted box are both carried by the walls at axis A (pilot bearing between them
+    transfers no net force to the housing).
+    """
+    t, D = L["wall_mm"], L["D"]
+    zf, zb = t / 2, D - t / 2
+    per_axis = {}
+    for me in L["meshes"]:
+        for role, f in (("pinion", me["f_on_pinion"]), ("gear", me["f_on_gear"])):
+            g = L["gears"][me[role]]
+            x = round(g["x"], 6)
+            wb = (me["z"] - zf) / (zb - zf)
+            acc = per_axis.setdefault(x, {"front": np.zeros(2), "back": np.zeros(2)})
+            acc["front"] += (1 - wb) * f
+            acc["back"] += wb * f
+    return per_axis
+
+
+def shaft_supports_z(L, si):
+    """Axial positions of the two bearings assumed for shaft si (z, mm)."""
+    t, D = L["wall_mm"], L["D"]
+    front, back = t / 2, D - t / 2
+    if L["stages"] == 2 and si in (0, 2):
+        pilot = (L["z1"] + L["face_width_mm"] + L["z2"]) / 2    # pilot bearing between coaxial shafts
+        return (front, pilot) if si == 0 else (pilot, back)
+    return front, back
+
+
+def per_shaft_reactions(L):
+    """Radial reactions [N, (Fx, Fy)] at the two bearings of every shaft (lever rule)."""
+    out = []
+    for si, s in enumerate(L["shafts"]):
+        za, zb = shaft_supports_z(L, si)
+        Ra, Rb = np.zeros(2), np.zeros(2)
+        for me in L["meshes"]:
+            for role, f in (("pinion", me["f_on_pinion"]), ("gear", me["f_on_gear"])):
+                if L["gears"][me[role]]["shaft"] != si:
+                    continue
+                w = (me["z"] - za) / (zb - za)
+                Ra += (1 - w) * f
+                Rb += w * f
+        out.append((Ra, Rb))
+    return out
 
 
 def bearing_loads(model, L):
-    """Distribute each shaft's bearing reactions over its two bore surfaces (cosine law)."""
-    h, I, t, b = model.h, L["inner"], L["wall_mm"], L["boss_mm"]
+    """Nodal loads on the housing: each axis' wall reaction spread over the bore edge (cosine law),
+    or over a Ø(shaft+2h) patch of the inner wall face where assembly3d has no bore (blind seat)."""
+    h = model.h
     P = model.nodes
+    t, D, yc = L["wall_mm"], L["D"], L["yc"]
     loads = np.zeros((model.n_nodes, 3))
     applied = []
-    zf, zb = I["z0"] - t / 2, I["z1"] + t / 2     # bearing planes (mid-wall)
-    walls = {"front": (I["z0"] - t - b - 1e-6, I["z0"] + 1e-6),
-             "back": (I["z1"] - 1e-6, I["z1"] + t + b + 1e-6)}
-    names = ["Input", "Intermediate", "Output"] if L["stages"] == 2 else ["Input", "Output"]
-    for si, (x, (bore, OD, Bw), flist) in enumerate(zip(L["shaft_x_mm"], L["bearings"], L["forces"])):
-        R = {"front": np.zeros(2), "back": np.zeros(2)}
-        for z, fx, fy in flist:
-            zz = I["z0"] + z
-            wb = (zz - zf) / (zb - zf)
-            R["front"] += (1 - wb) * np.array([fx, fy])
-            R["back"] += wb * np.array([fx, fy])
-        for wall, (za, zb_) in walls.items():
-            Fw = R[wall]
-            mag = np.linalg.norm(Fw)
+    zs = np.unique(np.round(P[:, 2], 6))
+    z_in_front = zs[np.argmin(np.abs(zs - t))]           # node plane of the inner face of each wall
+    z_in_back = zs[np.argmin(np.abs(zs - (D - t)))]
+    bore_at = {(bo["wall"], round(bo["x"], 6)): bo for bo in L["bores"]}
+    for x, walls in shaft_support_loads(L).items():
+        names = [s["name"] for s in L["shafts"] if abs(s["x"] - x) < 1e-6]
+        dmax = max(s["d"] for s in L["shafts"] if abs(s["x"] - x) < 1e-6)
+        for wall, Fw in walls.items():
+            mag = float(np.linalg.norm(Fw))
             if mag < 1e-9:
                 continue
-            rv = P[:, :2] - np.array([x, 0.0])
+            rv = P[:, :2] - np.array([x, yc])
             r = np.linalg.norm(rv, axis=1)
-            sel = (r < OD / 2 + 0.75 * h) & (P[:, 2] > za) & (P[:, 2] < zb_)
+            in_wall = (P[:, 2] <= z_in_front + 1e-6) if wall == "front" else (P[:, 2] >= z_in_back - 1e-6)
+            bo = bore_at.get((wall, round(x, 6)))
+            if bo is not None:
+                sel = in_wall & (r < bo["d"] / 2 + 0.9 * h)
+                seat = f"bore Ø{bo['d']:.0f}"
+            else:
+                face_z = z_in_front if wall == "front" else z_in_back
+                sel = (np.abs(P[:, 2] - face_z) < 1e-6) & (r < dmax / 2 + h)
+                seat = "blind seat (no bore in assembly)"
             idx = np.where(sel)[0]
             if len(idx) == 0:
-                raise ValueError("could not find bearing bore nodes: mesh too coarse for this bore")
+                raise ValueError("could not find load nodes at a shaft support (mesh too coarse)")
             cosang = (rv[idx] @ (Fw / mag)) / np.maximum(r[idx], 1e-9)
-            w = np.clip(cosang, 0, None)
+            w = np.clip(cosang, 0, None) if bo is not None else np.ones(len(idx))
             if w.sum() == 0:
                 w = np.ones(len(idx))
             loads[idx, :2] += np.outer(w / w.sum(), Fw)
-            applied.append({"name": f"{names[si]} bearing ({wall})",
-                            "force_n": [float(Fw[0]), float(Fw[1]), 0.0],
-                            "bore_mm": bore, "bearing_od_mm": OD})
+            applied.append({"name": f"{' / '.join(names)} support ({wall} wall)",
+                            "force_n": [round(float(Fw[0]), 2), round(float(Fw[1]), 2), 0.0],
+                            "at_mm": [round(x, 2), round(yc, 2), round(t / 2 if wall == 'front' else D - t / 2, 2)],
+                            "seat": seat})
     return loads, applied
 
 
 def fixture_nodes(model, L, fixture):
     P = model.nodes
-    h = model.h
     if fixture == "base":
-        return np.where(P[:, 1] < P[:, 1].min() + 1e-6)[0]
+        return np.where(P[:, 1] < 1e-6)[0]
     if fixture == "flange":
-        x_out = L["shaft_x_mm"][-1]
-        OD = L["bearings"][-1][1]
-        r = np.hypot(P[:, 0] - x_out, P[:, 1])
-        zmax = P[:, 2].max()
-        sel = (P[:, 2] > zmax - 1e-6) & (r > OD / 2 - 0.75 * h)
-        return np.where(sel)[0]
+        return np.where(P[:, 2] > L["D"] - 1e-6)[0]
     raise ValueError("fixture must be 'base' or 'flange'")
 
 
 def wetted_face_mask(thermal_model, L):
-    """True for faces that touch oil: cavity walls and bearing bores; False = outside air."""
+    """True for faces touching oil (the cavity); bores and outer faces see air."""
     c, n = thermal_model.centres, thermal_model.normals
-    h = thermal_model.m.h
-    probe = c + 0.5 * h * n                       # just outside the face, in the fluid
+    probe = c + 0.25 * thermal_model.m.h * n
     I = L["inner"]
-    in_cav = ((probe[:, 0] > I["x0"]) & (probe[:, 0] < I["x1"]) & (probe[:, 1] > I["y0"])
-              & (probe[:, 1] < I["y1"]) & (probe[:, 2] > I["z0"]) & (probe[:, 2] < I["z1"]))
-    in_bore = np.zeros(len(c), bool)
-    for x, (bore, OD, Bw) in zip(L["shaft_x_mm"], L["bearings"]):
-        in_bore |= np.hypot(probe[:, 0] - x, probe[:, 1]) < OD / 2
-    return in_cav | in_bore
+    return ((probe[:, 0] > I["x0"]) & (probe[:, 0] < I["x1"]) & (probe[:, 1] > I["y0"])
+            & (probe[:, 1] < I["y1"]) & (probe[:, 2] > I["z0"]) & (probe[:, 2] < I["z1"]))

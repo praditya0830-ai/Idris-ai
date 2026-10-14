@@ -35,10 +35,11 @@ def _B_from_grads(g):
     return B
 
 
-def cube_stiffness(h, E, nu):
-    """Condensed 24x24 stiffness of a cube of edge h, and the centre stress operator (6x24)."""
+def brick_stiffness(hx, hy, hz, E, nu):
+    """Condensed 24x24 stiffness of an hx×hy×hz brick (incompatible modes) and its centre stress operator."""
     D = elasticity_3d(E, nu)
-    J = h / 2                                      # d(x)/d(xi) for a cube
+    Jd = np.array([hx, hy, hz]) / 2                 # d(x)/d(xi) per axis (rectangular brick)
+    detJ = float(np.prod(Jd))
     g = 1 / math.sqrt(3)
     Kcc, Kci, Kii = np.zeros((24, 24)), np.zeros((24, 9)), np.zeros((9, 9))
     for xi in (-g, g):
@@ -46,17 +47,19 @@ def cube_stiffness(h, E, nu):
             for zeta in (-g, g):
                 p = np.array([xi, eta, zeta])
                 dN = 0.125 * _LOC * np.prod(1 + _LOC * p, axis=1)[:, None] / (1 + _LOC * p)
-                Bc = _B_from_grads(dN / J)
-                gi = np.diag(-2 * p) / J              # grads of (1-xi^2),(1-eta^2),(1-zeta^2)
-                Bi = _B_from_grads(gi)
-                w = J**3
-                Kcc += Bc.T @ D @ Bc * w
-                Kci += Bc.T @ D @ Bi * w
-                Kii += Bi.T @ D @ Bi * w
+                Bc = _B_from_grads(dN / Jd)
+                Bi = _B_from_grads(np.diag(-2 * p) / Jd)
+                Kcc += Bc.T @ D @ Bc * detJ
+                Kci += Bc.T @ D @ Bi * detJ
+                Kii += Bi.T @ D @ Bi * detJ
     Ke = Kcc - Kci @ np.linalg.solve(Kii, Kci.T)
-    dN0 = 0.125 * _LOC / J                         # shape gradients at the centre
-    S0 = D @ _B_from_grads(dN0)                    # incompatible-mode gradients vanish at centre
+    S0 = D @ _B_from_grads(0.125 * _LOC / Jd)
     return 0.5 * (Ke + Ke.T), S0
+
+
+def cube_stiffness(h, E, nu):
+    """Condensed 24x24 stiffness of a cube of edge h, and the centre stress operator (6x24)."""
+    return brick_stiffness(h, h, h, E, nu)
 
 
 class VoxelModel:
@@ -65,11 +68,15 @@ class VoxelModel:
     filled: bool array (nx, ny, nz); voxel (i,j,k) spans origin + h*[i..i+1, j..j+1, k..k+1].
     """
 
-    def __init__(self, filled, h, origin=(0.0, 0.0, 0.0)):
+    def __init__(self, filled, h=None, origin=(0.0, 0.0, 0.0), planes=None):
+        """filled: (nx,ny,nz) bool. Either a uniform cube size h, or planes=(xs, ys, zs) node
+        coordinates of a rectilinear grid (lengths nx+1, ny+1, nz+1) -> brick elements."""
         self.filled = np.asarray(filled, bool)
-        self.h = float(h)
         self.origin = np.asarray(origin, float)
         nx, ny, nz = self.filled.shape
+        if planes is None:
+            planes = [self.origin[k] + float(h) * np.arange(n + 1) for k, n in enumerate((nx, ny, nz))]
+        self.planes = [np.asarray(pl, float) for pl in planes]
         ijk = np.argwhere(self.filled)
         if len(ijk) == 0:
             raise ValueError("empty geometry")
@@ -80,8 +87,17 @@ class VoxelModel:
         k = used % (nz + 1)
         j = (used // (nz + 1)) % (ny + 1)
         i = used // ((nz + 1) * (ny + 1))
-        self.nodes = self.origin + self.h * np.stack([i, j, k], 1).astype(float)
+        xs, ys, zs = self.planes
+        self.nodes = np.stack([xs[i], ys[j], zs[k]], 1)
         self.ijk = ijk
+        # element sizes and groups of identical bricks (one stiffness matrix per group)
+        dx, dy, dz = (np.diff(pl) for pl in self.planes)
+        self.esize = np.stack([dx[ijk[:, 0]], dy[ijk[:, 1]], dz[ijk[:, 2]]], 1)
+        key = np.round(self.esize, 4)            # sizes equal to 0.1 µm share one stiffness matrix
+        uniq, inv_g = np.unique(key, axis=0, return_inverse=True)
+        self.groups = [(np.where(inv_g.ravel() == gi)[0], tuple(uniq[gi])) for gi in range(len(uniq))]
+        self.evol = np.prod(self.esize, axis=1)
+        self.h = float(np.median(self.esize))         # typical element size (tolerances)
         self._used = used
         self.shape = (nx, ny, nz)
 
@@ -92,11 +108,13 @@ class VoxelModel:
     # ---------------------------------------------------------------- solve
     def solve(self, E, nu, fixed_nodes, loads, tol=1e-6, max_iter=20000, progress=None):
         """fixed_nodes: array of node ids clamped in x,y,z. loads: (n_nodes,3) nodal forces [N]."""
-        Ke, S0 = cube_stiffness(self.h, E, nu)
         el = self.elems
         dofs = (3 * el[:, :, None] + np.arange(3)).reshape(len(el), 24)
-        flat = dofs.ravel()
         ndof = 3 * self.n_nodes
+        G = []                                          # (dofs_g, flat_g, Ke_g, S0_g, elem idx)
+        for idx, (hx, hy, hz) in self.groups:
+            Ke_g, S0_g = brick_stiffness(hx, hy, hz, E, nu)
+            G.append((dofs[idx], dofs[idx].ravel(), Ke_g, S0_g, idx))
         free = np.ones(ndof, bool)
         fx = np.asarray(fixed_nodes, int)
         if len(fx) == 0:
@@ -104,14 +122,20 @@ class VoxelModel:
         free[(3 * fx[:, None] + np.arange(3)).ravel()] = False
         f = np.asarray(loads, float).reshape(-1) * free
 
+        flat_all = np.concatenate([g[1] for g in G])
+        fe_buf = np.empty((len(el), 24))
+        starts = np.cumsum([0] + [len(g[4]) for g in G])
+
         def K_mul(u):
-            fe = u[dofs] @ Ke                          # (nel, 24); Ke symmetric
-            return np.bincount(flat, weights=fe.ravel(), minlength=ndof) * free
+            for gi, (d_g, _, Ke_g, _, _) in enumerate(G):
+                fe_buf[starts[gi]:starts[gi + 1]] = u[d_g] @ Ke_g
+            return np.bincount(flat_all, weights=fe_buf.ravel(), minlength=ndof) * free
 
         # nodal 3x3 block-Jacobi preconditioner
         blocks = np.zeros((self.n_nodes, 3, 3))
-        for a in range(8):
-            np.add.at(blocks, el[:, a], Ke[3 * a:3 * a + 3, 3 * a:3 * a + 3])
+        for _, _, Ke_g, _, idx in G:
+            for a in range(8):
+                np.add.at(blocks, el[idx, a], Ke_g[3 * a:3 * a + 3, 3 * a:3 * a + 3])
         fixed_mask = ~free.reshape(-1, 3)
         for c in range(3):
             blocks[fixed_mask[:, c], c, :] = 0
@@ -147,11 +171,16 @@ class VoxelModel:
             raise RuntimeError(f"CG did not converge (residual {res:.1e} after {it} iterations)")
         U = u.reshape(-1, 3)
         # element-centre stress -> nodal average
-        s_el = u[dofs] @ S0.T                          # (nel, 6)
+        s_el = np.zeros((len(el), 6))
+        for d_g, _, _, S0_g, idx in G:
+            s_el[idx] = u[d_g] @ S0_g.T
         cnt = np.bincount(el.ravel(), minlength=self.n_nodes)
         s_n = np.stack([np.bincount(el.ravel(), weights=np.repeat(s_el[:, c], 8), minlength=self.n_nodes)
                         for c in range(6)], 1) / cnt[:, None]
-        reac = (K_mul_full(u, dofs, Ke, ndof) - np.asarray(loads, float).reshape(-1)).reshape(-1, 3)
+        Ku = np.zeros(ndof)
+        for d_g, f_g, Ke_g, _, _ in G:
+            Ku += np.bincount(f_g, weights=(u[d_g] @ Ke_g).ravel(), minlength=ndof)
+        reac = (Ku - np.asarray(loads, float).reshape(-1)).reshape(-1, 3)
         return {"u": U, "stress": s_n, "von_mises": von_mises(s_n), "stress_elem": s_el,
                 "von_mises_elem": von_mises(s_el), "iterations": it, "residual": res,
                 "reactions": reac}

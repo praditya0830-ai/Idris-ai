@@ -28,10 +28,17 @@ from __future__ import annotations
 
 from collections import Counter
 
+from dataclasses import replace
+
 from physics.gears import (
     Requirements, evaluate, stages_for_ratio,
     GEAR_MATERIALS, HOUSING_MATERIALS, STANDARD_MODULES,
 )
+
+try:                                   # ACE shaft + bearing check (tim solver); optional at import time
+    from physics.variant_shafts import check_variant_shafts
+except Exception:                      # pragma: no cover
+    check_variant_shafts = None
 
 MODULE_SWEEP = (1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0)
 PINION_TEETH_SWEEP = range(17, 37)
@@ -201,6 +208,75 @@ def _suggestions(rejected: Counter) -> list[str]:
     return tips
 
 
+# ---------------------------------------------------------------------------- repair loop
+_MATERIAL_STRENGTH_ORDER = sorted(GEAR_MATERIALS, key=lambda k: GEAR_MATERIALS[k]["sigma_F_lim"])
+
+
+def _envelope_for(req: Requirements, k: int = 5):
+    """Envelope that fits the k smallest designs meeting strength + ratio (size unconstrained)."""
+    big = replace(req, env_w=1e6, env_h=1e6, env_d=1e6)
+    feas, _ = sweep(big)
+    if not feas:
+        return None
+    vol = lambda r: r["envelope_needed_mm"]["width"] * r["envelope_needed_mm"]["height"] * r["envelope_needed_mm"]["depth"]
+    best = sorted(feas, key=vol)[:k]
+    return {d: max(r["envelope_needed_mm"][d] for r in best) for d in ("width", "height", "depth")}
+
+
+def propose_repairs(req: Requirements, rejected: Counter, limit: int = 4) -> list[dict]:
+    """
+    Solver-proposed parameter changes when no design is feasible. Each proposal is re-checked
+    by running the full sweep again, so `feasible_variants` is a computed count, not a guess.
+    Safety factors are never lowered automatically (that would hide a weak design).
+    """
+    repairs = []
+
+    def trial(change: dict, why: str):
+        feas, _ = sweep(replace(req, **change))
+        if feas:
+            repairs.append({"change": change, "feasible_variants": len(feas), "reason": why})
+        return len(feas)
+
+    def env_change(env):
+        return {"env_w": float(max(req.env_w, env["width"])), "env_h": float(max(req.env_h, env["height"])),
+                "env_d": float(max(req.env_d, env["depth"]))}
+
+    stronger = [k for k in _MATERIAL_STRENGTH_ORDER
+                if GEAR_MATERIALS[k]["sigma_F_lim"] > GEAR_MATERIALS[req.gear_material]["sigma_F_lim"]]
+    # 1) stronger gear material, same envelope
+    for mat in stronger:
+        if trial({"gear_material": mat}, f"stronger gear steel ({GEAR_MATERIALS[mat]['label']})"):
+            break
+    # 2) larger envelope with the current material (sized to give several variants)
+    env = _envelope_for(req)
+    if env:
+        trial(env_change(env), f"enlarge the envelope to {env['width']}×{env['height']}×{env['depth']} mm")
+    # 3) strongest material + the (smaller) envelope it needs
+    if stronger:
+        env2 = _envelope_for(replace(req, gear_material=stronger[-1]))
+        if env2 and (not env or env2["width"] * env2["height"] * env2["depth"]
+                     < env["width"] * env["height"] * env["depth"]):
+            trial({"gear_material": stronger[-1], **env_change(env2)},
+                  f"{GEAR_MATERIALS[stronger[-1]]['label']} and an envelope of "
+                  f"{env2['width']}×{env2['height']}×{env2['depth']} mm")
+    # 4) ratio tolerance, only if the ratio was a real blocker
+    if rejected.get("ratio") and req.max_ratio_error < 0.05:
+        trial({"max_ratio_error": 0.05}, "allow ±5 % ratio tolerance")
+    # 5) thinner housing wall frees space (never below 3 mm)
+    if rejected.get("envelope") and req.wall_thickness > 3.0:
+        trial({"wall_thickness": 3.0}, "thinner housing wall (3 mm)")
+    repairs.sort(key=lambda r: -r["feasible_variants"])
+    names = {"env_w": "envelope_width", "env_h": "envelope_height", "env_d": "envelope_depth"}
+    for r in repairs:                                   # API field names, as /generate-variants expects
+        r["change"] = {names.get(k, k): v for k, v in r["change"].items()}
+    return repairs[:limit]
+
+
+def _repair_text(r: dict) -> str:
+    ch = ", ".join(f"{k} = {v:g}" if isinstance(v, (int, float)) else f"{k} = {v}" for k, v in r["change"].items())
+    return f"Solver check: {r['reason']} ({ch}) gives {r['feasible_variants']} feasible designs."
+
+
 def generate_variants(req: Requirements, n: int = 5) -> dict:
     if req.gear_material not in GEAR_MATERIALS:
         raise ValueError(f"unknown gear_material '{req.gear_material}', choose one of {list(GEAR_MATERIALS)}")
@@ -217,7 +293,13 @@ def generate_variants(req: Requirements, n: int = 5) -> dict:
         "rejected_by": dict(rejected),
     }
     if not feasible:
-        return {"variants": [], "diagnostics": diagnostics, "suggestions": _suggestions(rejected)}
+        repairs = propose_repairs(req, rejected)
+        extra = [] if repairs else [
+            "No single change inside the current design space (module ≤ 4 mm, 1–2 stages, spur gears) makes this "
+            "feasible: the load is too high for this gearbox type — consider more stages, helical gears or a "
+            "planetary layout (roadmap)."]
+        return {"variants": [], "diagnostics": diagnostics, "repairs": repairs,
+                "suggestions": [_repair_text(r) for r in repairs] + extra + _suggestions(rejected)}
 
     _score(feasible, req)
     chosen = _select(feasible, n)
@@ -235,6 +317,14 @@ def generate_variants(req: Requirements, n: int = 5) -> dict:
         }
         for k in ("_margin", "_vol", "_phys", "_des"):
             r.pop(k)
+        # ACE shaft + bearing check on the same geometry as /generate-assembly (additive fields)
+        r["warnings"] = []
+        if check_variant_shafts is not None:
+            try:
+                r["shafts"], r["warnings"] = check_variant_shafts(r, req.input_rpm)
+            except Exception as e:      # never block variant generation on the extra check
+                r["shafts"] = []
+                r["warnings"] = [f"shaft/bearing check unavailable: {e}"]
         variants.append(r)
 
-    return {"variants": variants, "diagnostics": diagnostics, "suggestions": []}
+    return {"variants": variants, "diagnostics": diagnostics, "suggestions": [], "repairs": []}
