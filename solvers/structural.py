@@ -188,14 +188,11 @@ register(SolverSpec(
                    "E_MPa": 200000, "nu": 0.3, "include_field": False},
                   {"outputs.tip_deflection_mm": 100 * 100**3 / (3 * 200000 * 10**3 / 12)
                    + 100 * 100 / (5 / 6 * 200000 / 2.6 * 10)}, 0.02),
-        Benchmark("kirsch-hole-Kt", "Kirsch (1898) infinite plate with circular hole: Kt = 3 (d/W = 0.05)",
+        Benchmark("kirsch-hole", "Kirsch (1898) infinite plate with circular hole: Kt = 3 at θ = 90°, "
+                  "σ_y = −σ at θ = 0 (d/W = 0.05)",
                   {"case": "plate_with_hole", "hole_radius_mm": 1, "half_width_mm": 20, "stress_MPa": 1,
                    "mesh": "fine", "include_field": False},
-                  {"outputs.Kt_gross": 3.0}, 0.025),
-        Benchmark("kirsch-hole-side", "Kirsch: σ_y = −σ at the hole side (θ = 0)",
-                  {"case": "plate_with_hole", "hole_radius_mm": 1, "half_width_mm": 20, "stress_MPa": 1,
-                   "mesh": "fine", "include_field": False},
-                  {"outputs.sigma_y_at_hole_side_MPa": -1.0}, 0.03),
+                  {"outputs.Kt_gross": 3.0, "outputs.sigma_y_at_hole_side_MPa": -1.0}, 0.03),
     ],
     limitations=["2D only (3D solid FEA is roadmap L2b)", "linear elastic, small displacement",
                  "no contact, no plasticity, no dynamics/modal yet",
