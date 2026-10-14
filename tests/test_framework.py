@@ -6,8 +6,7 @@ import physics.fem2d as fem
 
 
 def test_all_benchmarks_pass():
-    code, rep = handle_get("/verify")
-    assert code == 200
+    rep = registry.verify()
     failed = [(r["solver"], r["benchmark"]) for r in rep["report"] if not r["pass"]]
     assert not failed, failed
 
@@ -60,3 +59,17 @@ def test_fea_mesh_convergence_reported():
     mc = res["outputs"]["mesh_convergence"]
     assert mc["relative_change"] < 0.05
     assert 2.9 < res["outputs"]["Kt_gross"] < 3.2
+
+
+def test_verify_page_is_non_blocking():
+    import time
+    t0 = time.time()
+    code, body = handle_get("/verify?refresh=1")
+    assert code == 200 and body["status"] in ("running", "done")
+    assert time.time() - t0 < 1.0
+    for _ in range(300):
+        code, body = handle_get("/verify")
+        if body["status"] == "done":
+            break
+        time.sleep(0.1)
+    assert body["status"] == "done" and body["all_pass"], body
