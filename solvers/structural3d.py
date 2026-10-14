@@ -148,6 +148,9 @@ def _run_housing(p, progress):
                   "shafts": [{"name": s["name"], "x_mm": round(s["x"], 2), "diameter_mm": s["d"],
                               "torque_Nm": round(s["torque"], 2)} for s in L["shafts"]],
                   "bores": [{"wall": b["wall"], "x_mm": round(b["x"], 2), "diameter_mm": b["d"]} for b in L["bores"]],
+                  "gear_mesh_forces": [{"stage": me["stage"] + 1, "tangential_n": round(me["Wt"], 1),
+                                        "radial_n": round(me["Wr"], 1), "z_mm": round(me["z"], 2)}
+                                       for me in L["meshes"]],
                   "approx_mass_kg": float(model.evol.sum()) * 1e-9 * rho},
         "equilibrium_error": balance,
     }
