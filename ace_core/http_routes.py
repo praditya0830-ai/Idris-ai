@@ -7,6 +7,7 @@
     POST /solve/<name>         -> run a solver; body = JSON inputs
     POST /fea                  -> housing FEA in the UI team's job format (see analysis.py)
     GET  /fea/<job_id>         -> job status / result
+    POST /modal, /cfd, /review -> same job format (GET /<endpoint>/<job_id>)
 
 Returns (status_code, dict) or None if the path is not an ACE path.
 """

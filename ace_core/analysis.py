@@ -4,7 +4,7 @@
     GET  /fea/{job_id}   -> {"success", "status": queued|running|done|failed, "stage", "progress",
                              "result" | "error"}
 
-Same pattern for /modal, /cfd, /review later: add an entry to ANALYSES.
+/modal, /cfd (thermal) and /review follow the same pattern (entries in ANALYSES).
 Internally every analysis is an ordinary ACE solver; this module only adapts the shape.
 """
 from . import registry, jobs
@@ -26,8 +26,40 @@ def _fea_result(env):
             "method": env["method"], "limitations": env["limitations"]}
 
 
+def _common(env, o):
+    return {"warnings": env["warnings"], "verdict": env["verdict"], "checks": env["checks"],
+            "solver": f"{env['solver']} {env['version']}", "method": env["method"],
+            "limitations": env["limitations"]}
+
+
+def _modal_result(env):
+    o = env["outputs"]
+    return {"surface": o["surface"], "mesh": o["mesh"], "solve_time_s": o["solve_time_s"],
+            "frequencies_hz": o["frequencies_hz"], "excitations_hz": o["excitations_hz"],
+            "eigen_method": o["eigen_method"], "housing_mass_kg": o["housing_mass_kg"],
+            "material": o["material"], **_common(env, o)}
+
+
+def _thermal_result(env):
+    o = env["outputs"]
+    keep = ("oil_temp_c", "heat_dissipated_w", "heat_generated_w", "max_surface_temp_c",
+            "mean_outer_surface_temp_c", "h_oil_w_m2k", "h_outer_convection_w_m2k",
+            "h_outer_radiation_w_m2k", "area_outer_m2", "area_wetted_m2", "material", "conductivity_w_mk")
+    return {"surface": o["surface"], "mesh": o["mesh"], "solve_time_s": o["solve_time_s"],
+            **{k: o[k] for k in keep}, **_common(env, o)}
+
+
+def _review_result(env):
+    o = env["outputs"]
+    return {"findings": o["findings"], "counts": o["counts"], "checked_parts": o["checked_parts"],
+            "solve_time_s": o["solve_time_s"], **_common(env, o)}
+
+
 ANALYSES = {
     "/fea": {"solver": "fea_housing_3d", "adapt": _fea_result},
+    "/modal": {"solver": "modal_housing_3d", "adapt": _modal_result},
+    "/cfd": {"solver": "thermal_housing_3d", "adapt": _thermal_result},
+    "/review": {"solver": "review_gearbox", "adapt": _review_result},
 }
 
 
@@ -37,11 +69,21 @@ def _error_text(env):
 
 
 def _runner(spec, payload):
+    # The UI may send the whole variant object (name, tag, scores, mass, ...). Keep only the
+    # fields this solver understands and report the rest instead of rejecting the request.
+    solver = registry.get(spec["solver"])
+    known = set(solver.schema)
+    ignored = sorted(k for k in payload if k not in known)
+    clean = {k: v for k, v in payload.items() if k in known}
+
     def fn(progress):
-        env = registry.run(spec["solver"], payload, on_progress=progress)
+        env = registry.run(spec["solver"], clean, on_progress=progress)
         if not env.get("ok"):
             return None, _error_text(env)
-        return spec["adapt"](env), None
+        res = spec["adapt"](env)
+        if ignored:
+            res["warnings"] = list(res.get("warnings", [])) + [f"Fields not used by this solver: {ignored}"]
+        return res, None
     return fn
 
 
