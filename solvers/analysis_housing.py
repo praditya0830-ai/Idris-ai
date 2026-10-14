@@ -9,9 +9,12 @@ from physics.housing import (HOUSING_MATERIALS, find_material, build_layout, bui
 from physics.modal3d import natural_frequencies, natural_frequencies_fast
 from physics.thermal3d import ThermalModel, h_natural_air, h_forced_air
 from physics.review import review
-from .structural3d import VARIANT_DESIGN, VARIANT_KIN, MESH_DIVISIONS
+from .structural3d import VARIANT_DESIGN, VARIANT_KIN, MESH_DIVISIONS, FRAME_NOTE
+from ._example import EXAMPLE_VARIANT
 
-MAX_MODAL_ELEMENTS = int(os.environ.get("IDRIS_MODAL_MAX_ELEMENTS", "8000"))
+REG_F1 = 1347.39     # regression values, set after a validated run
+REG_Q = 443.12
+MAX_MODAL_ELEMENTS = int(os.environ.get("IDRIS_MODAL_MAX_ELEMENTS", "12000"))
 MAX_THERMAL_ELEMENTS = int(os.environ.get("IDRIS_THERMAL_MAX_ELEMENTS", "40000"))
 # thermal conductivity W/(m·K) of the housing materials
 CONDUCTIVITY = {"Al7075-T6": 130, "Al6061-T6": 167, "Al2024-T3": 121, "A356-T6": 151, "Ti-6Al-4V": 6.7,
@@ -28,12 +31,6 @@ VARIANT_SCHEMA = {
     "housing_params": {"type": "object", "default": {}},
     "housing_material": {"type": "string", "default": "Al7075-T6"},
 }
-EXAMPLE_VARIANT = {"design": {"module_mm": 2, "pinion_teeth": 18, "gear_teeth": 51, "face_width_mm": 48,
-                              "stages": 2, "center_distance_mm": 69},
-                   "kinematics": {"input_torque_nm": 23.9, "efficiency": 0.96},
-                   "shaft": {"output_diameter_mm": 30}, "housing_material": "Al7075-T6"}
-
-
 def _material(p):
     mat = find_material(p["housing_material"])
     if mat is None:
@@ -52,11 +49,7 @@ def _layout(p):
 
 def _surface(model, L):
     ids, tris = model.surface()
-    return ids, tris, np.round(model.nodes[ids] + L["offset"], 2).ravel()
-
-
-FRAME_NOTE = ("Coordinate frame: input shaft axis at x=0, y=0 along +z, inner front face at z=0 "
-              "(to be aligned with /generate-assembly; housing_params.frame_offset_mm shifts it)")
+    return ids, tris, np.round(model.nodes[ids], 2).ravel()
 
 
 # ------------------------------------------------------------------ modal
@@ -71,8 +64,8 @@ def _run_modal(p, progress):
     pre_warn = []
     mesh_used = p["mesh"]
     while True:
-        h = L["wall_mm"] / MESH_DIVISIONS[mesh_used]
-        model = build_model(L, h)
+        model = build_model(L, mesh_used)
+        h = model.h
         ne = len(model.elems)
         if ne <= MAX_MODAL_ELEMENTS:
             break
@@ -127,7 +120,7 @@ def _run_modal(p, progress):
         checks.append(Check("min separation mode ↔ excitation", margin, 0.1, "-", "min",
                             "±10 % rule; UI also flags this"))
     out = {"surface": {"positions": pos, "indices": tris.ravel(), "modes": modes},
-           "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8-im (voxel)",
+           "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8-im (rectilinear brick)",
                     "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
            "solve_time_s": round(solve_s, 2), "frequencies_hz": [m["frequency_hz"] for m in modes],
            "excitations_hz": excit, "eigen_method": info["method"], "material": mat,
@@ -148,9 +141,9 @@ register(SolverSpec(
             "mesh": {"type": "string", "enum": list(MESH_DIVISIONS), "default": "coarse"}},
     run=_run_modal,
     benchmarks=[Benchmark("regression-housing-modal-coarse",
-                          "ACE regression v0.1; LOBPCG and scipy eigsh agree to 4 digits (self-consistency)",
+                          "ACE regression v0.2 on a real variant; LOBPCG and scipy eigsh agree (self-consistency)",
                           {**EXAMPLE_VARIANT, "modes": 4, "mesh": "coarse"},
-                          {"outputs.frequencies_hz.0": 1617.0}, 0.01)],
+                          {"outputs.frequencies_hz.0": REG_F1}, 0.01)],
     limitations=["empty housing (no gears/shafts/oil mass)", "linear, undamped, small vibrations",
                  f"server cap {MAX_MODAL_ELEMENTS:,} elements (use mesh 'coarse')"],
     example={**EXAMPLE_VARIANT, "modes": 4, "mesh": "coarse"},
@@ -204,8 +197,8 @@ def _run_thermal(p, progress):
     eta = float(p["kinematics"].get("efficiency", 0.97))
     Q = p["power_kw"] * 1000 * (1 - eta)
     progress("Meshing", 0.05)
-    h = L["wall_mm"] / MESH_DIVISIONS[p["mesh"]]
-    model = build_model(L, h)
+    model = build_model(L, p["mesh"])
+    h = model.h
     ne = len(model.elems)
     if ne > MAX_THERMAL_ELEMENTS:
         return {"ok": False, "errors": [f"Mesh '{p['mesh']}' needs {ne:,} elements but this server allows "
@@ -213,8 +206,8 @@ def _run_thermal(p, progress):
     th = ThermalModel(model, k)
     progress("Applying loads", 0.15)
     wet = wetted_face_mask(th, L)
-    A_in = wet.sum() * th.face_area_mm2 * 1e-6
-    A_out = (~wet).sum() * th.face_area_mm2 * 1e-6
+    A_in = float(th.face_area[wet].sum()) * 1e-6
+    A_out = float(th.face_area[~wet].sum()) * 1e-6
     # oil-side coefficient: splash lubrication estimate scaled with pitch speed and viscosity
     v = (p.get("loads") or {}).get("pitch_line_velocity_ms")
     if not isinstance(v, (int, float)) or v <= 0:
@@ -269,7 +262,7 @@ def _run_thermal(p, progress):
            "h_oil_w_m2k": round(h_in, 1), "h_outer_convection_w_m2k": round(hc, 2),
            "h_outer_radiation_w_m2k": round(hr, 2), "area_outer_m2": round(A_out, 4),
            "area_wetted_m2": round(A_in, 4), "material": mat, "conductivity_w_mk": k,
-           "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8 (voxel)",
+           "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8 (rectilinear brick)",
                     "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
            "solve_time_s": round(solve_s, 2), "outer_iterations": it + 1}
     progress("Post-processing", 1.0)
@@ -292,11 +285,11 @@ register(SolverSpec(
             "mesh": {"type": "string", "enum": list(MESH_DIVISIONS), "default": "coarse"}},
     run=_run_thermal,
     benchmarks=[Benchmark("regression-housing-thermal", "ACE regression v0.1 + heat-balance self-check",
-                          {**EXAMPLE_VARIANT, "power_kw": 15, "input_rpm": 6000, "ambient_c": 25},
-                          {"outputs.heat_dissipated_w": 600.0}, 0.01)],
+                          {**EXAMPLE_VARIANT, "power_kw": 11.19, "input_rpm": 6000, "ambient_c": 25},
+                          {"outputs.heat_dissipated_w": REG_Q}, 0.01)],
     limitations=["not CFD: convection from correlations, oil assumed well mixed",
                  "no fins, no sun load, housing emissivity assumed 0.85 (painted)"],
-    example={**EXAMPLE_VARIANT, "power_kw": 15, "input_rpm": 6000, "ambient_c": 25, "cooling": "natural",
+    example={**EXAMPLE_VARIANT, "power_kw": 11.19, "input_rpm": 6000, "ambient_c": 25, "cooling": "natural",
              "air_speed_ms": 0, "oil": "ISO VG 68"},
 ))
 
@@ -351,11 +344,12 @@ def _run_review(p, progress):
     bad = [c for c in p["checks"] if c not in CHECKS]
     if bad:
         return {"ok": False, "errors": [f"unknown checks {bad}; choose from {CHECKS}"]}
-    findings = review(p["design"], p["kinematics"], p.get("shaft") or {}, L, mat, p["checks"], p.get("parts"))
+    findings = review(p["design"], p["kinematics"], L, mat, p["checks"], p.get("parts"), p.get("input_rpm"))
     progress("Post-processing", 1.0)
     counts = {s: sum(f["severity"] == s for f in findings) for s in ("critical", "warning", "info")}
     names = {pt.get("name") for pt in (p.get("parts") or []) if isinstance(pt, dict)}
-    warnings = [FRAME_NOTE]
+    warnings = [FRAME_NOTE, "Rule-based review on the parametric layout of /generate-assembly "
+                "(not a mesh clash detection)."]
     if not names:
         warnings.append("No parts list received: findings use generic part names.")
     return {"outputs": {"findings": findings, "counts": counts, "checks_run": p["checks"],
@@ -371,9 +365,10 @@ register(SolverSpec(
     schema={**VARIANT_SCHEMA,
             "analysis": {"type": "string", "enum": ["review"], "default": "review"},
             "parts": {"type": "array", "default": [], "max_items": 5000},
+            "input_rpm": {"type": "number", "exclusive_min": 0, "max": 1e5},
             "checks": {"type": "array", "items_type": "string", "default": CHECKS}},
     run=_run_review,
-    benchmarks=[Benchmark("regression-review-2stage", "ACE regression v0.1: example variant must flag the closed-housing assembly problem",
+    benchmarks=[Benchmark("regression-review-2stage", "ACE regression v0.2: real variant must flag the closed-housing assembly problem",
                           {**EXAMPLE_VARIANT}, {"outputs.counts.critical": 1}, 0.0)],
     limitations=["rules on the parametric layout, not a geometric clash detection on the STL parts yet",
                  "part names matched heuristically from the parts list"],

@@ -4,13 +4,17 @@ import time
 import numpy as np
 from ace_core import SolverSpec, Benchmark, Check, register
 from physics.fem3d import box_model
+from ._example import EXAMPLE_VARIANT
 from physics.housing import (HOUSING_MATERIALS, find_material, build_layout, build_model,
                              bearing_loads, fixture_nodes)
 
 MESH_DIVISIONS = {"coarse": 1, "standard": 2, "fine": 3}      # elements through the wall
-MAX_ELEMENTS = int(os.environ.get("IDRIS_FEA_MAX_ELEMENTS", "40000"))
-KNOWN_HP_KEYS = {"wall_thickness_mm", "clearance_mm", "axial_gap_mm", "inner_width_mm",
-                 "inner_height_mm", "inner_depth_mm", "boss_height_mm", "layout", "frame_offset_mm"}
+REG_VM = 10.0747          # regression value, set below after first validated run
+MAX_ELEMENTS = int(os.environ.get("IDRIS_FEA_MAX_ELEMENTS", "60000"))
+KNOWN_HP_KEYS = {"envelope_width", "envelope_height", "envelope_depth", "wall_thickness", "gear_ratio",
+                 "bore_diameter"}
+FRAME_NOTE = ("Same coordinate frame as /generate-assembly: housing x∈[0,W], y∈[0,H], z∈[0,D] mm, "
+              "shafts along +z at y = H/2.")
 
 
 # ------------------------------------------------------------------ solid block (verification)
@@ -88,11 +92,8 @@ def _run_housing(p, progress):
         L = build_layout(p["design"], p["kinematics"], p.get("loads") or {}, p.get("shaft") or {}, hp)
     except (KeyError, ValueError, TypeError) as ex:
         return {"ok": False, "errors": [f"Cannot build the housing model from this variant: {ex}"]}
-    h = L["wall_mm"] / MESH_DIVISIONS[p["mesh"]]
-    I = L["inner"]
-    est = ((I["x1"] - I["x0"] + 2 * L["wall_mm"]) * (I["y1"] - I["y0"] + 2 * L["wall_mm"])
-           * (I["z1"] - I["z0"] + 2 * L["wall_mm"] + 2 * L["boss_mm"]))
-    model = build_model(L, h)
+    model = build_model(L, p["mesh"])
+    h = model.h
     ne = len(model.elems)
     if ne > MAX_ELEMENTS:
         smaller = [k for k, v in MESH_DIVISIONS.items() if v < MESH_DIVISIONS[p["mesh"]]]
@@ -100,7 +101,8 @@ def _run_housing(p, progress):
             f"Mesh '{p['mesh']}' needs {ne:,} elements but this server allows {MAX_ELEMENTS:,} "
             f"(free-tier RAM/CPU). Please choose mesh '{smaller[-1] if smaller else 'coarse'}'."]}
     if MESH_DIVISIONS[p["mesh"]] == 1:
-        warnings.append("coarse mesh: one element through the wall, peak stresses are approximate")
+        warnings.append("coarse mesh: one element through the wall and ~2× wall-thickness elements in-plane; "
+                        "peak stresses are approximate (use 'standard' for final numbers)")
     progress("Applying loads", 0.15)
     loads, applied = bearing_loads(model, L)
     fixed = fixture_nodes(model, L, p["fixture"])
@@ -117,8 +119,7 @@ def _run_housing(p, progress):
     solve_s = time.perf_counter() - t0
     progress("Post-processing", 0.9)
     ids, tris = model.surface()
-    off = L["offset"]
-    pos = model.nodes[ids] + off
+    pos = model.nodes[ids]
     vm = r["von_mises"][ids]
     disp = r["u"][ids]
     reac = r["reactions"][fixed].sum(0)
@@ -130,20 +131,24 @@ def _run_housing(p, progress):
     # precision chosen for the viewport: 0.01 mm geometry, 0.01 MPa stress, 1e-5 mm displacement
     surface = {"positions": np.round(pos, 2).ravel(), "indices": tris.ravel(),
                "von_mises": np.round(vm, 2), "displacement": np.round(disp, 5).ravel()}
-    warnings.append("Coordinate frame: input shaft axis at x=0, y=0 along +z, inner front face at z=0 "
-                    "(to be aligned with /generate-assembly; housing_params.frame_offset_mm shifts it)")
+    warnings.append(FRAME_NOTE)
     warnings.append("Voxel mesh: curved bores are stair-stepped; peak stress at bore edges is approximate")
+    if any(a["seat"].startswith("blind") for a in applied):
+        warnings.append("Shafts without a bore in the assembly (e.g. intermediate shaft) are assumed to sit in "
+                        "blind bearing seats on the inner wall face.")
     out = {
         "surface": surface, "yield_mpa": Sy, "material": mat,
-        "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8-im (voxel)",
+        "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8-im (rectilinear brick)",
                  "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
         "solve_time_s": round(solve_s, 2), "cg_iterations": r["iterations"],
         "applied_loads": applied,
         "max_von_mises_MPa": vmax, "max_displacement_mm": float(np.linalg.norm(r["u"], axis=1).max()),
         "min_safety_factor": sf, "fixture": p["fixture"],
-        "model": {"wall_mm": L["wall_mm"], "inner_mm": L["inner"], "shaft_x_mm": L["shaft_x_mm"],
-                  "bearings_bore_od_width_mm": L["bearings"], "shaft_torque_Nm": L["shaft_torque_Nm"],
-                  "approx_mass_kg": ne * h**3 * 1e-9 * rho},
+        "model": {"envelope_mm": [L["W"], L["H"], L["D"]], "wall_mm": L["wall_mm"],
+                  "shafts": [{"name": s["name"], "x_mm": round(s["x"], 2), "diameter_mm": s["d"],
+                              "torque_Nm": round(s["torque"], 2)} for s in L["shafts"]],
+                  "bores": [{"wall": b["wall"], "x_mm": round(b["x"], 2), "diameter_mm": b["d"]} for b in L["bores"]],
+                  "approx_mass_kg": float(model.evol.sum()) * 1e-9 * rho},
         "equilibrium_error": balance,
     }
     checks = [Check("housing safety factor on yield", sf, p["design_factor"], "-", "min"),
@@ -181,19 +186,12 @@ register(SolverSpec(
     },
     run=_run_housing,
     benchmarks=[Benchmark(
-        "regression-housing-2stage-coarse", "ACE regression baseline v0.1 (self-consistency, not a published value)",
-        {"design": {"module_mm": 2, "pinion_teeth": 18, "gear_teeth": 51, "face_width_mm": 48,
-                    "stages": 2, "center_distance_mm": 69},
-         "kinematics": {"input_torque_nm": 23.9, "efficiency": 0.96},
-         "shaft": {"output_diameter_mm": 30}, "mesh": "coarse"},
-        {"outputs.max_von_mises_MPa": 13.98}, 0.02)],
-    limitations=["voxel geometry: simplified closed box with bearing bores and bosses, no ribs/feet/fillets",
+        "regression-housing-2stage-coarse", "ACE regression v0.2 on a real /generate-variants variant (self-consistency)",
+        {**EXAMPLE_VARIANT, "mesh": "coarse"},
+        {"outputs.max_von_mises_MPa": REG_VM}, 0.02)],
+    limitations=["housing = closed box of /generate-assembly (no ribs, feet, fillets or bearing bosses)",
                  "bearing loads from gear forces only (no gravity, no thermal, no bolt preload)",
-                 "1- or 2-stage inline spur layouts only",
+                 "1-stage or 2-stage reverted spur layouts (as /generate-assembly)",
                  f"server cap {MAX_ELEMENTS:,} elements (set IDRIS_FEA_MAX_ELEMENTS on a larger plan)"],
-    example={"design": {"module_mm": 2, "pinion_teeth": 18, "gear_teeth": 51, "face_width_mm": 48,
-                        "stages": 2, "center_distance_mm": 69},
-             "kinematics": {"input_torque_nm": 23.9, "efficiency": 0.96},
-             "shaft": {"output_diameter_mm": 30}, "housing_material": "Al7075-T6",
-             "fixture": "base", "mesh": "coarse"},
+    example={**EXAMPLE_VARIANT, "fixture": "base", "mesh": "coarse"},
 ))
