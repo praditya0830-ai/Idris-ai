@@ -44,7 +44,10 @@ def _thermal_result(env):
     o = env["outputs"]
     keep = ("oil_temp_c", "heat_dissipated_w", "heat_generated_w", "max_surface_temp_c",
             "mean_outer_surface_temp_c", "h_oil_w_m2k", "h_outer_convection_w_m2k",
-            "h_outer_radiation_w_m2k", "area_outer_m2", "area_wetted_m2", "material", "conductivity_w_mk")
+            "h_outer_radiation_w_m2k", "area_outer_m2", "area_wetted_m2", "material", "conductivity_w_mk",
+            "target_oil_temp_c", "fixes", "options", "surface_area_m2", "heat_to_housing_w",
+            "oil_cooler_w", "housing_box_mm", "housing_scale", "fins", "efficiency_total", "oil_limit_c",
+            "goal_report")
     return {"surface": o["surface"], "mesh": o["mesh"], "solve_time_s": o["solve_time_s"],
             **{k: o[k] for k in keep}, **_common(env, o)}
 
