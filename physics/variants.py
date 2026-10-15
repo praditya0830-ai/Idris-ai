@@ -40,6 +40,11 @@ try:                                   # ACE shaft + bearing check (tim solver);
 except Exception:                      # pragma: no cover
     check_variant_shafts = None
 
+try:                                   # ACE Goal Engine G1 (tim solver): thermal screen + engineer goals
+    from physics import goal_engine
+except Exception:                      # pragma: no cover
+    goal_engine = None
+
 MODULE_SWEEP = (1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0)
 PINION_TEETH_SWEEP = range(17, 37)
 FACE_WIDTH_FACTORS = range(8, 31, 2)       # b = k * m
@@ -277,7 +282,30 @@ def _repair_text(r: dict) -> str:
     return f"Solver check: {r['reason']} ({ch}) gives {r['feasible_variants']} feasible designs."
 
 
-def generate_variants(req: Requirements, n: int = 5) -> dict:
+def generate_variants(req: Requirements, n: int = 5, envelope_basis: str = "housing",
+                      goals: dict | None = None, ambient_c: float = 25.0) -> dict:
+    """envelope_basis "overall": the shaft ends (22 mm each side, along the depth) must also fit."""
+    if envelope_basis not in ("housing", "overall"):
+        raise ValueError("envelope_basis must be 'housing' or 'overall'")
+    if envelope_basis == "overall":
+        stick = 2 * (goal_engine.SHAFT_STICKOUT_MM if goal_engine else 22.0)
+        if req.env_d - stick <= 0:
+            raise ValueError(f"envelope_depth must be larger than {stick:g} mm when shaft ends are included")
+        out = _generate(replace(req, env_d=req.env_d - stick), n, goals, ambient_c)
+        for r in out.get("repairs", []):          # report depth in the engineer's (overall) terms
+            if "envelope_depth" in r["change"]:
+                r["change"]["envelope_depth"] = r["change"]["envelope_depth"] + stick
+        out["suggestions"] = [s.replace("(shaft ends excluded)", "") for s in out.get("suggestions", [])]
+        out["envelope_basis"] = "overall"
+        out["envelope_note"] = (f"Depth checked as housing + 2 × {stick / 2:g} mm shaft ends ≤ {req.env_d:g} mm "
+                                f"(housing depth ≤ {req.env_d - stick:g} mm).")
+        return out
+    out = _generate(req, n, goals, ambient_c)
+    out["envelope_basis"] = "housing"
+    return out
+
+
+def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -> dict:
     if req.gear_material not in GEAR_MATERIALS:
         raise ValueError(f"unknown gear_material '{req.gear_material}', choose one of {list(GEAR_MATERIALS)}")
     if req.housing_material not in HOUSING_MATERIALS:
@@ -301,6 +329,28 @@ def generate_variants(req: Requirements, n: int = 5) -> dict:
         return {"variants": [], "diagnostics": diagnostics, "repairs": repairs,
                 "suggestions": [_repair_text(r) for r in repairs] + extra + _suggestions(rejected)}
 
+    goal_note = None
+    if goals and goal_engine is not None and len(feasible) <= 4000:
+        # G1: screen EVERY feasible design against the engineer's goals, then pick variants from the
+        # designs that meet them all (if any) — goals steer the search, they are not just a label.
+        g = goals
+        meeting = []
+        for r in feasible:
+            env = r["envelope_needed_mm"]
+            r["housing_params"] = {"envelope_width": env["width"], "envelope_height": env["height"],
+                                   "envelope_depth": env["depth"]}
+            r["thermal_screen"] = goal_engine.thermal_screen(
+                r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
+                float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"))
+            r["goal_check"] = goal_engine.check_goals(r, g)
+            if all(x["pass"] for x in r["goal_check"].values()):
+                meeting.append(r)
+        diagnostics["meeting_goals"] = len(meeting)
+        if meeting:
+            feasible = meeting
+        else:
+            goal_note = ("No feasible design meets all goals; showing the best designs on strength and size. "
+                         "See goal_summary.blocking_goals and each variant's goal_check.")
     _score(feasible, req)
     chosen = _select(feasible, n)
     _label(chosen)
@@ -325,6 +375,21 @@ def generate_variants(req: Requirements, n: int = 5) -> dict:
             except Exception as e:      # never block variant generation on the extra check
                 r["shafts"] = []
                 r["warnings"] = [f"shaft/bearing check unavailable: {e}"]
+        if goal_engine is not None:
+            try:
+                g = goals or {}
+                r["assembly_bbox_mm"] = goal_engine.assembly_bbox(r)
+                r["thermal_screen"] = goal_engine.thermal_screen(
+                    r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
+                    float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"))
+                if goals:
+                    r["goal_check"] = goal_engine.check_goals(r, goals)
+            except Exception as e:      # never block variant generation on the extra check
+                r["warnings"].append(f"thermal screen unavailable: {e}")
         variants.append(r)
 
-    return {"variants": variants, "diagnostics": diagnostics, "suggestions": [], "repairs": []}
+    out = {"variants": variants, "diagnostics": diagnostics, "suggestions": [goal_note] if goal_note else [],
+           "repairs": []}
+    if goals and goal_engine is not None:
+        out["goal_summary"] = goal_engine.summarize(variants, goals)
+    return out
