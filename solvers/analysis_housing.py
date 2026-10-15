@@ -1,4 +1,5 @@
 """Housing analyses for the UI's Analysis tab: modal (L2), thermal (L2), design review (L0)."""
+import math
 import os
 import time
 import numpy as np
@@ -8,6 +9,8 @@ from physics.housing import (HOUSING_MATERIALS, find_material, build_layout, bui
                              wetted_face_mask)
 from physics.modal3d import natural_frequencies, natural_frequencies_fast
 from physics.thermal3d import ThermalModel, h_natural_air, h_forced_air
+from physics.thermal_lumped import (fin_layout, fin_conv_factor, fin_mass_kg, FIN_THICKNESS_MM,
+                                    FIN_MIN_GAP_MM)
 from physics.review import review
 from .structural3d import VARIANT_DESIGN, VARIANT_KIN, MESH_DIVISIONS, FRAME_NOTE
 from ._example import EXAMPLE_VARIANT
@@ -21,6 +24,7 @@ CONDUCTIVITY = {"Al7075-T6": 130, "Al6061-T6": 167, "Al2024-T3": 121, "A356-T6":
                 "Steel-1045": 50, "Steel-4140": 42, "CastIron-GG25": 48, "Mg-AZ91D": 72}
 OIL_GRADES = {"ISO VG 68": 68, "ISO VG 100": 100, "ISO VG 150": 150, "ISO VG 220": 220}
 OIL_LIMIT_C = 90.0          # common continuous limit for mineral gear oils
+TARGET_OIL_C = 85.0         # design target used by the repair options (5 °C margin)
 EMISSIVITY = 0.85           # painted / anodised housing (bare machined Al ≈ 0.1–0.2)
 
 VARIANT_SCHEMA = {
@@ -186,85 +190,336 @@ register(SolverSpec(
 
 
 # ------------------------------------------------------------------ thermal
+OPTION_KINDS = ["fan", "fins", "oil_cooler", "efficiency", "larger_housing", "combined"]
+
+
+def _scaled_layout(p, scale):
+    """Layout with every outer housing dimension × scale (gears stay put, more air-side area)."""
+    L0 = _layout(p)
+    if scale <= 1.0 + 1e-9:
+        return L0
+    hp = dict(p.get("housing_params") or {})
+    W, H, D = L0["W"], L0["H"], L0["D"]
+    hp.update(envelope_width=round(W * scale), envelope_height=round(H * scale), envelope_depth=round(D * scale))
+    return build_layout(p["design"], p["kinematics"], p.get("loads") or {}, p.get("shaft") or {}, hp)
+
+
+def _shell_volume_mm3(L):
+    W, H, D, t = L["W"], L["H"], L["D"], L["wall_mm"]
+    return W * H * D - (W - 2 * t) * (H - 2 * t) * (D - 2 * t)
+
+
+class _ThermalCase:
+    """One housing geometry: mesh + oil node; `state()` answers 'oil temperature for heat Q' or
+    'heat shed at oil ΔT' for any outer cooling (natural / forced, fins) by superposition."""
+
+    def __init__(self, p, L, k, mesh):
+        self.p, self.L, self.k = p, L, k
+        self.model = build_model(L, mesh)
+        self.ne = len(self.model.elems)
+        if self.ne > MAX_THERMAL_ELEMENTS:
+            raise ValueError(f"Mesh '{mesh}' needs {self.ne:,} elements but this server allows "
+                             f"{MAX_THERMAL_ELEMENTS:,}. Please choose a coarser mesh.")
+        th = self.th = ThermalModel(self.model, k)
+        self.wet = wetted_face_mask(th, L)
+        self.out_mask = ~self.wet
+        self.A_in = float(th.face_area[self.wet].sum()) * 1e-6
+        self.A_out = float(th.face_area[self.out_mask].sum()) * 1e-6
+        v = (p.get("loads") or {}).get("pitch_line_velocity_ms")
+        if not isinstance(v, (int, float)) or v <= 0:
+            dp = p["design"]["module_mm"] * p["design"]["pinion_teeth"]
+            v = 3.1416 * dp * p["input_rpm"] / 60000
+        self.h_in = 200.0 * min(2.0, max(0.5, (v / 5.0) ** 0.5)) * (68 / OIL_GRADES[p["oil"]]) ** 0.2
+        self.H_mm, self.D_mm, self.W_mm = L["H"], L["D"], L["W"]
+        self.G_in = th.node_conductance(self.wet, self.h_in)
+        self.S_in = float(self.G_in.sum())
+        self.Ta = float(p["ambient_c"])
+        self._b = None
+
+    def state(self, dT_oil=None, Q_in=None, cooling="natural", speed=0.0, area_factor=1.0, fins=None):
+        Ta = self.Ta
+        fl = fin_layout(fins, self.H_mm, self.D_mm) if fins else None
+        T_s = Ta + 20.0
+        b = self._b
+        f_fin, eta = 1.0, None
+        for _ in range(12):
+            if cooling == "forced":
+                hc, hr, _ = h_forced_air(speed, self.W_mm * 1e-3, T_s, Ta, EMISSIVITY)
+            else:
+                hc, hr = h_natural_air(T_s - Ta, self.H_mm * 1e-3, T_s, Ta, EMISSIVITY)
+            f_fin, eta = fin_conv_factor(fl, hc, self.k, self.A_out, cooling, T_s, Ta)
+            G_out = self.th.node_conductance(self.out_mask, (hc * f_fin + hr) * area_factor)
+            b, _it = self.th.solve_linear(self.G_in + G_out, self.G_in.copy(), x0=b)
+            K_eff = self.S_in - float(self.G_in @ b)
+            dT = dT_oil if dT_oil is not None else Q_in / K_eff
+            sel = G_out > 0
+            frac = float((G_out[sel] * b[sel]).sum() / G_out[sel].sum())
+            T_new = Ta + frac * dT
+            done = abs(T_new - T_s) < 0.05
+            T_s = T_new
+            if done:
+                break
+        self._b = b
+        return {"T_oil": Ta + dT, "Q": K_eff * dT, "K_eff": K_eff, "b": b, "G_out": G_out, "hc": hc, "hr": hr,
+                "T_s": T_s, "dT": dT, "fin_factor": f_fin, "fin_efficiency": eta,
+                "fin_gap_mm": fl["gap_mm"] if fl else None}
+
+
+def _fin_candidates(case):
+    """A small grid of practical fin sets for this housing (count from a target gap, height)."""
+    tf = FIN_THICKNESS_MM
+    out = []
+    for gap in (12.0, 8.0):
+        per_side = int((case.D_mm) // (gap + tf))
+        if per_side < 2:
+            continue
+        for hf in (15.0, 25.0, 35.0):
+            out.append({"count": 2 * per_side, "height_mm": hf})
+    return out
+
+
 def _run_thermal(p, progress):
     try:
         mat = _material(p)
-        L = _layout(p)
+        L = _scaled_layout(p, p["housing_scale"])
     except ValueError as ex:
         return {"ok": False, "errors": [str(ex)]}
     warnings = [FRAME_NOTE]
     k = CONDUCTIVITY[mat]
-    eta = float(p["kinematics"].get("efficiency", 0.97))
-    Q = p["power_kw"] * 1000 * (1 - eta)
+    rho = HOUSING_MATERIALS[mat][3]
+    n_st = L["stages"]
+    if p.get("efficiency_per_stage") is not None:
+        eta = float(p["efficiency_per_stage"]) ** n_st
+    else:
+        eta = float(p["kinematics"].get("efficiency", 0.97))
+    Q_gen = p["power_kw"] * 1000 * (1 - eta)
+    cooler = float(p["oil_cooler_w"])
+    Q = max(0.0, Q_gen - cooler)
+    goals = p.get("goals") or {}
+    limit = float(goals.get("oil_temp_max_c", OIL_LIMIT_C))
+    target = min(TARGET_OIL_C, limit - 5.0)
+    allowed = goals.get("allowed") or OPTION_KINDS
+    mass_cap = goals.get("added_mass_max_kg")
+    fins = p.get("fins") or None
+    if fins and (not fins.get("count") or not fins.get("height_mm")):
+        fins = None
+    if p["cooling"] == "forced" and p["air_speed_ms"] <= 0:
+        return {"ok": False, "errors": ["cooling 'forced' needs air_speed_ms > 0 (2, 5 or 10)"]}
     progress("Meshing", 0.05)
-    model = build_model(L, p["mesh"])
-    h = model.h
-    ne = len(model.elems)
-    if ne > MAX_THERMAL_ELEMENTS:
-        return {"ok": False, "errors": [f"Mesh '{p['mesh']}' needs {ne:,} elements but this server allows "
-                                        f"{MAX_THERMAL_ELEMENTS:,}. Please choose a coarser mesh."]}
-    th = ThermalModel(model, k)
+    try:
+        case = _ThermalCase(p, L, k, p["mesh"])
+    except ValueError as ex:
+        return {"ok": False, "errors": [str(ex)]}
+    model, h, ne = case.model, case.model.h, case.ne
+    fl_now = fin_layout(fins, case.H_mm, case.D_mm) if fins else None
+    if fl_now and fl_now["gap_mm"] < FIN_MIN_GAP_MM:
+        return {"ok": False, "errors": [f"{fins['count']} fins do not fit on {case.D_mm:.0f} mm depth: gap "
+                                        f"{fl_now['gap_mm']:.1f} mm < {FIN_MIN_GAP_MM:.0f} mm. Use fewer fins."]}
+    cool, spd = p["cooling"], p["air_speed_ms"]
     progress("Applying loads", 0.15)
-    wet = wetted_face_mask(th, L)
-    A_in = float(th.face_area[wet].sum()) * 1e-6
-    A_out = float(th.face_area[~wet].sum()) * 1e-6
-    # oil-side coefficient: splash lubrication estimate scaled with pitch speed and viscosity
-    v = (p.get("loads") or {}).get("pitch_line_velocity_ms")
-    if not isinstance(v, (int, float)) or v <= 0:
-        dp = p["design"]["module_mm"] * p["design"]["pinion_teeth"]
-        v = 3.1416 * dp * p["input_rpm"] / 60000
-    h_in = 200.0 * min(2.0, max(0.5, (v / 5.0) ** 0.5)) * (68 / OIL_GRADES[p["oil"]]) ** 0.2
-    I = L["inner"]
-    t = L["wall_mm"]
-    Ho = (I["y1"] - I["y0"] + 2 * t) * 1e-3
-    Wo = (I["x1"] - I["x0"] + 2 * t) * 1e-3
-    Ta = float(p["ambient_c"])
-    T_s = Ta + 20
-    G_in = th.node_conductance(wet, h_in)
     progress("Solving", 0.2)
     t0 = time.perf_counter()
-    for it in range(8):
-        if p["cooling"] == "forced":
-            if p["air_speed_ms"] <= 0:
-                return {"ok": False, "errors": ["cooling 'forced' needs air_speed_ms > 0 (2, 5 or 10)"]}
-            hc, hr, Re = h_forced_air(p["air_speed_ms"], Wo, T_s, Ta, EMISSIVITY)
+    st = case.state(Q_in=Q, cooling=cool, speed=spd, fins=fins)
+    T_oil, hc, hr, T_s, G_out = st["T_oil"], st["hc"], st["hr"], st["T_s"], st["G_out"]
+    T = case.Ta + st["b"] * st["dT"]
+    Ta = case.Ta
+    fin_mass_now = fin_mass_kg(fl_now, rho)
+
+    # ---- legacy `fixes` (kept for UI v18 compatibility): what brings the oil to TARGET_C
+    fixes = []
+    options = []
+    if T_oil > limit:
+        progress("Solving", 0.45)
+        dT_t = target - Ta
+        if dT_t <= 0:
+            fixes.append({"fix": "ambient", "detail": f"Ambient {Ta:.0f} °C is above the {target:.0f} °C target."})
         else:
-            hc, hr = h_natural_air(T_s - Ta, Ho, T_s, Ta, EMISSIVITY)
-        G_out = th.node_conductance(~wet, hc + hr)
-        T, T_oil, iters = th.solve_oil_balance(Q, G_in, G_out, Ta)
-        out_nodes = G_out > 0
-        T_new = float((G_out[out_nodes] * T[out_nodes]).sum() / G_out[out_nodes].sum())
-        progress("Solving", 0.2 + 0.08 * (it + 1))
-        if abs(T_new - T_s) < 0.05:
-            T_s = T_new
-            break
-        T_s = T_new
+            base = dict(cooling=cool, speed=spd, fins=fins)
+            q_allow = case.state(dT_oil=dT_t, **base)["Q"]
+            Qg = Q_gen
+            fixes.append({"fix": "duty_cycle", "title": "Limit continuous power (duty cycle)",
+                          "detail": f"The housing sheds {q_allow:.0f} W at {target:.0f} °C oil: continuous power ≤ "
+                                    f"{p['power_kw'] * min(1, (q_allow + cooler) / Qg):.1f} kW. Typical for actuators "
+                                    "with short peak loads.",
+                          "max_continuous_power_kw": round(p["power_kw"] * min(1, (q_allow + cooler) / Qg), 2),
+                          "predicted_oil_temp_c": target})
+            need_w = max(0.0, Q - q_allow)
+            fixes.append({"fix": "oil_cooler", "title": "Oil cooler / circulating oil",
+                          "detail": f"Remove {need_w:.0f} W with an external oil cooler (housing keeps {q_allow:.0f} W).",
+                          "cooler_capacity_w": round(need_w), "predicted_oil_temp_c": target})
+            Q99 = max(0.0, p["power_kw"] * 1000 * (1 - 0.99 ** n_st) - cooler)
+            t99 = case.state(Q_in=Q99, **base)["T_oil"] if Q99 < Q else None
+            if t99 is not None:
+                fixes.append({"fix": "efficiency", "title": "Ground, profile-corrected gears + low-loss bearings",
+                              "detail": f"η 99 %/stage instead of {100 * eta ** (1 / n_st):.1f} %: heat "
+                                        f"{Q99:.0f} W → oil {t99:.0f} °C.", "predicted_oil_temp_c": round(t99, 1)})
+            fan_t = {}
+            for sp in (5.0, 10.0):
+                fan_t[sp] = case.state(Q_in=Q, cooling="forced", speed=sp, fins=fins)["T_oil"]
+                fixes.append({"fix": f"forced_air_{sp:g}", "title": f"Fan, {sp:g} m/s air over the housing",
+                              "detail": f"Oil {fan_t[sp]:.0f} °C.", "predicted_oil_temp_c": round(fan_t[sp], 1)})
+            Qc = min(Q, Q99)
+            if case.state(dT_oil=dT_t, cooling="forced", speed=5.0, fins=fins)["Q"] >= Qc:
+                fixes.append({"fix": "combined", "title": "Combined: 99 %/stage gears + 5 m/s fan",
+                              "detail": f"Heat {Qc:.0f} W; reaches ≤ {target:.0f} °C oil without fins.",
+                              "predicted_oil_temp_c": target})
+            else:
+                fixes.append({"fix": "combined", "title": "Combined: 99 %/stage gears + 5 m/s fan + fins",
+                              "detail": "See `options` for the fin sets computed on this housing.",
+                              "predicted_oil_temp_c": None})
+            for f in fixes:
+                f.setdefault("predicted_oil_temp_c", None)
+                tv = f["predicted_oil_temp_c"]
+                f["passes"] = tv is not None and tv <= limit
+
+            # ---- `options` (UI v19 "Try" rows): each entry = a change to THIS request, computed here
+            progress("Solving", 0.6)
+
+            def opt(kind, label, change, t_oil, added_kg=0.0, note=""):
+                ok_mass = mass_cap is None or added_kg <= float(mass_cap) + 1e-9
+                options.append({"kind": kind, "label": label, "change": change, "oil_temp_c": round(t_oil, 1),
+                                "pass": bool(t_oil <= limit and ok_mass), "added_mass_kg": round(added_kg, 3),
+                                "note": note, "meets_mass_goal": ok_mass})
+
+            if cool == "natural":
+                for sp in (5.0, 10.0):
+                    opt("fan", f"Fan, {sp:g} m/s over the housing", {"cooling": "forced", "air_speed_ms": sp},
+                        fan_t[sp], note="needs an air flow (fan or propeller wash) along the housing")
+            # fins under the current cooling, and under a 5 m/s fan if currently natural
+            fin_res = []
+            for fc in _fin_candidates(case):
+                fl = fin_layout(fc, case.H_mm, case.D_mm)
+                if fl["gap_mm"] < FIN_MIN_GAP_MM:
+                    continue
+                for c_, s_ in ([(cool, spd)] + ([("forced", 5.0)] if cool == "natural" else [])):
+                    r_ = case.state(Q_in=Q, cooling=c_, speed=s_, fins=fc)
+                    fin_res.append((fc, c_, s_, r_["T_oil"], fin_mass_kg(fl, rho), fl["gap_mm"], r_["fin_efficiency"]))
+            for c_, s_ in ([(cool, spd)] + ([("forced", 5.0)] if cool == "natural" else [])):
+                rows = [r for r in fin_res if r[1] == c_ and r[2] == s_]
+                if not rows:
+                    continue
+                passing = sorted([r for r in rows if r[3] <= limit], key=lambda r: r[4])
+                pick = passing[0] if passing else min(rows, key=lambda r: r[3])
+                fc, _, _, t_, m_, gap_, eta_f = pick
+                ch = {"fins": fc}
+                lab = f"Cooling fins {fc['count']} × {fc['height_mm']:g} mm"
+                if c_ == "forced" and cool == "natural":
+                    ch.update(cooling="forced", air_speed_ms=s_)
+                    lab += f" + fan {s_:g} m/s"
+                opt("fins" if "cooling" not in ch else "combined", lab, ch, t_, m_,
+                    f"on both side walls, {FIN_THICKNESS_MM:g} mm thick, gap {gap_:.0f} mm, fin efficiency "
+                    f"{100 * eta_f:.0f} %; +{m_:.2f} kg")
+            need_cool = max(0.0, Q - q_allow)
+            cw = 50.0 * math.ceil(need_cool / 50.0)
+            if cw > 0:
+                t_c = case.state(Q_in=max(0.0, Q - cw), cooling=cool, speed=spd, fins=fins)["T_oil"]
+                opt("oil_cooler", f"Oil cooler {cw + cooler:.0f} W", {"oil_cooler_w": cw + cooler}, t_c,
+                    note="needs an oil pump/circuit and a heat sink (air or fuel)")
+            if t99 is not None:
+                opt("efficiency", "Gears + bearings at 99 %/stage", {"efficiency_per_stage": 0.99}, t99,
+                    note="ground, profile-corrected gears and low-loss bearings: cost, not mass")
+                t99f = case.state(Q_in=Q99, cooling="forced", speed=5.0, fins=fins)["T_oil"]
+                if cool == "natural":
+                    opt("combined", "99 %/stage gears + fan 5 m/s",
+                        {"efficiency_per_stage": 0.99, "cooling": "forced", "air_speed_ms": 5.0}, t99f)
+            # best combination: 99 %/stage + fan + the lightest fin set that reaches the limit
+            if t99 is not None and not any(o["pass"] and o["kind"] != "oil_cooler" for o in options):
+                found = None
+                for sp in ((5.0, 10.0) if cool == "natural" else (max(spd, 5.0),)):
+                    rows = []
+                    for fc in _fin_candidates(case):
+                        fl = fin_layout(fc, case.H_mm, case.D_mm)
+                        if fl["gap_mm"] < FIN_MIN_GAP_MM:
+                            continue
+                        rows.append((fin_mass_kg(fl, rho), fc, fl["gap_mm"]))
+                    for m_, fc, gap_ in sorted(rows, key=lambda r: r[0]):
+                        t_ = case.state(Q_in=Q99, cooling="forced", speed=sp, fins=fc)["T_oil"]
+                        if t_ <= limit:
+                            found = (sp, fc, t_, m_, gap_)
+                            break
+                    if found:
+                        break
+                if found:
+                    sp, fc, t_, m_, gap_ = found
+                    opt("combined", f"99 %/stage gears + fan {sp:g} m/s + fins {fc['count']} × {fc['height_mm']:g} mm",
+                        {"efficiency_per_stage": 0.99, "cooling": "forced", "air_speed_ms": sp, "fins": fc}, t_, m_,
+                        f"fins on both side walls, gap {gap_:.0f} mm; +{m_:.2f} kg")
+                    for f in fixes:
+                        if f["fix"] == "combined" and f["predicted_oil_temp_c"] is None:
+                            f.update(detail=f"99 %/stage gears + fan {sp:g} m/s + {fc['count']} fins × "
+                                            f"{fc['height_mm']:g} mm: oil {t_:.0f} °C.",
+                                     predicted_oil_temp_c=round(t_, 1), passes=True)
+            # larger housing: a new mesh per size (more outer area, more oil)
+            progress("Solving", 0.75)
+            vol0 = _shell_volume_mm3(L)
+            for sc in (1.3, 1.6):
+                try:
+                    Ls = _scaled_layout({**p, "housing_params": {**(p.get("housing_params") or {}),
+                                                                 "envelope_width": L["W"],
+                                                                 "envelope_height": L["H"],
+                                                                 "envelope_depth": L["D"]}}, sc)
+                    cs = _ThermalCase(p, Ls, k, "coarse")
+                except ValueError:
+                    continue
+                t_s = cs.state(Q_in=Q, cooling=cool, speed=spd, fins=fins)["T_oil"]
+                dm = (_shell_volume_mm3(Ls) - vol0) * 1e-9 * rho
+                bx = Ls
+                opt("larger_housing", f"Larger housing ×{sc:g} ({bx['W']:.0f}×{bx['H']:.0f}×{bx['D']:.0f} mm)",
+                    {"housing_scale": round(p["housing_scale"] * sc, 3)}, t_s, dm,
+                    f"+{dm:.2f} kg; check the envelope")
+            options = [o for o in options if o["kind"] in allowed or
+                       (o["kind"] == "combined" and all(x in allowed for x in ("fan",)))]
+            options.sort(key=lambda o: (not o["pass"], o["added_mass_kg"] if o["pass"] else o["oil_temp_c"]))
     solve_s = time.perf_counter() - t0
     progress("Post-processing", 0.9)
     q_out = float((G_out * (T - Ta)).sum())
     ids, tris, pos = _surface(model, L)
-    if p["power_kw"] * (1 - eta) * 1000 < 1:
-        warnings.append("Heat load is below 1 W: temperatures stay at ambient.")
-    warnings += [f"Oil-side heat transfer coefficient {h_in:.0f} W/m²K is an engineering estimate for splash "
+    if Q < 1:
+        warnings.append("Net heat load is below 1 W: temperatures stay at ambient.")
+    warnings += [f"Oil-side heat transfer coefficient {case.h_in:.0f} W/m²K is an engineering estimate for splash "
                  "lubrication (scaled with pitch speed and viscosity), not a CFD result.",
-                 f"Outer surface: {'forced' if p['cooling'] == 'forced' else 'natural'} convection correlation "
+                 f"Outer surface: {'forced' if cool == 'forced' else 'natural'} convection correlation "
                  f"(h_c = {hc:.1f} W/m²K) + radiation (ε = {EMISSIVITY}, h_r = {hr:.1f} W/m²K).",
                  "Heat source = P × (1 − η) delivered to a well-mixed oil volume; local hot spots at bearings "
                  "and the gear mesh are not resolved."]
-    if T_oil > OIL_LIMIT_C:
-        warnings.append(f"Oil temperature {T_oil:.0f} °C exceeds {OIL_LIMIT_C:.0f} °C: add fins, forced air, an oil "
-                        "cooler, or a higher-efficiency gear set.")
-    checks = [Check("oil temperature", T_oil, OIL_LIMIT_C, "°C", "max", "mineral gear oil continuous limit"),
-              Check("heat balance error", abs(q_out - Q) / max(Q, 1e-9), 0.01, "-", "max", "solver self-check")]
+    if fl_now:
+        warnings.append(f"Fins: {fl_now['count']} × {fl_now['height_mm']:g} mm on the side walls (gap "
+                        f"{fl_now['gap_mm']:.1f} mm, efficiency {100 * (st['fin_efficiency'] or 0):.0f} %) raise the outer "
+                        f"convective conductance ×{st['fin_factor']:.2f}; applied uniformly to the outer skin "
+                        "(fins are not meshed). Radiation is counted on the base envelope only.")
+    if cooler > 0:
+        warnings.append(f"Oil cooler removes {cooler:.0f} W directly from the oil (ideal sink).")
+    if T_oil > limit:
+        warnings.append(f"Oil temperature {T_oil:.0f} °C exceeds {limit:.0f} °C. See `options` for computed changes "
+                        "(fan, fins, oil cooler, efficiency, larger housing).")
+    checks = [Check("oil temperature", T_oil, limit, "°C", "max",
+                    "goal from engineer" if "oil_temp_max_c" in goals else "mineral gear oil continuous limit"),
+              Check("heat balance error", abs(q_out - Q) / max(Q, 1e-9) if Q >= 1 else 0.0, 0.01, "-", "max",
+                    "solver self-check")]
+    goal_report = None
+    if goals:
+        goal_report = {"oil_temp_max_c": limit, "added_mass_max_kg": mass_cap, "allowed": allowed,
+                       "met_now": T_oil <= limit,
+                       "met_by": [o["label"] for o in options if o["pass"]],
+                       "closest": None if (T_oil <= limit or not options) else
+                       min(options, key=lambda o: o["oil_temp_c"])["label"]}
     out = {"surface": {"positions": pos, "indices": tris.ravel(), "temperature": np.round(T[ids], 2)},
-           "oil_temp_c": round(T_oil, 2), "heat_dissipated_w": round(q_out, 2), "heat_generated_w": round(Q, 2),
+           "oil_temp_c": round(T_oil, 2), "heat_dissipated_w": round(q_out, 2), "heat_generated_w": round(Q_gen, 2),
+           "heat_to_housing_w": round(Q, 2), "oil_cooler_w": cooler,
            "max_surface_temp_c": round(float(T.max()), 2), "mean_outer_surface_temp_c": round(T_s, 2),
-           "h_oil_w_m2k": round(h_in, 1), "h_outer_convection_w_m2k": round(hc, 2),
-           "h_outer_radiation_w_m2k": round(hr, 2), "area_outer_m2": round(A_out, 4),
-           "area_wetted_m2": round(A_in, 4), "material": mat, "conductivity_w_mk": k,
+           "h_oil_w_m2k": round(case.h_in, 1), "h_outer_convection_w_m2k": round(hc, 2),
+           "h_outer_radiation_w_m2k": round(hr, 2), "area_outer_m2": round(case.A_out, 4),
+           "surface_area_m2": round(case.A_out, 4), "area_wetted_m2": round(case.A_in, 4),
+           "housing_box_mm": [L["W"], L["H"], L["D"]], "housing_scale": p["housing_scale"],
+           "fins": ({**fl_now, "factor": round(st["fin_factor"], 3),
+                     "efficiency": round(st["fin_efficiency"] or 0, 3), "mass_kg": round(fin_mass_now, 3)}
+                    if fl_now else None),
+           "efficiency_total": round(eta, 5), "oil_limit_c": limit,
+           "material": mat, "conductivity_w_mk": k,
            "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8 (rectilinear brick)",
                     "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
-           "solve_time_s": round(solve_s, 2), "outer_iterations": it + 1}
+           "solve_time_s": round(solve_s, 2), "outer_iterations": 1,
+           "target_oil_temp_c": target, "fixes": fixes, "options": options, "goal_report": goal_report}
     progress("Post-processing", 1.0)
     return {"outputs": out, "checks": checks, "warnings": warnings}
 
@@ -282,13 +537,25 @@ register(SolverSpec(
             "cooling": {"type": "string", "enum": ["natural", "forced"], "default": "natural"},
             "air_speed_ms": {"type": "number", "min": 0, "max": 50, "default": 0.0},
             "oil": {"type": "string", "enum": list(OIL_GRADES), "default": "ISO VG 68"},
+            "fins": {"type": "object", "default": {}, "allow_extra": False,
+                     "fields": {"count": {"type": "integer", "min": 0, "max": 200},
+                                "height_mm": {"type": "number", "min": 0, "max": 100},
+                                "thickness_mm": {"type": "number", "min": 1, "max": 10}}},
+            "oil_cooler_w": {"type": "number", "min": 0, "max": 1e6, "default": 0.0},
+            "housing_scale": {"type": "number", "min": 1.0, "max": 3.0, "default": 1.0},
+            "efficiency_per_stage": {"type": "number", "min": 0.8, "max": 0.999},
+            "goals": {"type": "object", "default": {}, "allow_extra": False,
+                      "fields": {"oil_temp_max_c": {"type": "number", "min": 30, "max": 200},
+                                 "added_mass_max_kg": {"type": "number", "min": 0, "max": 1000},
+                                 "allowed": {"type": "array", "items_type": "string"}}},
             "mesh": {"type": "string", "enum": list(MESH_DIVISIONS), "default": "coarse"}},
     run=_run_thermal,
     benchmarks=[Benchmark("regression-housing-thermal", "ACE regression v0.1 + heat-balance self-check",
                           {**EXAMPLE_VARIANT, "power_kw": 11.19, "input_rpm": 6000, "ambient_c": 25},
                           {"outputs.heat_dissipated_w": REG_Q}, 0.01)],
     limitations=["not CFD: convection from correlations, oil assumed well mixed",
-                 "no fins, no sun load, housing emissivity assumed 0.85 (painted)"],
+                 "fins are not meshed: their effect is a fin-efficiency-weighted factor on outer convection",
+                 "no sun load, housing emissivity assumed 0.85 (painted)"],
     example={**EXAMPLE_VARIANT, "power_kw": 11.19, "input_rpm": 6000, "ambient_c": 25, "cooling": "natural",
              "air_speed_ms": 0, "oil": "ISO VG 68"},
 ))
