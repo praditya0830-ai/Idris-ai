@@ -78,3 +78,15 @@ def test_review_subset_and_errors():
     assert all(f["check"] == "dfm" for f in r["result"]["findings"])
     c, b = handle_post("/review?sync=1", {**VARIANT, "checks": ["magic"]})
     assert c == 400 and "unknown checks" in b["error"]
+
+
+def test_thermal_fixes_are_consistent():
+    r = handle_post("/cfd?sync=1", {**VARIANT, "power_kw": 11.19, "input_rpm": 6000})[1]["result"]
+    fx = {f["fix"]: f for f in r["fixes"]}
+    assert r["oil_temp_c"] > 90 and {"duty_cycle", "oil_cooler", "efficiency", "combined"} <= set(fx)
+    # applying the duty-cycle answer must really give ~85 °C
+    p_ok = fx["duty_cycle"]["max_continuous_power_kw"]
+    r2 = handle_post("/cfd?sync=1", {**VARIANT, "power_kw": p_ok, "input_rpm": 6000})[1]["result"]
+    assert abs(r2["oil_temp_c"] - 85) < 1.5 and not r2["fixes"]
+    # forced air must be cooler than natural
+    assert fx["forced_air_10"]["predicted_oil_temp_c"] < fx["forced_air_5"]["predicted_oil_temp_c"] < r["oil_temp_c"]
