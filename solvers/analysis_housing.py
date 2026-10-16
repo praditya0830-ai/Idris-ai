@@ -9,13 +9,14 @@ from physics.housing import (HOUSING_MATERIALS, find_material, build_layout, bui
                              wetted_face_mask)
 from physics.modal3d import natural_frequencies, natural_frequencies_fast
 from physics.thermal3d import ThermalModel, h_natural_air, h_forced_air
-from physics.thermal_lumped import (fin_layout, fin_conv_factor, fin_mass_kg, FIN_THICKNESS_MM,
+from physics.thermal_lumped import (fin_layout, fin_conv_factor, fin_mass_kg, FIN_THICKNESS_MM, oil_temp_lumped,
                                     FIN_MIN_GAP_MM)
 from physics.review import review
+from physics.variant_shafts import shaft_plan, designed_housing_params
 from .structural3d import VARIANT_DESIGN, VARIANT_KIN, MESH_DIVISIONS, FRAME_NOTE
 from ._example import EXAMPLE_VARIANT
 
-REG_F1 = 1347.39     # regression values, set after a validated run
+REG_F1 = 1353.95     # regression values, set after a validated run
 REG_Q = 443.12
 MAX_MODAL_ELEMENTS = int(os.environ.get("IDRIS_MODAL_MAX_ELEMENTS", "12000"))
 MAX_THERMAL_ELEMENTS = int(os.environ.get("IDRIS_THERMAL_MAX_ELEMENTS", "40000"))
@@ -43,10 +44,11 @@ def _material(p):
     return mat
 
 
-def _layout(p):
+def _layout(p, hp=None):
     try:
-        return build_layout(p["design"], p["kinematics"], p.get("loads") or {}, p.get("shaft") or {},
-                            p.get("housing_params") or {})
+        hp = designed_housing_params(p, hp if hp is not None else (p.get("housing_params") or {}),
+                                     p.get("input_rpm"))
+        return build_layout(p["design"], p["kinematics"], p.get("loads") or {}, p.get("shaft") or {}, hp)
     except (KeyError, ValueError, TypeError) as ex:
         raise ValueError(f"Cannot build the housing model from this variant: {ex}")
 
@@ -202,7 +204,7 @@ def _scaled_layout(p, scale):
     hp = dict(p.get("housing_params") or {})
     W, H, D = L0["W"], L0["H"], L0["D"]
     hp.update(envelope_width=round(W * scale), envelope_height=round(H * scale), envelope_depth=round(D * scale))
-    return build_layout(p["design"], p["kinematics"], p.get("loads") or {}, p.get("shaft") or {}, hp)
+    return _layout(p, hp)
 
 
 def _shell_volume_mm3(L):
@@ -237,9 +239,15 @@ class _ThermalCase:
         self.Ta = float(p["ambient_c"])
         self._b = None
 
+    def quick(self, Q_in, cooling="natural", speed=0.0, fins=None):
+        """L1 lumped estimate on the same geometry (agrees with state() within ~0.3 %): used to RANK
+        candidates; every option that is reported is re-solved with state()."""
+        return oil_temp_lumped(Q_in, self.W_mm, self.H_mm, self.D_mm, self.L["wall_mm"], self.k, self.h_in,
+                               self.Ta, cooling, speed, fins, emissivity=EMISSIVITY)["oil_temp_c"]
+
     def state(self, dT_oil=None, Q_in=None, cooling="natural", speed=0.0, area_factor=1.0, fins=None):
         Ta = self.Ta
-        fl = fin_layout(fins, self.H_mm, self.D_mm) if fins else None
+        fl = fin_layout(fins, self.H_mm, self.D_mm, self.W_mm) if fins else None
         T_s = Ta + 20.0
         b = self._b
         f_fin, eta = 1.0, None
@@ -267,15 +275,19 @@ class _ThermalCase:
 
 
 def _fin_candidates(case):
-    """A small grid of practical fin sets for this housing (count from a target gap, height)."""
+    """A small grid of practical fin sets: side walls and top face, count from a target gap, height."""
     tf = FIN_THICKNESS_MM
     out = []
-    for gap in (12.0, 8.0):
-        per_side = int((case.D_mm) // (gap + tf))
-        if per_side < 2:
-            continue
-        for hf in (15.0, 25.0, 35.0):
-            out.append({"count": 2 * per_side, "height_mm": hf})
+    for loc, per in (("sides", 2), ("top", 1)):
+        for gap in (12.0, 8.0):
+            per_row = int((case.D_mm) // (gap + tf))
+            if per_row < 2:
+                continue
+            for hf in ((15.0, 25.0, 35.0) if loc == "sides" else (15.0, 25.0, 35.0, 50.0, 70.0)):
+                fc = {"count": per * per_row, "height_mm": hf}
+                if loc == "top":
+                    fc["location"] = "top"
+                out.append(fc)
     return out
 
 
@@ -298,6 +310,32 @@ def _run_thermal(p, progress):
     Q = max(0.0, Q_gen - cooler)
     goals = p.get("goals") or {}
     limit = float(goals.get("oil_temp_max_c", OIL_LIMIT_C))
+    # QA Q-022: every option is checked against the engineer's envelope (when the UI sends it)
+    env = p.get("envelope_mm") or {}
+    env = env if all(isinstance(env.get(k), (int, float)) and env[k] > 0 for k in ("width", "height", "depth")) else {}
+    stick = 44.0 if p.get("envelope_basis") == "overall" else 0.0
+    L0 = _layout(p)
+
+    def outer_size(change):
+        sc_ = float(change.get("housing_scale", p["housing_scale"]))
+        f_ = change.get("fins", p.get("fins") or None)
+        W_ = round(L0["W"] * sc_) if sc_ > 1 + 1e-9 else L0["W"]
+        H_ = round(L0["H"] * sc_) if sc_ > 1 + 1e-9 else L0["H"]
+        D_ = round(L0["D"] * sc_) if sc_ > 1 + 1e-9 else L0["D"]
+        if f_ and f_.get("count") and f_.get("height_mm"):
+            if f_.get("location") == "top":
+                H_ += float(f_["height_mm"])               # fins on the top face
+            else:
+                W_ += 2 * float(f_["height_mm"])           # fins stand out of both side walls
+        return [W_, H_, D_ + stick]
+
+    def envelope_check(change):
+        size = outer_size(change)
+        if not env:
+            return size, None, None
+        lim = [env["width"], env["height"], env["depth"]]
+        bad = [f"{n} {v:.0f} > {l:g} mm" for n, v, l in zip(("width", "height", "depth"), size, lim) if v > l + 0.5]
+        return size, not bad, ("exceeds the envelope: " + ", ".join(bad)) if bad else None
     target = min(TARGET_OIL_C, limit - 5.0)
     allowed = goals.get("allowed") or OPTION_KINDS
     mass_cap = goals.get("added_mass_max_kg")
@@ -312,7 +350,7 @@ def _run_thermal(p, progress):
     except ValueError as ex:
         return {"ok": False, "errors": [str(ex)]}
     model, h, ne = case.model, case.model.h, case.ne
-    fl_now = fin_layout(fins, case.H_mm, case.D_mm) if fins else None
+    fl_now = fin_layout(fins, case.H_mm, case.D_mm, case.W_mm) if fins else None
     if fl_now and fl_now["gap_mm"] < FIN_MIN_GAP_MM:
         return {"ok": False, "errors": [f"{fins['count']} fins do not fit on {case.D_mm:.0f} mm depth: gap "
                                         f"{fl_now['gap_mm']:.1f} mm < {FIN_MIN_GAP_MM:.0f} mm. Use fewer fins."]}
@@ -381,9 +419,13 @@ def _run_thermal(p, progress):
             def opt(kind, label, change, t_oil, added_kg=0.0, note=""):
                 ok_mass = mass_cap is None or added_kg <= float(mass_cap) + 1e-9
                 assumed = "efficiency_per_stage" in change
-                options.append({"kind": kind, "label": label + (" (assumption)" if assumed else ""), "change": change,
-                                "oil_temp_c": round(t_oil, 1),
-                                "pass": bool(t_oil <= limit and ok_mass), "added_mass_kg": round(added_kg, 3),
+                size, fits, why = envelope_check(change)
+                options.append({"kind": kind, "label": label + (" (assumption)" if assumed else "")
+                                + (" — exceeds envelope" if fits is False else ""), "change": change,
+                                "oil_temp_c": round(t_oil, 1), "outer_size_mm": size, "fits_envelope": fits,
+                                "envelope_violation": why,
+                                "pass": bool(t_oil <= limit and ok_mass and fits is not False),
+                                "added_mass_kg": round(added_kg, 3),
                                 "note": note, "meets_mass_goal": ok_mass,
                                 "assumption": EFF_ASSUMPTION if assumed else None,
                                 "basis": "assumption" if assumed else "computed"})
@@ -395,26 +437,36 @@ def _run_thermal(p, progress):
             # fins under the current cooling, and under a 5 m/s fan if currently natural
             fin_res = []
             for fc in _fin_candidates(case):
-                fl = fin_layout(fc, case.H_mm, case.D_mm)
+                fl = fin_layout(fc, case.H_mm, case.D_mm, case.W_mm)
                 if fl["gap_mm"] < FIN_MIN_GAP_MM:
                     continue
                 for c_, s_ in ([(cool, spd)] + ([("forced", 5.0), ("forced", 10.0)] if cool == "natural" else [])):
-                    r_ = case.state(Q_in=Q, cooling=c_, speed=s_, fins=fc)
-                    fin_res.append((fc, c_, s_, r_["T_oil"], fin_mass_kg(fl, rho), fl["gap_mm"], r_["fin_efficiency"]))
+                    fin_res.append((fc, c_, s_, case.quick(Q, c_, s_, fc), fin_mass_kg(fl, rho), fl["gap_mm"], None))
             for c_, s_ in ([(cool, spd)] + ([("forced", 5.0), ("forced", 10.0)] if cool == "natural" else [])):
                 rows = [r for r in fin_res if r[1] == c_ and r[2] == s_]
                 if not rows:
                     continue
-                passing = sorted([r for r in rows if r[3] <= limit], key=lambda r: r[4])
-                pick = passing[0] if passing else min(rows, key=lambda r: r[3])
-                fc, _, _, t_, m_, gap_, eta_f = pick
+                fit_ok = lambda r: envelope_check({"fins": r[0]})[1] is not False
+                passing = sorted([r for r in rows if r[3] <= limit and fit_ok(r)], key=lambda r: r[4])
+                rows = [r for r in rows if fit_ok(r)] or rows
+                pick = None
+                for cand in passing[:3]:                       # FEM-confirm the lightest quick passes
+                    st_ = case.state(Q_in=Q, cooling=c_, speed=s_, fins=cand[0])
+                    if st_["T_oil"] <= limit:
+                        pick = (cand, st_)
+                        break
+                if pick is None:
+                    cand = min(rows, key=lambda r: r[3])
+                    pick = (cand, case.state(Q_in=Q, cooling=c_, speed=s_, fins=cand[0]))
+                (fc, _, _, _, m_, gap_, _), st_ = pick
+                t_, eta_f = st_["T_oil"], st_["fin_efficiency"]
                 ch = {"fins": fc}
-                lab = f"Cooling fins {fc['count']} × {fc['height_mm']:g} mm"
+                lab = f"Cooling fins {fc['count']} × {fc['height_mm']:g} mm" + (" on top" if fc.get("location") == "top" else " on the sides")
                 if c_ == "forced" and cool == "natural":
                     ch.update(cooling="forced", air_speed_ms=s_)
                     lab += f" + fan {s_:g} m/s"
                 opt("fins" if "cooling" not in ch else "combined", lab, ch, t_, m_,
-                    f"on both side walls, {FIN_THICKNESS_MM:g} mm thick, gap {gap_:.0f} mm, fin efficiency "
+                    f"{'on the top face' if fc.get('location') == 'top' else 'on both side walls'}, {FIN_THICKNESS_MM:g} mm thick, gap {gap_:.0f} mm, fin efficiency "
                     f"{100 * eta_f:.0f} %; +{m_:.2f} kg")
             need_cool = max(0.0, Q - q_allow)
             cw = 50.0 * math.ceil(need_cool / 50.0)
@@ -435,11 +487,13 @@ def _run_thermal(p, progress):
                 for sp in ((5.0, 10.0) if cool == "natural" else (max(spd, 5.0),)):
                     rows = []
                     for fc in _fin_candidates(case):
-                        fl = fin_layout(fc, case.H_mm, case.D_mm)
-                        if fl["gap_mm"] < FIN_MIN_GAP_MM:
+                        fl = fin_layout(fc, case.H_mm, case.D_mm, case.W_mm)
+                        if fl["gap_mm"] < FIN_MIN_GAP_MM or envelope_check({"fins": fc})[1] is False:
                             continue
                         rows.append((fin_mass_kg(fl, rho), fc, fl["gap_mm"]))
                     for m_, fc, gap_ in sorted(rows, key=lambda r: r[0]):
+                        if case.quick(Q99, "forced", sp, fc) > limit + 1.0:
+                            continue
                         t_ = case.state(Q_in=Q99, cooling="forced", speed=sp, fins=fc)["T_oil"]
                         if t_ <= limit:
                             found = (sp, fc, t_, m_, gap_)
@@ -448,9 +502,10 @@ def _run_thermal(p, progress):
                         break
                 if found:
                     sp, fc, t_, m_, gap_ = found
-                    opt("combined", f"99 %/stage gears + fan {sp:g} m/s + fins {fc['count']} × {fc['height_mm']:g} mm",
+                    opt("combined", f"99 %/stage gears + fan {sp:g} m/s + fins {fc['count']} × {fc['height_mm']:g} mm"
+                                    + (" on top" if fc.get("location") == "top" else ""),
                         {"efficiency_per_stage": 0.99, "cooling": "forced", "air_speed_ms": sp, "fins": fc}, t_, m_,
-                        f"fins on both side walls, gap {gap_:.0f} mm; +{m_:.2f} kg")
+                        f"fins {'on the top face' if fc.get('location') == 'top' else 'on both side walls'}, gap {gap_:.0f} mm; +{m_:.2f} kg")
                     for f in fixes:
                         if f["fix"] == "combined" and f["predicted_oil_temp_c"] is None:
                             f.update(detail=f"99 %/stage gears + fan {sp:g} m/s + {fc['count']} fins × "
@@ -459,7 +514,13 @@ def _run_thermal(p, progress):
             # larger housing: a new mesh per size (more outer area, more oil)
             progress("Solving", 0.75)
             vol0 = _shell_volume_mm3(L)
-            for sc in (1.3, 1.6):
+            if env:
+                s_max = min(env["width"] / L["W"], env["height"] / L["H"], (env["depth"] - stick) / L["D"])
+                s_max = math.floor(s_max * 100) / 100
+                scales = sorted({x for x in (min(1.3, s_max), s_max) if x > 1.02})
+            else:
+                scales = [1.3, 1.6]
+            for sc in scales:
                 try:
                     Ls = _scaled_layout({**p, "housing_params": {**(p.get("housing_params") or {}),
                                                                  "envelope_width": L["W"],
@@ -480,11 +541,15 @@ def _run_thermal(p, progress):
                     found = None
                     rows = []
                     for fc in _fin_candidates(cs):
-                        fl = fin_layout(fc, cs.H_mm, cs.D_mm)
+                        fl = fin_layout(fc, cs.H_mm, cs.D_mm, cs.W_mm)
+                        if envelope_check({"housing_scale": round(p["housing_scale"] * sc, 3), "fins": fc})[1] is False:
+                            continue
                         if fl["gap_mm"] >= FIN_MIN_GAP_MM:
                             rows.append((fin_mass_kg(fl, rho), fc, fl["gap_mm"]))
                     for sp in ((5.0, 10.0) if cool == "natural" else (max(spd, 5.0),)):
                         for m_, fc, gap_ in sorted(rows, key=lambda r: r[0]):
+                            if cs.quick(Q, "forced", sp, fc) > limit + 1.0:
+                                continue
                             t_ = cs.state(Q_in=Q, cooling="forced", speed=sp, fins=fc)["T_oil"]
                             if t_ <= limit:
                                 found = (sp, fc, t_, m_, gap_)
@@ -494,7 +559,7 @@ def _run_thermal(p, progress):
                     if found:
                         sp, fc, t_, m_, gap_ = found
                         opt("combined", f"Larger housing ×{sc:g} + fan {sp:g} m/s + fins {fc['count']} × "
-                                        f"{fc['height_mm']:g} mm",
+                                        f"{fc['height_mm']:g} mm" + (" on top" if fc.get("location") == "top" else ""),
                             {"housing_scale": round(p["housing_scale"] * sc, 3), "cooling": "forced",
                              "air_speed_ms": sp, "fins": fc}, t_, dm + m_,
                             f"+{dm + m_:.2f} kg (housing +{dm:.2f}, fins +{m_:.2f}); check the envelope")
@@ -516,7 +581,8 @@ def _run_thermal(p, progress):
                  "Heat source = P × (1 − η) delivered to a well-mixed oil volume; local hot spots at bearings "
                  "and the gear mesh are not resolved."]
     if fl_now:
-        warnings.append(f"Fins: {fl_now['count']} × {fl_now['height_mm']:g} mm on the side walls (gap "
+        warnings.append(f"Fins: {fl_now['count']} × {fl_now['height_mm']:g} mm "
+                        f"{'on the top face' if fl_now['location'] == 'top' else 'on the side walls'} (gap "
                         f"{fl_now['gap_mm']:.1f} mm, efficiency {100 * (st['fin_efficiency'] or 0):.0f} %) raise the outer "
                         f"convective conductance ×{st['fin_factor']:.2f}; applied uniformly to the outer skin "
                         "(fins are not meshed). Radiation is counted on the base envelope only.")
@@ -530,7 +596,12 @@ def _run_thermal(p, progress):
               Check("heat balance error", abs(q_out - Q) / max(Q, 1e-9) if Q >= 1 else 0.0, 0.01, "-", "max",
                     "solver self-check")]
     computed = [o for o in options if o["basis"] == "computed"]
-    best_computed = next((o for o in computed if o["pass"]), None)
+    best_computed = next((o for o in computed if o["pass"]), None)          # pass already requires the envelope
+    if options and not env:
+        warnings.append("No envelope_mm in the request: options were not checked against the envelope.")
+    size_now, fits_now, why_now = envelope_check({})
+    if fits_now is False:
+        warnings.append(f"This configuration {why_now}.")
     closest_computed = min(computed, key=lambda o: o["oil_temp_c"]) if computed else None
     goal_report = None
     if goals:
@@ -557,7 +628,7 @@ def _run_thermal(p, progress):
                     "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
            "solve_time_s": round(solve_s, 2), "outer_iterations": 1,
            "target_oil_temp_c": target, "fixes": fixes, "options": options, "goal_report": goal_report,
-           "best_without_assumption": best_computed,
+           "best_without_assumption": best_computed, "outer_size_mm": size_now, "fits_envelope": fits_now,
            "closest_without_assumption": None if best_computed else closest_computed,
            "validation": "screening-level: correlations + FEM, not yet validated against test data"}
     progress("Post-processing", 1.0)
@@ -580,10 +651,16 @@ register(SolverSpec(
             "fins": {"type": "object", "default": {}, "allow_extra": False,
                      "fields": {"count": {"type": "integer", "min": 0, "max": 200},
                                 "height_mm": {"type": "number", "min": 0, "max": 100},
-                                "thickness_mm": {"type": "number", "min": 1, "max": 10}}},
+                                "thickness_mm": {"type": "number", "min": 1, "max": 10},
+                                "location": {"type": "string", "enum": ["sides", "top"]}}},
             "oil_cooler_w": {"type": "number", "min": 0, "max": 1e6, "default": 0.0},
             "housing_scale": {"type": "number", "min": 1.0, "max": 3.0, "default": 1.0},
             "efficiency_per_stage": {"type": "number", "min": 0.8, "max": 0.999},
+            "envelope_mm": {"type": "object", "default": {}, "allow_extra": False,
+                            "fields": {"width": {"type": "number", "min": 0, "max": 1e5},
+                                       "height": {"type": "number", "min": 0, "max": 1e5},
+                                       "depth": {"type": "number", "min": 0, "max": 1e5}}},
+            "envelope_basis": {"type": "string", "enum": ["housing", "overall"], "default": "housing"},
             "goals": {"type": "object", "default": {}, "allow_extra": False,
                       "fields": {"oil_temp_max_c": {"type": "number", "min": 30, "max": 200},
                                  "added_mass_max_kg": {"type": "number", "min": 0, "max": 1000},
@@ -653,7 +730,12 @@ def _run_review(p, progress):
     bad = [c for c in p["checks"] if c not in CHECKS]
     if bad:
         return {"ok": False, "errors": [f"unknown checks {bad}; choose from {CHECKS}"]}
-    findings = review(p["design"], p["kinematics"], L, mat, p["checks"], p.get("parts"), p.get("input_rpm"))
+    try:
+        plan = shaft_plan({k: p.get(k) for k in ("design", "kinematics", "loads", "shaft", "housing_params")},
+                          p.get("input_rpm"))
+    except Exception:
+        plan = None
+    findings = review(p["design"], p["kinematics"], L, mat, p["checks"], p.get("parts"), p.get("input_rpm"), plan)
     progress("Post-processing", 1.0)
     counts = {s: sum(f["severity"] == s for f in findings) for s in ("critical", "warning", "info")}
     names = {pt.get("name") for pt in (p.get("parts") or []) if isinstance(pt, dict)}
@@ -677,8 +759,9 @@ register(SolverSpec(
             "input_rpm": {"type": "number", "exclusive_min": 0, "max": 1e5},
             "checks": {"type": "array", "items_type": "string", "default": CHECKS}},
     run=_run_review,
-    benchmarks=[Benchmark("regression-review-2stage", "ACE regression v0.2: real variant must flag the closed-housing assembly problem",
-                          {**EXAMPLE_VARIANT}, {"outputs.counts.critical": 1}, 0.0)],
+    benchmarks=[Benchmark("regression-review-2stage", "ACE regression v0.9: real variant with the body + bolted end cover "
+                          "of /generate-assembly v4 has no critical finding (closed-box problem solved)",
+                          {**EXAMPLE_VARIANT}, {"outputs.counts.critical": 0}, 0.0)],
     limitations=["rules on the parametric layout, not a geometric clash detection on the STL parts yet",
                  "part names matched heuristically from the parts list"],
     example={**EXAMPLE_VARIANT, "checks": CHECKS},
