@@ -94,14 +94,15 @@ def check_variant_shafts(variant, input_rpm):
                                                 "bearing_journal": f"bore of {brg['A']['designation']} chosen for "
                                                                    f"L10 ≥ {LIFE_H} h; journal also sized for "
                                                                    "fatigue, slope and deflection"}}
-        if seat_need > s["d"] * 1.01:
-            warns.append(f"{s['name']}: fatigue under combined bending + torsion needs Ø{seat_need:.1f} mm at the gear "
-                         f"seat, more than the Ø{s['d']:.0f} mm torsion-only diameter in the model.")
-        need = max(g["journal_dia_mm"], 0)
-        if need > s["d"] * 1.01:
-            warns.append(f"{s['name']}: the Ø{s['d']:.0f} mm torsion-only diameter is too small at the bearings — "
-                         f"combined bending + torsion fatigue and a {brg['A']['designation']} bearing "
-                         f"(L10 ≥ {LIFE_H} h at {spec['rpm']:.0f} rpm) need Ø{need:.0f} mm journals.")
+        # since /generate-assembly v4 the 3D model draws THIS designed stepped shaft (not the torsion-only size)
+        entry["torsion_only_diameter_mm"] = s["d"]
+        entry["diameter_in_model_mm"] = g["seat_dia_mm"]
+        entry["model_segments_mm"] = [[g_["x0_mm"], g_["x1_mm"], g_["dia_mm"]] for g_ in g["segments"]]
+        if max(g["journal_dia_mm"], seat_need) > s["d"] * 1.01:
+            warns.append(f"{s['name']}: drawn as a stepped shaft — Ø{g['journal_dia_mm']:.0f} mm journals for "
+                         f"{brg['A']['designation']}/{brg['B']['designation']} bearings (L10 ≥ {LIFE_H} h at "
+                         f"{spec['rpm']:.0f} rpm) and a Ø{g['seat_dia_mm']:.0f} mm gear seat (bending + torsion fatigue); "
+                         f"the Ø{s['d']:.0f} mm torsion-only size is only the starting estimate.")
         out.append(entry)
     if L["stages"] == 2:
         warns.append("Shaft check assumes a pilot bearing between the coaxial input and output shafts "

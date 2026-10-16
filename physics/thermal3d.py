@@ -124,23 +124,47 @@ class ThermalModel:
         return T, float(T_oil), i1 + i2
 
 
-def h_natural_air(dT, L_m, T_s, T_amb, emissivity):
-    """Free convection (McAdams, laminar vertical surface) + linearised radiation, W/(m²K)."""
-    dT = max(dT, 0.1)
-    hc = 1.42 * (dT / max(L_m, 0.02)) ** 0.25
+# air at 1 atm vs temperature (Incropera, Fundamentals of Heat and Mass Transfer, Table A.4)
+_AIR_T = (250.0, 300.0, 350.0, 400.0, 450.0, 500.0, 600.0)
+_AIR_NU = (11.44e-6, 15.89e-6, 20.92e-6, 26.41e-6, 32.39e-6, 38.79e-6, 52.69e-6)
+_AIR_K = (0.0223, 0.0263, 0.0300, 0.0338, 0.0373, 0.0407, 0.0469)
+_AIR_ALPHA = (15.9e-6, 22.5e-6, 29.9e-6, 38.3e-6, 47.2e-6, 56.7e-6, 76.9e-6)
+_AIR_PR = (0.720, 0.707, 0.700, 0.690, 0.686, 0.684, 0.685)
+
+
+def air_props(T_film_c):
+    """k [W/mK], nu [m²/s], alpha [m²/s], Pr of air at the film temperature (linear interpolation)."""
+    T = min(max(T_film_c + 273.15, _AIR_T[0]), _AIR_T[-1])
+    return {"k": float(np.interp(T, _AIR_T, _AIR_K)), "nu": float(np.interp(T, _AIR_T, _AIR_NU)),
+            "alpha": float(np.interp(T, _AIR_T, _AIR_ALPHA)), "Pr": float(np.interp(T, _AIR_T, _AIR_PR))}
+
+
+def _h_rad(T_s, T_amb, emissivity):
     Ts, Ta = T_s + 273.15, T_amb + 273.15
-    hr = emissivity * SIGMA * (Ts**2 + Ta**2) * (Ts + Ta)
-    return hc, hr
+    return emissivity * SIGMA * (Ts**2 + Ta**2) * (Ts + Ta)
+
+
+def h_natural_air(dT, L_m, T_s, T_amb, emissivity):
+    """Free convection on a vertical surface of height L: Churchill & Chu (1975), all Ra
+    (Incropera eq. 9.26), air properties at the film temperature; + linearised radiation. W/(m²K).
+    (v0.10: replaces the McAdams 1.42·(ΔT/L)^¼ shortcut, which was up to ~10 % optimistic when hot.)"""
+    dT = max(dT, 0.1)
+    L = max(L_m, 0.02)
+    a = air_props(0.5 * (T_s + T_amb))
+    beta = 1.0 / (0.5 * (T_s + T_amb) + 273.15)
+    Ra = 9.81 * beta * dT * L ** 3 / (a["nu"] * a["alpha"])
+    Nu = (0.825 + 0.387 * Ra ** (1 / 6) / (1 + (0.492 / a["Pr"]) ** (9 / 16)) ** (8 / 27)) ** 2
+    return Nu * a["k"] / L, _h_rad(T_s, T_amb, emissivity)
 
 
 def h_forced_air(v, L_m, T_s, T_amb, emissivity):
-    """Flat plate in parallel flow, average Nusselt (laminar 0.664 Re^½ Pr^⅓ / mixed above 5e5)."""
-    Re = max(v, 0.01) * max(L_m, 0.02) / AIR["nu"]
+    """Flat plate in parallel flow, average Nusselt (laminar 0.664 Re^½ Pr^⅓ / mixed above 5e5),
+    air properties at the film temperature."""
+    a = air_props(0.5 * (T_s + T_amb))
+    Re = max(v, 0.01) * max(L_m, 0.02) / a["nu"]
     if Re < 5e5:
-        Nu = 0.664 * Re**0.5 * AIR["Pr"] ** (1 / 3)
+        Nu = 0.664 * Re**0.5 * a["Pr"] ** (1 / 3)
     else:
-        Nu = (0.037 * Re**0.8 - 871) * AIR["Pr"] ** (1 / 3)
-    hc = Nu * AIR["k"] / L_m
-    Ts, Ta = T_s + 273.15, T_amb + 273.15
-    hr = emissivity * SIGMA * (Ts**2 + Ta**2) * (Ts + Ta)
-    return hc, hr, Re
+        Nu = (0.037 * Re**0.8 - 871) * a["Pr"] ** (1 / 3)
+    hc = Nu * a["k"] / L_m
+    return hc, _h_rad(T_s, T_amb, emissivity), Re

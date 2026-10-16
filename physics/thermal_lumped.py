@@ -1,7 +1,7 @@
 """Fast thermal screen of a gearbox housing (L1) + cooling-fin model shared with the 3D solver.
 
 Lumped network: oil --(h_oil·A_in)--> wall --(t/k·A)--> outer skin --((h_c+h_r)·A_out)--> ambient.
-Same correlations as thermal_housing_3d (McAdams natural / flat-plate forced + radiation), so the
+Same correlations as thermal_housing_3d (Churchill-Chu natural / flat-plate forced + radiation), so the
 screen and the 3D result use one physics; the 3D FEM stays the reference (L2).
 
 Fins: straight rectangular fins on the two side walls (x = 0 and x = W, vertical, running along
@@ -13,7 +13,7 @@ Under forced air the fins are assumed parallel to the flow (h of the base plate)
 counted on the base envelope only (fins mostly see each other) — conservative.
 """
 import math
-from .thermal3d import AIR, h_natural_air, h_forced_air
+from .thermal3d import AIR, air_props, h_natural_air, h_forced_air
 
 FIN_THICKNESS_MM = 3.0        # cast / machined aluminium fin, practical minimum
 FIN_MIN_GAP_MM = 4.0          # below this, casting and dirt make fins useless
@@ -27,10 +27,11 @@ def h_channel_natural(gap_mm, L_fin_mm, T_s, T_amb):
     Lf = max(L_fin_mm, 5.0) * 1e-3
     dT = max(T_s - T_amb, 0.1)
     beta = 1.0 / (0.5 * (T_s + T_amb) + 273.15)
-    Ra_s = G * beta * dT * s ** 3 / (AIR["nu"] * ALPHA_AIR)
+    a = air_props(0.5 * (T_s + T_amb))
+    Ra_s = G * beta * dT * s ** 3 / (a["nu"] * a["alpha"])
     El = max(Ra_s * s / Lf, 1e-9)
     Nu = (576.0 / El ** 2 + 2.873 / El ** 0.5) ** -0.5
-    return Nu * AIR["k"] / s
+    return Nu * a["k"] / s
 
 
 def fin_layout(fins, H_mm, D_mm, W_mm=None):
