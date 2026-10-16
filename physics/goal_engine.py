@@ -24,6 +24,8 @@ OIL_LIMIT_C = 90.0
 COOLING_KINDS = ["natural", "fan", "fins", "efficiency", "oil_cooler"]
 DEFAULT_ALLOWED = ["natural", "fan", "fins", "efficiency"]
 SHAFT_STICKOUT_MM = 22.0          # same as assembly3d.SHAFT_STICKOUT
+EFF_ASSUMPTION = ("η 99 %/stage is an assumption (ground, profile-corrected gears + low-loss bearings), not computed: "
+                  "a gear/bearing loss model (ISO/TR 14179) is not in the solver yet")
 
 
 def h_oil(variant, input_rpm, oil_vg=68):
@@ -66,7 +68,8 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
            "limit_c": limit_c, "pass_natural": nat["oil_temp_c"] <= limit_c, "measure": None}
     if res["pass_natural"]:
         res["measure"] = {"label": "No cooling needed (natural convection)", "change": {},
-                          "oil_temp_c": res["oil_temp_natural_c"], "added_mass_kg": 0.0}
+                          "oil_temp_c": res["oil_temp_natural_c"], "added_mass_kg": 0.0, "basis": "computed",
+                          "assumption": None}
         return res
     # cheapest first: fan → efficiency+fan → fins (+fan) → efficiency+fan+fins → oil cooler
     tries = []
@@ -88,9 +91,10 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
                 continue
             tries.append((f"Fins {fs['count']} × {fs['height_mm']:g} mm", {"fins": fs}, Q, dict(fins=fs), fl))
             if "fan" in allowed:
-                tries.append((f"Fins {fs['count']} × {fs['height_mm']:g} mm + fan 5 m/s",
-                              {"fins": fs, "cooling": "forced", "air_speed_ms": 5.0}, Q,
-                              dict(fins=fs, cooling="forced", air_speed=5.0), fl))
+                for sp in (5.0, 10.0):
+                    tries.append((f"Fins {fs['count']} × {fs['height_mm']:g} mm + fan {sp:g} m/s",
+                                  {"fins": fs, "cooling": "forced", "air_speed_ms": sp}, Q,
+                                  dict(fins=fs, cooling="forced", air_speed=sp), fl))
             if "efficiency" in allowed and "fan" in allowed:
                 tries.append((f"99 %/stage + fan 5 m/s + fins {fs['count']} × {fs['height_mm']:g} mm",
                               {"efficiency_per_stage": 0.99, "fins": fs, "cooling": "forced", "air_speed_ms": 5.0},
@@ -106,25 +110,36 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
     res["max_power_natural_kw"] = round(lo_p, 2)
     best = {"label": "Natural convection", "change": {}, "oil_temp_c": res["oil_temp_natural_c"],
             "added_mass_kg": 0.0}
+    passing = []
+    closest_computed = best
     for label, change, q, kw, fl in tries:
         t = run(q, **kw)["oil_temp_c"]
         m = fin_mass_kg(fl, rho)
-        cand = {"label": label, "change": change, "oil_temp_c": round(t, 1), "added_mass_kg": round(m, 3)}
+        assumed = "efficiency_per_stage" in change
+        cand = {"label": label + (" (assumption)" if assumed else ""), "change": change, "oil_temp_c": round(t, 1),
+                "added_mass_kg": round(m, 3), "basis": "assumption" if assumed else "computed",
+                "assumption": EFF_ASSUMPTION if assumed else None}
         if t <= limit_c:
-            # prefer no added mass, then the lightest fins
-            if res["measure"] is None or m < res["measure"]["added_mass_kg"] - 1e-9:
-                res["measure"] = cand
-            if m == 0:
-                break
+            passing.append(cand)
+        if not assumed and t < closest_computed["oil_temp_c"]:
+            closest_computed = cand
         if best is None or t < best["oil_temp_c"]:
             best = cand
-    if res["measure"] is None and "oil_cooler" in allowed:
+    # QA Q-020: a computed measure wins over one that relies on the efficiency assumption
+    comp = sorted([c for c in passing if c["basis"] == "computed"], key=lambda c: c["added_mass_kg"])
+    assm = sorted([c for c in passing if c["basis"] != "computed"], key=lambda c: c["added_mass_kg"])
+    if comp:
+        res["measure"] = comp[0]
+    elif assm:
+        res["measure"] = assm[0]
+        res["best_without_assumption"] = closest_computed
+    if (res["measure"] is None or res["measure"]["basis"] != "computed") and "oil_cooler" in allowed:
         dT_t = (limit_c - 5) - ambient_c
         G = Q / max(nat["oil_temp_c"] - ambient_c, 1e-9)        # W/K at the natural state (screen)
         cw = 50.0 * math.ceil(max(0.0, Q - G * dT_t) / 50.0)
         t = run(oil_cooler_w=cw)["oil_temp_c"]
         res["measure"] = {"label": f"Oil cooler {cw:.0f} W", "change": {"oil_cooler_w": cw},
-                          "oil_temp_c": round(t, 1), "added_mass_kg": 0.0}
+                          "oil_temp_c": round(t, 1), "added_mass_kg": 0.0, "basis": "computed", "assumption": None}
     if res["measure"] is None:
         res["closest"] = best
     return res
@@ -136,8 +151,11 @@ def check_goals(variant, goals):
     ts = variant.get("thermal_screen") or {}
     meas = ts.get("measure")
     t_oil = meas["oil_temp_c"] if meas else (ts.get("closest") or {}).get("oil_temp_c", ts.get("oil_temp_natural_c"))
-    out["oil_temp_max_c"] = {"value": t_oil, "limit": ts.get("limit_c"), "pass": meas is not None,
-                             "with": meas["label"] if meas else None}
+    computed = meas is not None and meas.get("basis", "computed") == "computed"
+    out["oil_temp_max_c"] = {"value": t_oil, "limit": ts.get("limit_c"), "pass": computed,
+                             "with": meas["label"] if meas else None,
+                             # QA Q-020: an assumption alone never makes a goal PASS
+                             "passes_only_with_assumption": meas is not None and not computed}
     if goals.get("mass_max_kg") is not None:
         m = variant["mass_kg"]["total"] + (meas["added_mass_kg"] if meas else 0.0)
         out["mass_max_kg"] = {"value": round(m, 3), "limit": goals["mass_max_kg"], "pass": m <= goals["mass_max_kg"]}
@@ -167,3 +185,15 @@ def assembly_bbox(variant):
     return {"min": [0.0, 0.0, -SHAFT_STICKOUT_MM],
             "max": [float(hp["envelope_width"]), float(hp["envelope_height"]),
                     float(hp["envelope_depth"]) + SHAFT_STICKOUT_MM]}
+
+
+def assembly_warnings(variant):
+    """QA Q-011: the closed box of /generate-assembly cannot be assembled when gears are larger than the bores."""
+    d = variant["design"]
+    tip = d["module_mm"] * (d["gear_teeth"] + 2)
+    bore = float(variant["housing_params"].get("bore_diameter") or 0)
+    if bore and tip > bore:
+        return [f"Assembly: the housing is a closed box; the Ø{tip:.0f} mm gear cannot pass the Ø{bore:.0f} mm bore. "
+                "Fix: split the housing on the shaft plane (bolted halves) or add a bolted side cover larger than "
+                f"Ø{tip + 4:.0f} mm. Not yet in the 3D model (planned, G2)."]
+    return []

@@ -379,6 +379,7 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -
             try:
                 g = goals or {}
                 r["assembly_bbox_mm"] = goal_engine.assembly_bbox(r)
+                r["warnings"] = list(r["warnings"]) + goal_engine.assembly_warnings(r)
                 r["thermal_screen"] = goal_engine.thermal_screen(
                     r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
                     float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"))

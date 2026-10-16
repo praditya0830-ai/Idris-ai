@@ -84,6 +84,16 @@ def check_variant_shafts(variant, input_rpm):
         })
         seat_need = max((sec["d_required_mm"] for sec in res["sections"] if sec["name"] == "gear seat"), default=0)
         entry["seat_diameter_required_by_strength_mm"] = round(seat_need, 2)
+        # QA Q-015: why this diameter — each requirement as data, and which one governs
+        cand = {"torsion_only": float(s["d"]), "fatigue_at_gear_seat": float(seat_need),
+                "bearing_journal": float(g["journal_dia_mm"])}
+        gov = max(cand, key=cand.get)
+        entry["diameter_basis_mm"] = {**{k: round(v, 2) for k, v in cand.items()}, "governing": gov,
+                                      "notes": {"torsion_only": "τ_allow sizing used by the 3D model",
+                                                "fatigue_at_gear_seat": "Shigley DE-Goodman, bending + torsion, Kf",
+                                                "bearing_journal": f"bore of {brg['A']['designation']} chosen for "
+                                                                   f"L10 ≥ {LIFE_H} h; journal also sized for "
+                                                                   "fatigue, slope and deflection"}}
         if seat_need > s["d"] * 1.01:
             warns.append(f"{s['name']}: fatigue under combined bending + torsion needs Ø{seat_need:.1f} mm at the gear "
                          f"seat, more than the Ø{s['d']:.0f} mm torsion-only diameter in the model.")
