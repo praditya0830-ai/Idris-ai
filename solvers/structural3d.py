@@ -5,16 +5,18 @@ import numpy as np
 from ace_core import SolverSpec, Benchmark, Check, register
 from physics.fem3d import box_model
 from ._example import EXAMPLE_VARIANT
+from physics.variant_shafts import designed_housing_params
 from physics.housing import (HOUSING_MATERIALS, find_material, build_layout, build_model,
                              bearing_loads, fixture_nodes)
 
 MESH_DIVISIONS = {"coarse": 1, "standard": 2, "fine": 3}      # elements through the wall
-REG_VM = 10.0747          # regression value, set below after first validated run
+REG_VM = 11.7776   # v0.9: bores = bearing OD (was 10.0747 with shaft+2 clearance holes)
 MAX_ELEMENTS = int(os.environ.get("IDRIS_FEA_MAX_ELEMENTS", "60000"))
 KNOWN_HP_KEYS = {"envelope_width", "envelope_height", "envelope_depth", "wall_thickness", "gear_ratio",
                  "bore_diameter"}
 FRAME_NOTE = ("Same coordinate frame as /generate-assembly: housing x∈[0,W], y∈[0,H], z∈[0,D] mm, "
-              "shafts along +z at y = H/2.")
+              "shafts along +z at y = H/2. Body and bolted end cover are analysed as one rigidly joined part; "
+              "bores = bearing outside diameter.")
 
 
 # ------------------------------------------------------------------ solid block (verification)
@@ -89,7 +91,8 @@ def _run_housing(p, progress):
         warnings.append(f"housing_params keys not used by the solver yet: {extra}")
     progress("Meshing", 0.05)
     try:
-        L = build_layout(p["design"], p["kinematics"], p.get("loads") or {}, p.get("shaft") or {}, hp)
+        L = build_layout(p["design"], p["kinematics"], p.get("loads") or {}, p.get("shaft") or {},
+                         designed_housing_params(p, hp, p.get("input_rpm")))
     except (KeyError, ValueError, TypeError) as ex:
         return {"ok": False, "errors": [f"Cannot build the housing model from this variant: {ex}"]}
     model = build_model(L, p["mesh"])
@@ -189,7 +192,7 @@ register(SolverSpec(
     },
     run=_run_housing,
     benchmarks=[Benchmark(
-        "regression-housing-2stage-coarse", "ACE regression v0.2 on a real /generate-variants variant (self-consistency)",
+        "regression-housing-2stage-coarse", "ACE regression v0.9 on a real /generate-variants variant, bores = bearing OD (self-consistency)",
         {**EXAMPLE_VARIANT, "mesh": "coarse"},
         {"outputs.max_von_mises_MPa": REG_VM}, 0.02)],
     limitations=["housing = closed box of /generate-assembly (no ribs, feet, fillets or bearing bosses)",
