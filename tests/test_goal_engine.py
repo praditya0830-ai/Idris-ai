@@ -137,3 +137,26 @@ def _cfd_body(body):
     c, b = handle_post("/cfd?sync=1", body)
     assert c == 200, b
     return b["result"]
+
+
+def test_q022_options_respect_envelope():
+    env = {"envelope_mm": {"width": 200, "height": 200, "depth": 150}, "envelope_basis": "overall"}
+    r = _cfd(env)
+    for o in r["options"]:
+        if o["fits_envelope"] is False:
+            assert not o["pass"] and "exceeds envelope" in o["label"] and o["envelope_violation"]
+        w, h, d = o["outer_size_mm"]
+        assert o["fits_envelope"] == (w <= 200.5 and h <= 200.5 and d <= 150.5)
+    b = r["best_without_assumption"]
+    assert b is None or b["fits_envelope"] is True
+    # generator: every computed measure stays inside the envelope (fins included)
+    o = generate_variants(REQ, goals={"oil_temp_max_c": 90})
+    for v in o["variants"]:
+        m = v["thermal_screen"]["measure"]
+        hp = v["housing_params"]
+        f = (m or {}).get("change", {}).get("fins")
+        if f:
+            if f.get("location") == "top":
+                assert hp["envelope_height"] + f["height_mm"] <= 200.5
+            else:
+                assert hp["envelope_width"] + 2 * f["height_mm"] <= 200.5

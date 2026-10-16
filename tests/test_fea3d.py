@@ -49,7 +49,7 @@ def test_layout_matches_assembly3d():
     L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], v["housing_params"])
     assert np.allclose(asm["layout"]["axis_a_mm"], [L["x_a"], L["yc"]])
     assert np.allclose(asm["layout"]["axis_b_mm"], [L["x_b"], L["yc"]])
-    housing = [p for p in asm["parts"] if p["name"] == "Housing"][0]["verts"]
+    housing = np.vstack([p["verts"] for p in asm["parts"] if p["kind"] == "housing"])     # body + end cover
     m = build_model(L, "coarse")
     assert np.allclose(m.nodes.min(0), housing.min(0), atol=1e-6)
     assert np.allclose(m.nodes.max(0), housing.max(0), atol=1e-6)

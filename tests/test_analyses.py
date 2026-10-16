@@ -58,7 +58,7 @@ def test_thermal_more_air_is_cooler():
 
 def test_review_job():
     parts = [{"name": n, "kind": k} for n, k in [
-        ("Housing", "housing"), ("Input shaft", "shaft"), ("Intermediate shaft", "shaft"), ("Output shaft", "shaft"),
+        ("Housing", "housing"), ("Housing cover", "housing"), ("Input shaft", "shaft"), ("Intermediate shaft", "shaft"), ("Output shaft", "shaft"),
         ("Pinion (stage 1)", "gear"), ("Gear (stage 1)", "gear"), ("Pinion (stage 2)", "gear"), ("Gear (stage 2)", "gear")]]
     s = _job("/review", {**VARIANT, "analysis": "review", "parts": parts,
                          "checks": ["interference", "fits", "dfm", "assembly"]})
@@ -66,7 +66,9 @@ def test_review_job():
     fs = s["result"]["findings"]
     assert fs and all(set(f) >= {"severity", "part", "message", "fix", "at"} for f in fs)
     assert all(len(f["at"]) == 3 for f in fs)
-    assert any(f["severity"] == "critical" and f["part"] == "Housing" for f in fs)
+    # v0.9: assembly3d builds a body + bolted end cover, so the closed-box critical is gone (QA Q-001)
+    assert not any(f["severity"] == "critical" for f in fs)
+    assert any(f["check"] == "assembly" and f["part"] == "Housing cover" for f in fs)
     assert {f["part"] for f in fs} <= {p["name"] for p in parts}
     hp = EXAMPLE_VARIANT["housing_params"]
     for f in fs:          # every pin lies inside (or on) the housing box of the assembly
