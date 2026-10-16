@@ -86,7 +86,8 @@ def test_generator_overall_basis_and_bbox():
 
 
 def test_generator_goals_steer_selection():
-    o = generate_variants(REQ, goals={"oil_temp_max_c": 90, "mass_max_kg": 5.0})
+    o = generate_variants(REQ, goals={"oil_temp_max_c": 90, "mass_max_kg": 5.0,
+                                      "cooling_allowed": ["natural", "fan", "fins", "efficiency", "oil_cooler"]})
     assert o["diagnostics"]["meeting_goals"] > 0
     for v in o["variants"]:
         assert all(x["pass"] for x in v["goal_check"].values())
@@ -95,3 +96,44 @@ def test_generator_goals_steer_selection():
     assert o2["goal_summary"]["variants_meeting_all"] == []
     assert "oil_temp_max_c" in o2["goal_summary"]["blocking_goals"]
     assert all(0 < v["thermal_screen"]["max_power_natural_kw"] < 11.19 for v in o2["variants"])
+
+
+def test_efficiency_assumption_never_alone_makes_pass():
+    # QA Q-020: without an oil cooler, S1 only "passes" with the 99 % efficiency assumption -> goal not met
+    o = generate_variants(REQ, goals={"oil_temp_max_c": 90})
+    for v in o["variants"]:
+        ts = v["thermal_screen"]
+        if ts["measure"] and ts["measure"]["basis"] == "assumption":
+            assert "(assumption)" in ts["measure"]["label"] and ts["best_without_assumption"]
+            assert v["goal_check"]["oil_temp_max_c"]["pass"] is False
+            assert v["goal_check"]["oil_temp_max_c"]["passes_only_with_assumption"] is True
+    r = _cfd()
+    kinds = [o["basis"] for o in r["options"]]
+    assert kinds == sorted(kinds, key=lambda b: b != "computed")       # computed first
+    assert all(o["assumption"] for o in r["options"] if "efficiency_per_stage" in o["change"])
+    assert r["best_without_assumption"]["basis"] == "computed" and r["best_without_assumption"]["pass"]
+
+
+def test_screen_vs_fem_on_demo_variants():
+    # QA Q-019: L1 screen vs 3D FEM on demo variants (full 15-variant table in solver/update-v0.8.md: max 0.28 %)
+    import json, os
+    path = os.path.join(os.path.dirname(__file__), "..", "qa-skenario-demo.json")
+    if not os.path.exists(path):
+        return
+    from physics.goal_engine import h_oil
+    D = json.load(open(path))
+    for sk in D:
+        v = D[sk]["variants"][1]
+        req = D[sk]["requirements"]
+        body = {k: v[k] for k in ("design", "kinematics", "loads", "shaft", "housing_params") if k in v}
+        body.update(power_kw=req["power_kw"], input_rpm=req["input_rpm"])
+        r = _cfd_body(body)
+        W, H, Dd = r["housing_box_mm"]
+        q = oil_temp_lumped(r["heat_to_housing_w"], W, H, Dd, 4, r["conductivity_w_mk"], h_oil(v, req["input_rpm"]))
+        assert abs(q["oil_temp_c"] - r["oil_temp_c"]) / (r["oil_temp_c"] - 25) < 0.01, (sk, q["oil_temp_c"], r["oil_temp_c"])
+
+
+def _cfd_body(body):
+    c, b = handle_post("/cfd?sync=1", body)
+    assert c == 200, b
+    return b["result"]
