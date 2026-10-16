@@ -23,6 +23,8 @@ def _fea_result(env):
                         "max_displacement_mm": o["max_displacement_mm"],
                         "min_safety_factor": o["min_safety_factor"]},
             "model": o["model"], "solver": f"{env['solver']} {env['version']}",
+            "options": o.get("options", []), "outer_size_mm": o.get("outer_size_mm"),
+            "fits_envelope": o.get("fits_envelope"),
             "method": env["method"], "limitations": env["limitations"]}
 
 
@@ -37,6 +39,7 @@ def _modal_result(env):
     return {"surface": o["surface"], "mesh": o["mesh"], "solve_time_s": o["solve_time_s"],
             "frequencies_hz": o["frequencies_hz"], "excitations_hz": o["excitations_hz"],
             "eigen_method": o["eigen_method"], "housing_mass_kg": o["housing_mass_kg"],
+            "speed_map": o.get("speed_map", []), "options": o.get("options", []),
             "material": o["material"], **_common(env, o)}
 
 
