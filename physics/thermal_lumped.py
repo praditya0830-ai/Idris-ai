@@ -4,8 +4,8 @@ Lumped network: oil --(h_oil·A_in)--> wall --(t/k·A)--> outer skin --((h_c+h_r
 Same correlations as thermal_housing_3d (McAdams natural / flat-plate forced + radiation), so the
 screen and the 3D result use one physics; the 3D FEM stays the reference (L2).
 
-Fins: straight rectangular fins on the two side walls (x = 0 and x = W), vertical (running along
-the housing height). Fin efficiency η = tanh(m·Lc)/(m·Lc), m = √(2h/(k·t)), Lc = L + t/2
+Fins: straight rectangular fins on the two side walls (x = 0 and x = W, vertical, running along
+the housing height) or on the top face (running along the width). Fin efficiency η = tanh(m·Lc)/(m·Lc), m = √(2h/(k·t)), Lc = L + t/2
 (Incropera eq. 3.89 / 3.92). Under natural convection the air between fins is a vertical channel:
 h from Bar-Cohen & Rohsenow (1984) parallel-plate correlation
     Nu_s = [576/El² + 2.873/El^½]^-½ ,  El = Ra_s · s / L_fin .
@@ -33,17 +33,31 @@ def h_channel_natural(gap_mm, L_fin_mm, T_s, T_amb):
     return Nu * AIR["k"] / s
 
 
-def fin_layout(fins, H_mm, D_mm):
-    """Geometry of `fins` = {count, height_mm[, thickness_mm]} on the two side walls."""
+def fin_layout(fins, H_mm, D_mm, W_mm=None):
+    """Geometry of `fins` = {count, height_mm[, thickness_mm][, location]}.
+    location "sides" (default): vertical fins on the two side walls (x = 0, x = W), length = H, the
+                                 housing gets 2 × height wider.
+    location "top": fins on the top face running along the width, length = W, the housing gets
+                    height taller; under natural convection the air rises through a channel as
+                    tall as the fin."""
     n = int(fins.get("count", 0))
     hf = float(fins.get("height_mm", 0.0))
     tf = float(fins.get("thickness_mm", FIN_THICKNESS_MM))
+    loc = fins.get("location", "sides")
     if n <= 0 or hf <= 0:
         return None
-    per_side = max(1, math.ceil(n / 2))
-    gap = (D_mm - per_side * tf) / per_side
-    return {"count": n, "height_mm": hf, "thickness_mm": tf, "per_side": per_side, "gap_mm": gap,
-            "length_mm": H_mm}
+    if loc == "top":
+        per_row = n
+        length = float(W_mm if W_mm else H_mm)
+        channel = hf
+    else:
+        loc = "sides"
+        per_row = max(1, math.ceil(n / 2))
+        length = float(H_mm)
+        channel = float(H_mm)
+    gap = (D_mm - per_row * tf) / per_row
+    return {"count": n, "height_mm": hf, "thickness_mm": tf, "location": loc, "per_side": per_row,
+            "gap_mm": gap, "length_mm": length, "channel_len_mm": channel}
 
 
 def fin_conv_factor(fl, h_base, k, A_out_m2, cooling, T_s, T_amb):
@@ -52,7 +66,7 @@ def fin_conv_factor(fl, h_base, k, A_out_m2, cooling, T_s, T_amb):
         return 1.0, None
     if fl["gap_mm"] <= 0:
         return 1.0, 0.0
-    h_f = h_channel_natural(fl["gap_mm"], fl["length_mm"], T_s, T_amb) if cooling == "natural" else h_base
+    h_f = h_channel_natural(fl["gap_mm"], fl.get("channel_len_mm", fl["length_mm"]), T_s, T_amb) if cooling == "natural" else h_base
     tf = fl["thickness_mm"] * 1e-3
     Lc = (fl["height_mm"] + 0.5 * fl["thickness_mm"]) * 1e-3
     m = math.sqrt(2 * h_f / (k * tf))
@@ -83,7 +97,7 @@ def oil_temp_lumped(Q_w, W, H, D, t, k, h_oil, T_amb=25.0, cooling="natural", ai
     """Steady oil temperature of a closed box housing (mm, W, W/mK, W/m²K). Returns a dict."""
     A_out, A_in = box_areas(W, H, D, t)
     Q = max(0.0, Q_w - max(0.0, oil_cooler_w))
-    fl = fin_layout(fins, H, D) if fins else None
+    fl = fin_layout(fins, H, D, W) if fins else None
     R_in = 1.0 / (h_oil * A_in)
     R_wall = (t * 1e-3) / (k * 0.5 * (A_in + A_out))
     T_s = T_amb + 20.0

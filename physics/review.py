@@ -43,7 +43,7 @@ class _Names:
         return low.get(canonical.lower(), canonical)
 
 
-def review(design, kinematics, L, material, checks, parts=None, input_rpm=None):
+def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, plan=None):
     m = L["module_mm"]
     zp, zg = L["teeth"]
     b = L["face_width_mm"]
@@ -115,7 +115,30 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None):
                 [s_in["x"], yc, (s_in["z1"] + s_out["z0"]) / 2])
 
     # ------------------------------------------------------------- fits / bearings
-    if "fits" in checks:
+    if "fits" in checks and plan:
+        # bearings as designed by the ACE shaft solver and drawn by /generate-assembly v4
+        for si, ps in enumerate(plan["shafts"]):
+            s = shafts[si]
+            for br in ps["bearings"]:
+                z_b = br["z"]
+                in_wall = abs(z_b - t / 2) < 1e-6 or abs(z_b - (D - t / 2)) < 1e-6
+                where = ("front wall" if abs(z_b - t / 2) < 1e-6 else "back wall") if in_wall else "pilot (inside the output shaft)"
+                through = any(bo["shaft"] == si and abs((t / 2 if bo["wall"] == "front" else D - t / 2) - z_b) < 1e-6
+                              for bo in L["bores"])
+                if in_wall and br["B"] > t:
+                    add("fits", "warning", s["name"],
+                        f"Bearing {br['designation']} (Ø{br['d']}×Ø{br['D']}×{br['B']} mm, {where}) is wider than the "
+                        f"{t:.0f} mm wall" + ("" if through else "; this seat is a blind pocket that is not drawn yet") + ".",
+                        f"Add a bearing boss so the seat is ≥ {br['B']} mm long: bore Ø{br['D']} "
+                        f"{'N7' if material.startswith(('Al', 'A356', 'Mg')) else 'H7'}, shaft seat Ø{br['d']} "
+                        f"{'k5' if br['d'] <= 40 else 'm5'}.",
+                        [s["x"], yc, z_b])
+                elif not in_wall:
+                    add("fits", "info", s["name"],
+                        f"Pilot bearing {br['designation']} (Ø{br['d']}×Ø{br['D']}×{br['B']} mm) between the coaxial "
+                        "shafts is part of the shaft check but not drawn.",
+                        "Detail the bore in the output-shaft end (or a central web) for this bearing.", [s["x"], yc, z_b])
+    elif "fits" in checks:
         reac = per_shaft_reactions(L)
         for si, s in enumerate(shafts):
             Fr = max(float(np.linalg.norm(v)) for v in reac[si])
@@ -129,8 +152,11 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None):
                     f"{BEARING_LIFE_H} h at {rpm:.0f} rpm.",
                     "Use tapered/cylindrical roller bearings or reduce the load.", [s["x"], yc, z_at])
                 continue
-            hole = (f"runs in a Ø{bore[0]['d']:.0f} mm clearance hole" if bore
-                    else "ends in the wall without any bore")
+            if L.get("designed_bearings") and bore:
+                hole = f"sits in a Ø{bore[0]['d']:.0f} mm bearing bore in a {t:.0f} mm wall"
+            else:
+                hole = (f"runs in a Ø{bore[0]['d']:.0f} mm clearance hole" if bore
+                        else "ends in the wall without any bore")
             sev = "warning"
             add("fits", sev, s["name"],
                 f"The shaft {hole} and has no bearing. For {Fr:.0f} N at {rpm:.0f} rpm "
@@ -141,6 +167,7 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None):
                 f"shaft seat Ø{brg['d_mm']} {'k5' if brg['d_mm'] <= 40 else 'm5'}, and add a boss so the seat is "
                 f"≥ {brg['B_mm']} mm long (wall is {t:.0f} mm).",
                 [s["x"], yc, z_at])
+    if "fits" in checks:
         if material.startswith(("Al", "A356", "Mg")):
             add("fits", "warning", "Housing",
                 f"{material} expands ≈2× more than steel bearing rings (23 vs 12 µm/m·K): at +60 °C a bearing "
@@ -203,12 +230,20 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None):
     if "assembly" in checks:
         max_tip = max(dap, dag)
         max_hole = max(bo["d"] for bo in L["bores"])
-        add("assembly", "critical", "Housing",
-            f"The housing is a closed box: the gears (tip Ø{max_tip:.0f} mm) cannot be inserted through the "
-            f"largest opening (Ø{max_hole:.0f} mm bore).",
-            "Split the housing in the shaft plane (y = H/2) into two dowel-located bolted halves, or make the "
-            "back wall a removable bolted cover with a gasket.",
-            [W / 2, yc, D])
+        if L.get("split_cover"):
+            add("assembly", "info", "Housing cover",
+                f"Gears (tip Ø{max_tip:.0f} mm) and shafts go in through the open back of the housing body; the "
+                "bolted end cover closes it.",
+                "Detail the cover joint: dowel pins for bore alignment, a bolt circle in bosses on the side walls "
+                f"(the {t:.0f} mm wall is too thin to tap), and a gasket or sealant.",
+                [W / 2, yc, D])
+        else:
+            add("assembly", "critical", "Housing",
+                f"The housing is a closed box: the gears (tip Ø{max_tip:.0f} mm) cannot be inserted through the "
+                f"largest opening (Ø{max_hole:.0f} mm bore).",
+                "Split the housing in the shaft plane (y = H/2) into two dowel-located bolted halves, or make the "
+                "back wall a removable bolted cover with a gasket.",
+                [W / 2, yc, D])
         add("assembly", "info", "Housing", "No breather, oil fill, level or drain plug in the model.",
             f"Breather on top, oil-level plug at the dip depth of the largest gear (≈{2.5 * m:.0f} mm), magnetic "
             "drain plug at the lowest point.", [W / 2, H, D / 2])

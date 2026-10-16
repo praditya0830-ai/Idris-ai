@@ -105,6 +105,13 @@ def build_layout(design, kinematics, loads, shaft, hp):
         bores = [{"wall": "front", "x": x_a, "d": d_in + 2, "shaft": 0},
                  {"wall": "back", "x": x_a, "d": d_out + 2, "shaft": 2}]
 
+    # designed bores (bearing OD from the ACE shaft solver) and the bolted end cover of assembly3d v4
+    fb, bb = _num(hp, "front_bore_diameter"), _num(hp, "back_bore_diameter")
+    if fb:
+        bores[0]["d"] = fb
+    if bb:
+        bores[1]["d"] = bb
+
     # gear mesh forces (on each gear, from its mate). Input turns CCW about +z.
     meshes = []
     for s in range(stages):
@@ -124,7 +131,8 @@ def build_layout(design, kinematics, loads, shaft, hp):
     return {"stages": stages, "module_mm": m, "face_width_mm": b, "teeth": (zp, zg),
             "center_distance_mm": a, "W": W, "H": H, "D": D, "wall_mm": t, "yc": yc, "z1": z1, "z2": z2,
             "x_a": x_a, "x_b": x_b, "shafts": shafts, "gears": gears, "bores": bores, "meshes": meshes,
-            "input_torque_Nm": T_in,
+            "input_torque_Nm": T_in, "designed_bearings": bool(fb or bb),
+            "split_cover": bool(isinstance(hp, dict) and hp.get("split_cover")),
             "inner": {"x0": t, "x1": W - t, "y0": t, "y1": H - t, "z0": t, "z1": D - t},
             "offset": np.zeros(3)}
 

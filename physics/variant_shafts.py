@@ -107,3 +107,83 @@ def check_variant_shafts(variant, input_rpm):
         warns.append("Shaft check assumes a pilot bearing between the coaxial input and output shafts "
                      "(reverted layout) and bearings in both housing walls for the intermediate shaft.")
     return out, warns
+
+
+def input_rpm_of(variant, default=6000.0):
+    k = variant.get("kinematics") or {}
+    try:
+        return float(k["output_rpm"]) * float(k["ratio_actual"])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def shaft_plan(variant, input_rpm=None):
+    """Designed shaft geometry for the 3D model and the analyses (QA Q-015 / Q-001).
+
+    Returns {"shafts": [{name, x, segments: [(z0, z1, d)], bearings: [{z, designation, d, D, B}],
+             journal_mm, seat_mm}], "front_bore_mm", "back_bore_mm"} in the housing frame, or None when
+    the shaft solver cannot design a shaft (the callers then keep the torsion-only model).
+    Bores in the end walls are sized to the OD of the bearing that sits there."""
+    rpm = input_rpm or input_rpm_of(variant)
+    L = build_layout(variant["design"], variant["kinematics"], variant.get("loads") or {},
+                     variant.get("shaft") or {}, variant.get("housing_params") or {})
+    out = []
+    for si, s in enumerate(L["shafts"]):
+        spec = _shaft_spec(L, si, rpm)
+        res = design_shaft(spec)
+        if not res.get("ok"):
+            return None
+        origin = min(shaft_supports_z(L, si) + (s["z0"], s["z1"]))
+        segs = [(origin + g["x0_mm"], origin + g["x1_mm"], float(g["dia_mm"])) for g in res["geometry"]["segments"]]
+        za, zb = shaft_supports_z(L, si)
+        brg = [{"z": z, "position": k, "designation": v["designation"], "d": v["d_mm"], "D": v["D_mm"],
+                "B": v["B_mm"]} for z, (k, v) in zip((za, zb), sorted(res["bearings"].items()))]
+        out.append({"name": s["name"], "x": s["x"], "segments": segs, "bearings": brg,
+                    "journal_mm": res["geometry"]["journal_dia_mm"], "seat_mm": res["geometry"]["seat_dia_mm"]})
+    t, D = L["wall_mm"], L["D"]
+    front = None
+    back = None
+    # through-bores: the input shaft in the front wall, the output shaft in the back wall
+    for sh in out:
+        for b in sh["bearings"]:
+            if sh["name"] == "Input shaft" and abs(b["z"] - t / 2) < 1e-6:
+                front = b["D"]
+            if sh["name"] == "Output shaft" and abs(b["z"] - (D - t / 2)) < 1e-6:
+                back = b["D"]
+    # a bearing seat must fit between the walls; otherwise keep the clearance hole and say so
+    notes = []
+    W, H = L["W"], L["H"]
+
+    def fits(x, dia):
+        r = dia / 2.0
+        return x - r >= t and x + r <= W - t and L["yc"] - r >= t and L["yc"] + r <= H - t
+    x_front = L["bores"][0]["x"]
+    x_back = L["bores"][1]["x"]
+    if front and not fits(x_front, front):
+        notes.append(f"Front bearing (OD {front:g} mm) does not fit beside the wall at this axis: the housing must "
+                     "grow there or the bearing needs an external flange housing — drawn as a clearance hole.")
+        front = None
+    if back and not fits(x_back, back):
+        notes.append(f"Back bearing (OD {back:g} mm) does not fit beside the wall at this axis: the housing must "
+                     "grow there or the bearing needs an external flange housing — drawn as a clearance hole.")
+        back = None
+    return {"shafts": out, "front_bore_mm": front, "back_bore_mm": back, "input_rpm": rpm, "notes": notes}
+
+
+def designed_housing_params(variant, hp=None, input_rpm=None):
+    """housing_params + the bores (bearing OD) and end cover of /generate-assembly v4, so every
+    analysis meshes the same housing that the 3D model shows. Unchanged when no shaft design exists."""
+    hp = dict(hp if hp is not None else (variant.get("housing_params") or {}))
+    try:
+        plan = shaft_plan({**{k: variant.get(k) for k in ("design", "kinematics", "loads", "shaft")},
+                           "housing_params": hp}, input_rpm)
+    except Exception:
+        plan = None
+    if not plan:
+        return hp
+    hp["split_cover"] = True
+    if plan.get("front_bore_mm"):
+        hp["front_bore_diameter"] = plan["front_bore_mm"]
+    if plan.get("back_bore_mm"):
+        hp["back_bore_diameter"] = plan["back_bore_mm"]
+    return hp

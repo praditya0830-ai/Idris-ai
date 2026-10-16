@@ -341,7 +341,8 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -
                                    "envelope_depth": env["depth"]}
             r["thermal_screen"] = goal_engine.thermal_screen(
                 r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
-                float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"))
+                float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"),
+                    (req.env_w, req.env_h, req.env_d))
             r["goal_check"] = goal_engine.check_goals(r, g)
             if all(x["pass"] for x in r["goal_check"].values()):
                 meeting.append(r)
@@ -382,7 +383,8 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -
                 r["warnings"] = list(r["warnings"]) + goal_engine.assembly_warnings(r)
                 r["thermal_screen"] = goal_engine.thermal_screen(
                     r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
-                    float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"))
+                    float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"),
+                    (req.env_w, req.env_h, req.env_d))
                 if goals:
                     r["goal_check"] = goal_engine.check_goals(r, goals)
             except Exception as e:      # never block variant generation on the extra check

@@ -38,16 +38,29 @@ def h_oil(variant, input_rpm, oil_vg=68):
 
 def _fin_sets(D_mm):
     out = []
-    for gap in (12.0, 8.0):
-        per_side = int(D_mm // (gap + FIN_THICKNESS_MM))
-        if per_side >= 2:
-            for hf in (15.0, 25.0, 35.0):
-                out.append({"count": 2 * per_side, "height_mm": hf})
+    for loc, per in (("sides", 2), ("top", 1)):
+        for gap in (12.0, 8.0):
+            per_row = int(D_mm // (gap + FIN_THICKNESS_MM))
+            if per_row >= 2:
+                for hf in ((15.0, 25.0, 35.0) if loc == "sides" else (15.0, 25.0, 35.0, 50.0, 70.0)):
+                    fs = {"count": per * per_row, "height_mm": hf}
+                    if loc == "top":
+                        fs["location"] = "top"
+                    out.append(fs)
     return out
 
 
+def _fits(fs, W, H, envelope):
+    """QA Q-022: fins must stay inside the engineer's envelope (housing-basis limits W, H)."""
+    if not envelope:
+        return True
+    if fs.get("location") == "top":
+        return H + fs["height_mm"] <= envelope[1] + 0.5
+    return W + 2 * fs["height_mm"] <= envelope[0] + 0.5
+
+
 def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambient_c=25.0,
-                   limit_c=OIL_LIMIT_C, allowed=None):
+                   limit_c=OIL_LIMIT_C, allowed=None, envelope=None):
     allowed = allowed or DEFAULT_ALLOWED
     hp = variant["housing_params"]
     W, H, D = hp["envelope_width"], hp["envelope_height"], hp["envelope_depth"]
@@ -86,17 +99,18 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
                               dict(cooling="forced", air_speed=sp), None))
     if "fins" in allowed:
         for fs in sorted(_fin_sets(D), key=lambda f: f["count"] * f["height_mm"]):
-            fl = fin_layout(fs, H, D)
-            if fl["gap_mm"] < FIN_MIN_GAP_MM:
+            fl = fin_layout(fs, H, D, W)
+            if fl["gap_mm"] < FIN_MIN_GAP_MM or not _fits(fs, W, H, envelope):
                 continue
-            tries.append((f"Fins {fs['count']} × {fs['height_mm']:g} mm", {"fins": fs}, Q, dict(fins=fs), fl))
+            loc_ = " on top" if fs.get("location") == "top" else ""
+            tries.append((f"Fins {fs['count']} × {fs['height_mm']:g} mm{loc_}", {"fins": fs}, Q, dict(fins=fs), fl))
             if "fan" in allowed:
                 for sp in (5.0, 10.0):
-                    tries.append((f"Fins {fs['count']} × {fs['height_mm']:g} mm + fan {sp:g} m/s",
+                    tries.append((f"Fins {fs['count']} × {fs['height_mm']:g} mm{loc_} + fan {sp:g} m/s",
                                   {"fins": fs, "cooling": "forced", "air_speed_ms": sp}, Q,
                                   dict(fins=fs, cooling="forced", air_speed=sp), fl))
             if "efficiency" in allowed and "fan" in allowed:
-                tries.append((f"99 %/stage + fan 5 m/s + fins {fs['count']} × {fs['height_mm']:g} mm",
+                tries.append((f"99 %/stage + fan 5 m/s + fins {fs['count']} × {fs['height_mm']:g} mm{loc_}",
                               {"efficiency_per_stage": 0.99, "fins": fs, "cooling": "forced", "air_speed_ms": 5.0},
                               Q99, dict(fins=fs, cooling="forced", air_speed=5.0), fl))
     # power the bare housing can carry continuously at the limit (natural convection, bisection)
@@ -188,12 +202,10 @@ def assembly_bbox(variant):
 
 
 def assembly_warnings(variant):
-    """QA Q-011: the closed box of /generate-assembly cannot be assembled when gears are larger than the bores."""
+    """QA Q-011: how the variant is assembled in /generate-assembly v4 (body + bolted end cover)."""
     d = variant["design"]
     tip = d["module_mm"] * (d["gear_teeth"] + 2)
-    bore = float(variant["housing_params"].get("bore_diameter") or 0)
-    if bore and tip > bore:
-        return [f"Assembly: the housing is a closed box; the Ø{tip:.0f} mm gear cannot pass the Ø{bore:.0f} mm bore. "
-                "Fix: split the housing on the shaft plane (bolted halves) or add a bolted side cover larger than "
-                f"Ø{tip + 4:.0f} mm. Not yet in the 3D model (planned, G2)."]
-    return []
+    t = float(variant["housing_params"].get("wall_thickness") or 4)
+    return [f"Assembly: the Ø{tip:.0f} mm gears go in through the open back of the housing; a bolted end cover "
+            f"closes it. Cover bolts, dowels, gasket and bearing bosses (bearings are wider than the {t:g} mm wall) "
+            "are not modelled yet."]
