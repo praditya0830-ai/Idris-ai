@@ -191,6 +191,7 @@ register(SolverSpec(
 
 # ------------------------------------------------------------------ thermal
 OPTION_KINDS = ["fan", "fins", "oil_cooler", "efficiency", "larger_housing", "combined"]
+EFF_ASSUMPTION = ("η 99 %/stage is an assumption (ground, profile-corrected gears + low-loss bearings), not computed: a gear/bearing loss model (ISO/TR 14179) is not in the solver yet")
 
 
 def _scaled_layout(p, scale):
@@ -368,6 +369,8 @@ def _run_thermal(p, progress):
                               "detail": "See `options` for the fin sets computed on this housing.",
                               "predicted_oil_temp_c": None})
             for f in fixes:
+                if f["fix"] in ("efficiency", "combined"):
+                    f["assumption"] = EFF_ASSUMPTION
                 f.setdefault("predicted_oil_temp_c", None)
                 tv = f["predicted_oil_temp_c"]
                 f["passes"] = tv is not None and tv <= limit
@@ -377,9 +380,13 @@ def _run_thermal(p, progress):
 
             def opt(kind, label, change, t_oil, added_kg=0.0, note=""):
                 ok_mass = mass_cap is None or added_kg <= float(mass_cap) + 1e-9
-                options.append({"kind": kind, "label": label, "change": change, "oil_temp_c": round(t_oil, 1),
+                assumed = "efficiency_per_stage" in change
+                options.append({"kind": kind, "label": label + (" (assumption)" if assumed else ""), "change": change,
+                                "oil_temp_c": round(t_oil, 1),
                                 "pass": bool(t_oil <= limit and ok_mass), "added_mass_kg": round(added_kg, 3),
-                                "note": note, "meets_mass_goal": ok_mass})
+                                "note": note, "meets_mass_goal": ok_mass,
+                                "assumption": EFF_ASSUMPTION if assumed else None,
+                                "basis": "assumption" if assumed else "computed"})
 
             if cool == "natural":
                 for sp in (5.0, 10.0):
@@ -391,10 +398,10 @@ def _run_thermal(p, progress):
                 fl = fin_layout(fc, case.H_mm, case.D_mm)
                 if fl["gap_mm"] < FIN_MIN_GAP_MM:
                     continue
-                for c_, s_ in ([(cool, spd)] + ([("forced", 5.0)] if cool == "natural" else [])):
+                for c_, s_ in ([(cool, spd)] + ([("forced", 5.0), ("forced", 10.0)] if cool == "natural" else [])):
                     r_ = case.state(Q_in=Q, cooling=c_, speed=s_, fins=fc)
                     fin_res.append((fc, c_, s_, r_["T_oil"], fin_mass_kg(fl, rho), fl["gap_mm"], r_["fin_efficiency"]))
-            for c_, s_ in ([(cool, spd)] + ([("forced", 5.0)] if cool == "natural" else [])):
+            for c_, s_ in ([(cool, spd)] + ([("forced", 5.0), ("forced", 10.0)] if cool == "natural" else [])):
                 rows = [r for r in fin_res if r[1] == c_ and r[2] == s_]
                 if not rows:
                     continue
@@ -467,9 +474,35 @@ def _run_thermal(p, progress):
                 opt("larger_housing", f"Larger housing ×{sc:g} ({bx['W']:.0f}×{bx['H']:.0f}×{bx['D']:.0f} mm)",
                     {"housing_scale": round(p["housing_scale"] * sc, 3)}, t_s, dm,
                     f"+{dm:.2f} kg; check the envelope")
+                # computed (no efficiency assumption) combination on the larger housing: + fan + lightest fins
+                if t_s > limit and not any(o["pass"] and o["basis"] == "computed" and o["kind"] != "oil_cooler"
+                                           for o in options):
+                    found = None
+                    rows = []
+                    for fc in _fin_candidates(cs):
+                        fl = fin_layout(fc, cs.H_mm, cs.D_mm)
+                        if fl["gap_mm"] >= FIN_MIN_GAP_MM:
+                            rows.append((fin_mass_kg(fl, rho), fc, fl["gap_mm"]))
+                    for sp in ((5.0, 10.0) if cool == "natural" else (max(spd, 5.0),)):
+                        for m_, fc, gap_ in sorted(rows, key=lambda r: r[0]):
+                            t_ = cs.state(Q_in=Q, cooling="forced", speed=sp, fins=fc)["T_oil"]
+                            if t_ <= limit:
+                                found = (sp, fc, t_, m_, gap_)
+                                break
+                        if found:
+                            break
+                    if found:
+                        sp, fc, t_, m_, gap_ = found
+                        opt("combined", f"Larger housing ×{sc:g} + fan {sp:g} m/s + fins {fc['count']} × "
+                                        f"{fc['height_mm']:g} mm",
+                            {"housing_scale": round(p["housing_scale"] * sc, 3), "cooling": "forced",
+                             "air_speed_ms": sp, "fins": fc}, t_, dm + m_,
+                            f"+{dm + m_:.2f} kg (housing +{dm:.2f}, fins +{m_:.2f}); check the envelope")
             options = [o for o in options if o["kind"] in allowed or
                        (o["kind"] == "combined" and all(x in allowed for x in ("fan",)))]
-            options.sort(key=lambda o: (not o["pass"], o["added_mass_kg"] if o["pass"] else o["oil_temp_c"]))
+            # computed options first (QA Q-020), assumption-based ones after them
+            options.sort(key=lambda o: (o["basis"] != "computed", not o["pass"],
+                                        o["added_mass_kg"] if o["pass"] else o["oil_temp_c"]))
     solve_s = time.perf_counter() - t0
     progress("Post-processing", 0.9)
     q_out = float((G_out * (T - Ta)).sum())
@@ -496,11 +529,15 @@ def _run_thermal(p, progress):
                     "goal from engineer" if "oil_temp_max_c" in goals else "mineral gear oil continuous limit"),
               Check("heat balance error", abs(q_out - Q) / max(Q, 1e-9) if Q >= 1 else 0.0, 0.01, "-", "max",
                     "solver self-check")]
+    computed = [o for o in options if o["basis"] == "computed"]
+    best_computed = next((o for o in computed if o["pass"]), None)
+    closest_computed = min(computed, key=lambda o: o["oil_temp_c"]) if computed else None
     goal_report = None
     if goals:
         goal_report = {"oil_temp_max_c": limit, "added_mass_max_kg": mass_cap, "allowed": allowed,
                        "met_now": T_oil <= limit,
                        "met_by": [o["label"] for o in options if o["pass"]],
+                       "met_by_computed": [o["label"] for o in computed if o["pass"]],
                        "closest": None if (T_oil <= limit or not options) else
                        min(options, key=lambda o: o["oil_temp_c"])["label"]}
     out = {"surface": {"positions": pos, "indices": tris.ravel(), "temperature": np.round(T[ids], 2)},
@@ -519,7 +556,10 @@ def _run_thermal(p, progress):
            "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8 (rectilinear brick)",
                     "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
            "solve_time_s": round(solve_s, 2), "outer_iterations": 1,
-           "target_oil_temp_c": target, "fixes": fixes, "options": options, "goal_report": goal_report}
+           "target_oil_temp_c": target, "fixes": fixes, "options": options, "goal_report": goal_report,
+           "best_without_assumption": best_computed,
+           "closest_without_assumption": None if best_computed else closest_computed,
+           "validation": "screening-level: correlations + FEM, not yet validated against test data"}
     progress("Post-processing", 1.0)
     return {"outputs": out, "checks": checks, "warnings": warnings}
 
@@ -555,6 +595,8 @@ register(SolverSpec(
                           {"outputs.heat_dissipated_w": REG_Q}, 0.01)],
     limitations=["not CFD: convection from correlations, oil assumed well mixed",
                  "fins are not meshed: their effect is a fin-efficiency-weighted factor on outer convection",
+                 "screening-level: not yet validated against test data",
+                 "gear efficiency is an input (variant value or assumption), not computed from a loss model",
                  "no sun load, housing emissivity assumed 0.85 (painted)"],
     example={**EXAMPLE_VARIANT, "power_kw": 11.19, "input_rpm": 6000, "ambient_c": 25, "cooling": "natural",
              "air_speed_ms": 0, "oil": "ISO VG 68"},
