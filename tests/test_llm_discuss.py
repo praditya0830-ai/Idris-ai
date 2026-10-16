@@ -3,6 +3,8 @@ import json
 import os
 import llm
 
+ORIG_CALL_PROVIDER = llm.call_provider      # captured before the tests below swap in fakes
+
 CTX = {"advice": {"topic": "thermal", "status": "FAIL", "oil_temp_c": 237.8, "limit_c": 90,
                   "options": [{"label": "Oil cooler 400 W", "change": {"oil_cooler_w": 400}, "oil_temp_c": 60.3}]},
        "pending_question": "envBasis"}
@@ -76,3 +78,34 @@ def test_q018_bait_questions_flag_invented_numbers():
         _with_reply({"intent": "discuss", "language": "id", "answer": honest, "actions": []})
         r = llm.interpret(None, q, None, [], "B", CTX)
         assert r["numbers_verified"] is True, (q, r)
+
+
+def test_goals_in_set_params_are_validated():
+    _with_reply({"intent": "set_params", "language": "id", "answer": "",
+                 "params": {"goals": {"oil_temp_max_c": 90, "mass_max_kg": -3,
+                                      "cooling_allowed": ["natural", "fins", "teleport"]}}})
+    r = llm.interpret(None, "oli maks 90 C, tanpa kipas", None, None, None)
+    assert r["params"]["goals"] == {"oil_temp_max_c": 90.0, "cooling_allowed": ["natural", "fins"]}
+    assert "goals.mass_max_kg" in r["rejected"] and "goals.cooling_allowed" in r["rejected"]
+
+
+def test_nvidia_backup_used_when_gemini_quota_is_out():
+    os.environ.update(GEMINI_API_KEY="g", NVIDIA_API_KEY="n", IDRIS_LLM_ORDER="gemini,nvidia",
+                      IDRIS_LLM_RETRY_SLEEP="0")
+    calls = []
+
+    def fake_one(provider, model, system, user, max_tokens=500):
+        calls.append((provider, model))
+        if provider == "gemini":
+            raise llm.LLMError("provider returned HTTP 429: quota", http=429)
+        return json.dumps({"intent": "set_params", "params": {"power_kw": 11.19}, "answer": "", "language": "en"})
+    real_one = llm._call_one
+    llm._call_one, llm.call_provider = fake_one, ORIG_CALL_PROVIDER
+    try:
+        r = llm.interpret(None, "15 hp", None, None, None)
+        assert r["provider"] == "nvidia" and r["params"] == {"power_kw": 11.19}
+        assert calls[-1] == ("nvidia", "nvidia/nemotron-3-super-120b-a12b")
+        assert llm.models_for("nvidia") == ["nvidia/nemotron-3-super-120b-a12b", "openai/gpt-oss-20b"]
+    finally:
+        llm._call_one = real_one
+        os.environ.pop("NVIDIA_API_KEY", None)

@@ -160,3 +160,10 @@ def test_q022_options_respect_envelope():
                 assert hp["envelope_height"] + f["height_mm"] <= 200.5
             else:
                 assert hp["envelope_width"] + 2 * f["height_mm"] <= 200.5
+
+
+def test_allowed_filters_every_measure_of_combined_options():
+    r = _cfd({"goals": {"oil_temp_max_c": 90, "allowed": ["fins", "oil_cooler", "larger_housing"]}})
+    for o in r["options"]:
+        ch = o["change"]
+        assert ch.get("cooling") != "forced" and "efficiency_per_stage" not in ch, o["label"]
