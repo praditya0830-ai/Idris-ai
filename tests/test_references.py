@@ -11,10 +11,19 @@ def test_resolve_and_labels():
         assert False
     except ValueError:
         pass
-    assert REFERENCES["lewis"]["status"] == "verified"
-    # an unverified reference is labelled on every number it produces
-    assert all("preliminary" in v for k, v in basis("iso6336").items() if k.startswith(("sf_bending", "bending")))
+    assert REFERENCES["lewis"]["status"] == "verified" and REFERENCES["iso6336"]["status"] == "verified"
     assert not any("preliminary" in v for v in basis("lewis").values())
+    assert "Method C" in basis("iso6336")["sf_bending"]
+
+
+def test_tooth_form_matches_iso_6336_3():
+    from physics.toothform import tooth_form, iso_closed_form
+    for z in (12, 17, 20, 30, 50, 100, 200):
+        t, i = tooth_form(z), iso_closed_form(z)
+        assert abs(t["YF"] / i["YF"] - 1) < 0.005 and abs(t["YS"] / i["YS"] - 1) < 0.005, z
+    # the standard's chart values for x = 0 (Y_Fa, Y_Sa): z = 20 ≈ 2.80 / 1.55, z = 100 ≈ 2.20 / 1.79
+    assert abs(tooth_form(20)["YF"] - 2.80) < 0.03 and abs(tooth_form(20)["YS"] - 1.55) < 0.02
+    assert abs(tooth_form(100)["YF"] - 2.20) < 0.03 and abs(tooth_form(100)["YS"] - 1.79) < 0.02
 
 
 def test_reference_changes_the_bending_check():
