@@ -7,7 +7,7 @@
 /modal, /cfd (thermal) and /review follow the same pattern (entries in ANALYSES).
 Internally every analysis is an ordinary ACE solver; this module only adapts the shape.
 """
-from . import registry, jobs
+from . import registry, jobs, SOLVER_VERSION
 
 SYNC_ELEMENT_HINT = {"coarse"}      # small meshes may be answered directly with ?sync=1
 
@@ -47,7 +47,7 @@ def _thermal_result(env):
             "h_outer_radiation_w_m2k", "area_outer_m2", "area_wetted_m2", "material", "conductivity_w_mk",
             "target_oil_temp_c", "fixes", "options", "surface_area_m2", "heat_to_housing_w",
             "oil_cooler_w", "housing_box_mm", "housing_scale", "fins", "efficiency_total", "oil_limit_c",
-            "goal_report")
+            "goal_report", "best_without_assumption", "closest_without_assumption", "validation")
     return {"surface": o["surface"], "mesh": o["mesh"], "solve_time_s": o["solve_time_s"],
             **{k: o[k] for k in keep}, **_common(env, o)}
 
@@ -84,6 +84,7 @@ def _runner(spec, payload):
         if not env.get("ok"):
             return None, _error_text(env)
         res = spec["adapt"](env)
+        res["solver_version"] = SOLVER_VERSION
         if ignored:
             res["warnings"] = list(res.get("warnings", [])) + [f"Fields not used by this solver: {ignored}"]
         return res, None
