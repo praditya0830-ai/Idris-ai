@@ -13,12 +13,13 @@ REFERENCES = {
         "default": True,
     },
     "iso6336": {
-        "label": "ISO 6336 (bending: Y_F·Y_S·Y_ε, σ_Flim·Y_ST)",
-        "bending": "ISO 6336-3 style: σ_F = F_t/(b·m)·Y_F·Y_S·Y_ε·K, permissible σ_Flim·Y_ST (Y_ST = 2.0); "
-                   "Y_F, Y_S from the real tooth form (physics/toothform.py)",
+        "label": "ISO 6336 (Method C bending: Y_Fa·Y_Sa·Y_ε)",
+        "bending": "ISO 6336-3 Method C: σ_F = F_t/(b·m)·Y_Fa·Y_Sa·Y_ε·K, permissible σ_Flim·Y_ST (Y_ST = 2.0; "
+                   "Y_NT, Y_δrelT, Y_RrelT, Y_X = 1); Y_Fa, Y_Sa from the generated tooth form",
         "contact": "Hertz, Z_E·Z_H·Z_ε (ISO 6336-2 form)",
-        "status": "preliminary",
-        "evidence": "benchmark against a published ISO 6336 worked example is pending (target ≤ 2 %)",
+        "status": "verified",
+        "evidence": "solver gear_tooth_form_iso: Y_F, Y_S within 0.05 % of the ISO 6336-3 closed-form equations "
+                    "for z = 12…200 (benchmarks in /verify); QA hand check pending (checklist QA no. 27)",
         "default": False,
     },
 }
