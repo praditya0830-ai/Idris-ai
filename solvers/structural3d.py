@@ -159,8 +159,88 @@ def _run_housing(p, progress):
     }
     checks = [Check("housing safety factor on yield", sf, p["design_factor"], "-", "min"),
               Check("force equilibrium error", balance, 1e-3, "-", "max", "solver self-check")]
+    if not p.get("_inner"):
+        out["options"] = _fea_options(p, L, mat, vmax, sf, out["model"]["approx_mass_kg"], solve_s, progress)
+        out["outer_size_mm"], out["fits_envelope"], _why = _envelope_fit(p, [L["W"], L["H"], L["D"]])
     progress("Post-processing", 1.0)
     return {"outputs": out, "checks": checks, "warnings": warnings}
+
+
+def _envelope_fit(p, size):
+    """(outer size incl. shaft ends if basis overall, fits?, reason) against the request's envelope_mm."""
+    env = p.get("envelope_mm") or {}
+    size = [float(size[0]), float(size[1]), float(size[2]) + (44.0 if p.get("envelope_basis") == "overall" else 0.0)]
+    if not all(isinstance(env.get(k), (int, float)) and env[k] > 0 for k in ("width", "height", "depth")):
+        return size, None, None
+    lim = [env["width"], env["height"], env["depth"]]
+    bad = [f"{n} {v:.0f} > {l:g} mm" for n, v, l in zip(("width", "height", "depth"), size, lim) if v > l + 0.5]
+    return size, not bad, ("exceeds the envelope: " + ", ".join(bad)) if bad else None
+
+
+def wall_change_hp(p, L, dt):
+    """housing_params with the wall changed by dt mm and the cavity kept: outer box grows by 2·dt."""
+    hp = dict(p.get("housing_params") or {})
+    hp.update(wall_thickness=round(L["wall_mm"] + dt, 2), envelope_width=round(L["W"] + 2 * dt, 2),
+              envelope_height=round(L["H"] + 2 * dt, 2), envelope_depth=round(L["D"] + 2 * dt, 2))
+    return hp
+
+
+MIN_WALL_MM = 3.0
+FAST_ENOUGH_S = 15.0          # extra solves only when the base solve was quick (keeps /fea under ~60 s on Render)
+
+
+def _fea_options(p, L, mat, vmax, sf, mass, solve_s, progress):
+    """Computed design changes (UI 'Try' rows, same shape as /cfd options). Change keys merge into the request."""
+    E0, nu0, Sy0, rho0, _ = HOUSING_MATERIALS[mat]
+    target = p["design_factor"]
+    opts = []
+
+    def add(kind, label, change, sf_new, dmass, note, basis="computed", size=None):
+        size, fits, why = _envelope_fit(p, size or [L["W"], L["H"], L["D"]])
+        opts.append({"kind": kind, "label": label + (" — exceeds envelope" if fits is False else ""),
+                     "change": change, "safety_factor": round(sf_new, 2), "pass": bool(sf_new >= target and fits is not False),
+                     "added_mass_kg": round(dmass, 3), "note": note, "basis": basis, "outer_size_mm": size,
+                     "fits_envelope": fits, "envelope_violation": why})
+
+    def resolve(dt):
+        hp = wall_change_hp(p, L, dt)
+        r = _run_housing({**p, "housing_params": hp, "_inner": True}, lambda *a, **k: None)
+        if not r.get("outputs"):
+            return None, hp
+        o = r["outputs"]
+        return (Sy0 / max(o["max_von_mises_MPa"], 1e-12), o["model"]["approx_mass_kg"], o["model"]["envelope_mm"]), hp
+
+    can_resolve = solve_s <= FAST_ENOUGH_S
+    if sf < target:
+        if can_resolve:
+            for dt in (1.0, 2.0, 4.0):
+                progress("Solving", 0.9)
+                res, hp = resolve(dt)
+                if res:
+                    add("wall", f"Wall {L['wall_mm'] + dt:g} mm (+{dt:g})", {"housing_params": hp}, res[0], res[1] - mass,
+                        "outer box grows by 2× the extra wall; cavity unchanged", size=res[2])
+                    if res[0] >= target:
+                        break
+        for m, (E, nu, Sy, rho, note) in HOUSING_MATERIALS.items():
+            if Sy > Sy0 and abs(nu - nu0) < 0.05 and m != mat:
+                add("material", f"Housing material {m}", {"housing_material": m}, Sy / vmax, mass * (rho / rho0 - 1),
+                    "same stress field (linear elastic, uniform material); SF = yield / σ_vM,max" + (f"; {note}" if note else ""))
+    elif sf >= 2 * target:
+        # over-designed: computed ways to save mass while keeping SF ≥ target
+        if can_resolve and L["wall_mm"] - 1.0 >= MIN_WALL_MM:
+            progress("Solving", 0.9)
+            res, hp = resolve(-1.0)
+            if res:
+                add("wall", f"Thinner wall {L['wall_mm'] - 1:g} mm (−1)", {"housing_params": hp}, res[0], res[1] - mass,
+                    f"saves mass; {MIN_WALL_MM:g} mm is the practical minimum for machined/cast aluminium", size=res[2])
+        for m in ("Mg-AZ91D", "A356-T6"):
+            if m != mat and m in HOUSING_MATERIALS:
+                E, nu, Sy, rho, note = HOUSING_MATERIALS[m]
+                add("material", f"Housing material {m}", {"housing_material": m}, Sy / vmax, mass * (rho / rho0 - 1),
+                    "same stress field (linear elastic); " + ("cast, cheaper in series" if m == "A356-T6" else
+                                                              "lightest structural metal; check corrosion protection"))
+    opts.sort(key=lambda o: (not o["pass"], o["added_mass_kg"]))
+    return opts
 
 
 VARIANT_DESIGN = {"module_mm": {"type": "number", "exclusive_min": 0, "max": 50, "required": True},
@@ -189,6 +269,12 @@ register(SolverSpec(
         "fixture": {"type": "string", "enum": ["base", "flange"], "default": "base"},
         "mesh": {"type": "string", "enum": list(MESH_DIVISIONS), "default": "standard"},
         "design_factor": {"type": "number", "min": 1, "max": 10, "default": 1.5},
+        "envelope_mm": {"type": "object", "default": {}, "allow_extra": False,
+                        "fields": {"width": {"type": "number", "min": 0, "max": 1e5},
+                                   "height": {"type": "number", "min": 0, "max": 1e5},
+                                   "depth": {"type": "number", "min": 0, "max": 1e5}}},
+        "envelope_basis": {"type": "string", "enum": ["housing", "overall"], "default": "housing"},
+        "input_rpm": {"type": "number", "exclusive_min": 0, "max": 1e5},
     },
     run=_run_housing,
     benchmarks=[Benchmark(

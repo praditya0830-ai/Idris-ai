@@ -121,16 +121,60 @@ def _run_modal(p, progress):
         near = [m for m in modes if abs(m["frequency_hz"] - e["hz"]) <= 0.1 * e["hz"]]
         for m in near:
             warnings.append(f"Mode at {m['frequency_hz']:.0f} Hz is within ±10 % of {e['source']} ({e['hz']:.0f} Hz): resonance risk.")
+    margin = None
     if excit:
         margin = min(abs(m["frequency_hz"] - e["hz"]) / e["hz"] for m in modes for e in excit)
         checks.append(Check("min separation mode ↔ excitation", margin, 0.1, "-", "min",
                             "±10 % rule; UI also flags this"))
+    # speed map: every excitation scales with the input speed -> input-rpm bands to avoid (computed, no re-solve)
+    speed_map = []
+    if excit and isinstance(rpm_out, (int, float)) and isinstance(ratio, (int, float)):
+        rpm_now = rpm_out * ratio
+        for m in modes:
+            for e in excit:
+                c = e["hz"] / rpm_now
+                lo, hi = m["frequency_hz"] / (1.1 * c), m["frequency_hz"] / (0.9 * c)
+                if hi >= 0.5 * rpm_now and lo <= 1.2 * rpm_now:
+                    speed_map.append({"mode_hz": m["frequency_hz"], "source": e["source"],
+                                      "avoid_input_rpm": [round(lo), round(hi)],
+                                      "includes_operating_speed": lo <= rpm_now <= hi})
+    options = []
+    if not p.get("_inner") and margin is not None and margin < 0.1:
+        risky = [sm for sm in speed_map if sm["includes_operating_speed"]]
+        if risky:
+            bands = ", ".join(f"{a}–{b} rpm ({sm['source']} vs {sm['mode_hz']:.0f} Hz)"
+                              for sm in risky for a, b in [sm["avoid_input_rpm"]])
+            options.append({"kind": "speed", "label": "Keep the input speed out of the resonance band",
+                            "change": {}, "pass": None, "basis": "computed",
+                            "note": f"Resonance bands at the current design: {bands}. Useful if the speed can vary "
+                                    "(e.g. VTOL rotor rpm schedule)."})
+        if solve_s <= 20.0:                      # one extra eigen-solve keeps /modal inside ~60 s on Render
+            from .structural3d import wall_change_hp
+            for dt in (2.0,):
+                hp2 = wall_change_hp(p, L, dt)
+                r2 = _run_modal({**p, "housing_params": hp2, "_inner": True}, lambda *a, **k: None)
+                o2 = (r2 or {}).get("outputs")
+                if not o2:
+                    continue
+                m2 = min(abs(f - e["hz"]) / e["hz"] for f in o2["frequencies_hz"] for e in o2["excitations_hz"]) \
+                    if o2["excitations_hz"] else None
+                close = min(((abs(f - e["hz"]) / e["hz"], f, e) for f in o2["frequencies_hz"] for e in o2["excitations_hz"]),
+                            key=lambda x: x[0], default=None)
+                options.append({"kind": "wall", "label": f"Wall {L['wall_mm'] + dt:g} mm (+{dt:g})",
+                                "closest_pair": None if close is None else
+                                f"{close[1]:.0f} Hz mode vs {close[2]['source']} {close[2]['hz']:.0f} Hz",
+                                "change": {"housing_params": hp2}, "basis": "computed",
+                                "first_mode_hz": o2["frequencies_hz"][0], "min_separation": round(m2, 4) if m2 else None,
+                                "pass": bool(m2 is not None and m2 >= 0.1),
+                                "added_mass_kg": round(o2["housing_mass_kg"] - info["total_mass_kg"], 3),
+                                "note": "re-solved eigenproblem; outer box grows by 2× the extra wall"})
     out = {"surface": {"positions": pos, "indices": tris.ravel(), "modes": modes},
            "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8-im (rectilinear brick)",
                     "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
            "solve_time_s": round(solve_s, 2), "frequencies_hz": [m["frequency_hz"] for m in modes],
            "excitations_hz": excit, "eigen_method": info["method"], "material": mat,
-           "housing_mass_kg": info["total_mass_kg"], "fixture": p["fixture"], "mesh_level": mesh_used}
+           "housing_mass_kg": info["total_mass_kg"], "fixture": p["fixture"], "mesh_level": mesh_used,
+           "speed_map": speed_map, "options": options}
     progress("Post-processing", 1.0)
     return {"outputs": out, "checks": checks, "warnings": warnings}
 
@@ -563,8 +607,23 @@ def _run_thermal(p, progress):
                             {"housing_scale": round(p["housing_scale"] * sc, 3), "cooling": "forced",
                              "air_speed_ms": sp, "fins": fc}, t_, dm + m_,
                             f"+{dm + m_:.2f} kg (housing +{dm:.2f}, fins +{m_:.2f}); check the envelope")
-            options = [o for o in options if o["kind"] in allowed or
-                       (o["kind"] == "combined" and all(x in allowed for x in ("fan",)))]
+            # an option is allowed when EVERY measure in its change is allowed (UI question 14 Oct, #1);
+            # "combined" in `allowed` is accepted for compatibility but not needed
+            def measures(o):
+                ch = o["change"]
+                ms = set()
+                if ch.get("cooling") == "forced":
+                    ms.add("fan")
+                if ch.get("fins"):
+                    ms.add("fins")
+                if "efficiency_per_stage" in ch:
+                    ms.add("efficiency")
+                if "housing_scale" in ch:
+                    ms.add("larger_housing")
+                if "oil_cooler_w" in ch:
+                    ms.add("oil_cooler")
+                return ms
+            options = [o for o in options if measures(o) <= set(allowed)]
             # computed options first (QA Q-020), assumption-based ones after them
             options.sort(key=lambda o: (o["basis"] != "computed", not o["pass"],
                                         o["added_mass_kg"] if o["pass"] else o["oil_temp_c"]))
@@ -639,7 +698,7 @@ register(SolverSpec(
     name="thermal_housing_3d", version="0.1.0", domain="thermal", fidelity="L2", progress=True,
     summary="Steady-state oil and housing temperatures of a gearbox: gear losses P·(1−η) into the oil, conduction through the walls, convection + radiation to ambient.",
     method=("3D conduction FEM (8-node hexahedra, voxel mesh) coupled to a lumped oil node; outer convection from "
-            "McAdams (natural) / flat-plate Nusselt (forced) correlations + linearised radiation, iterated to convergence"),
+            "Churchill-Chu (natural) / flat-plate Nusselt (forced) correlations with film-temperature air properties + linearised radiation, iterated to convergence"),
     schema={**VARIANT_SCHEMA,
             "analysis": {"type": "string", "enum": ["thermal"], "default": "thermal"},
             "power_kw": {"type": "number", "min": 0, "max": 10000, "required": True},
@@ -712,6 +771,31 @@ register(SolverSpec(
                            "outputs.hot_surface_temp_c": 100 - 80 / (1 / 500 + 0.01 / 50 + 1 / 20) / 500}, 0.001)],
     limitations=["1D slab only"],
     example={"thickness_mm": 10, "k_W_mK": 50, "h_hot": 500, "h_cold": 20, "T_hot_c": 100, "T_cold_c": 20},
+))
+
+
+def _run_free_conv(p):
+    hc, hr = h_natural_air(p["T_surface_c"] - p["T_ambient_c"], p["height_m"] , p["T_surface_c"], p["T_ambient_c"], 0.0)
+    return {"outputs": {"h_W_m2K": hc,
+                        "q_W": hc * p["height_m"] * p["width_m"] * (p["T_surface_c"] - p["T_ambient_c"])}}
+
+
+register(SolverSpec(
+    name="free_convection_plate", version="0.1.0", domain="thermal", fidelity="L0",
+    summary="Natural-convection coefficient of a vertical plate (the correlation used by thermal_housing_3d).",
+    method="Churchill & Chu (1975), all Ra, air properties at the film temperature (Incropera Table A.4)",
+    schema={"height_m": {"type": "number", "exclusive_min": 0, "required": True},
+            "width_m": {"type": "number", "exclusive_min": 0, "default": 1.0},
+            "T_surface_c": {"type": "number", "required": True},
+            "T_ambient_c": {"type": "number", "required": True}},
+    run=_run_free_conv,
+    benchmarks=[Benchmark("incropera-example-9-2",
+                          "Incropera, Fundamentals of Heat and Mass Transfer 6e, Example 9.2 (fireplace glass door "
+                          "0.71 × 1.02 m, 232 °C in 23 °C air): h = 7.0 W/m²K, q ≈ 1060 W",
+                          {"height_m": 0.71, "width_m": 1.02, "T_surface_c": 232, "T_ambient_c": 23},
+                          {"outputs.h_W_m2K": 7.0, "outputs.q_W": 1060}, 0.02)],
+    limitations=["vertical plate correlation; the housing applies it to all outer faces (screening)"],
+    example={"height_m": 0.126, "T_surface_c": 210, "T_ambient_c": 25},
 ))
 
 
