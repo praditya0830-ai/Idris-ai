@@ -65,3 +65,15 @@ def test_web_is_ribbed_not_solid():
     from physics.gears import web_volume_mm3
     solid = 180 * 110 * 28
     assert web_volume_mm3(180, 110, 28, 4.0, 58.0, [39.0]) < 0.4 * solid
+
+
+def test_envelope_fit_is_reported_by_the_solver():
+    # v0.11.1: the UI shows the solver's verdict instead of recomputing (UI v26 showed a false mismatch)
+    v = generate_variants(S1)["variants"][0]
+    ef = v["envelope_fit"]
+    hp = v["housing_params"]
+    assert ef["basis"] == "housing" and ef["fits"] is True and ef["fits_housing"] is True
+    assert ef["housing_box_mm"] == [hp["envelope_width"], hp["envelope_height"], hp["envelope_depth"]]
+    asm = build_assembly(v["design"], v["kinematics"], v["shaft"], hp)
+    assert asm["layout"]["overall_box_mm"] == ef["overall_box_mm"]
+    assert asm["layout"]["housing_box_mm"] == ef["housing_box_mm"]
