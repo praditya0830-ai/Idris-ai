@@ -5,6 +5,7 @@ All formulas are closed-form or plain numerical integration of Euler-Bernoulli
 beam theory -- no ML. Material values are approximate handbook values.
 """
 import math
+import numpy as np
 from bisect import bisect_right
 from statistics import NormalDist
 
@@ -171,32 +172,35 @@ def beam_response(segments, E, xA, xB, loads, n=1500):
     segments: [(x0, x1, d), ...] contiguous from 0 to L.
     loads   : [(x, Fy, Fz), ...] point forces in N.
     Returns per-plane moment, slope, deflection and support reactions.
+    (v0.11.1: numpy-vectorised, same trapezoidal double integration as before.)
     """
     L = segments[-1][1]
     pts = [L * i / (n - 1) for i in range(n)]
     special = [0.0, L, xA, xB] + [p[0] for p in loads] + [s[0] for s in segments]
     xs = sorted(set(round(v, 9) for v in pts + special))
-    EI = [E * _I(diameter_at(segments, x)) for x in xs]
+    X = np.asarray(xs)
+    starts = np.asarray([sg[0] for sg in segments])
+    dias = np.asarray([sg[2] for sg in segments], float)
+    idx = np.clip(np.searchsorted(starts, X, side="right") - 1, 0, len(segments) - 1)
+    EI = E * np.pi * dias[idx] ** 4 / 64
+    h = np.diff(X)
     out = {"x": xs}
     for k, ax in ((1, "y"), (2, "z")):
         F = [(p[0], p[k]) for p in loads if p[k]]
         RB = -sum(f * (x - xA) for x, f in F) / (xB - xA)
         RA = -sum(f for _, f in F) - RB
         allp = F + [(xA, RA), (xB, RB)]
-        M = [sum(f * (x - xi) for xi, f in allp if xi < x) for x in xs]
-        kap = [m / ei for m, ei in zip(M, EI)]
-        th0, y0 = [0.0], [0.0]
-        for i in range(1, len(xs)):
-            h = xs[i] - xs[i - 1]
-            th0.append(th0[-1] + 0.5 * h * (kap[i] + kap[i - 1]))
-        for i in range(1, len(xs)):
-            h = xs[i] - xs[i - 1]
-            y0.append(y0[-1] + 0.5 * h * (th0[i] + th0[i - 1]))
-        yA, yB = _interp(xs, y0, xA), _interp(xs, y0, xB)
+        M = np.zeros_like(X)
+        for xi, f in allp:
+            M += np.where(xi < X, f * (X - xi), 0.0)
+        kap = M / EI
+        th0 = np.concatenate(([0.0], np.cumsum(0.5 * h * (kap[1:] + kap[:-1]))))
+        y0 = np.concatenate(([0.0], np.cumsum(0.5 * h * (th0[1:] + th0[:-1]))))
+        yA, yB = float(np.interp(xA, X, y0)), float(np.interp(xB, X, y0))
         C1 = -(yB - yA) / (xB - xA)
         C2 = -yA - C1 * xA
-        out[ax] = {"M": M, "slope": [t + C1 for t in th0],
-                   "defl": [v + C1 * x + C2 for v, x in zip(y0, xs)], "RA": RA, "RB": RB}
+        out[ax] = {"M": M.tolist(), "slope": (th0 + C1).tolist(),
+                   "defl": (y0 + C1 * X + C2).tolist(), "RA": RA, "RB": RB}
     return out
 
 

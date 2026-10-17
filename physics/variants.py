@@ -285,8 +285,88 @@ def _repair_text(r: dict) -> str:
 
 
 def generate_variants(req: Requirements, n: int = 5, envelope_basis: str = "housing",
-                      goals: dict | None = None, ambient_c: float = 25.0) -> dict:
-    """envelope_basis "overall": the shaft ends (22 mm each side, along the depth) must also fit."""
+                      goals: dict | None = None, ambient_c: float = 25.0, compare_basis: bool = True) -> dict:
+    """Variants for the requested envelope basis, plus (Arya, 17 Oct) `envelope_choice`: when the answer
+    depends on whether the shaft ends count, the result of the OTHER basis is computed too so the engineer
+    can choose in the chat — e.g. "housing fits: 5 variants" vs "whole unit at 183 mm: 3 variants"."""
+    out = _generate_basis(req, n, envelope_basis, goals, ambient_c)
+    if compare_basis and goal_engine is not None:
+        try:
+            out["envelope_choice"] = _envelope_choice(req, n, envelope_basis, goals, ambient_c, out)
+        except Exception as e:          # never block the main result on the comparison
+            out["envelope_choice"] = None
+            out.setdefault("suggestions", []).append(f"envelope comparison unavailable: {e}")
+    return out
+
+
+def _option(basis, req, res, selected):
+    vs = res.get("variants", [])
+    env = [req.env_w, req.env_h, req.env_d]
+    if basis == "housing":
+        label = (f"Housing within {env[0]:g} × {env[1]:g} × {env[2]:g} mm; shaft ends stick out for the "
+                 f"couplings: {len(vs)} variant(s)")
+    else:
+        label = (f"Whole unit (shaft ends, bosses and breather included) within {env[0]:g} × {env[1]:g} × "
+                 f"{env[2]:g} mm: {len(vs)} variant(s)")
+    return {"basis": basis, "envelope_mm": env, "variant_count": len(vs), "label": label, "selected": selected,
+            "request_change": {"envelope_basis": basis, "envelope_width": env[0], "envelope_height": env[1],
+                               "envelope_depth": env[2]},
+            "overall_box_mm": [v["envelope_fit"]["overall_box_mm"] for v in vs if v.get("envelope_fit")],
+            "variants": None if selected else vs}
+
+
+def _envelope_choice(req, n, basis, goals, ambient_c, out):
+    """The other basis, computed with the real manufacturable assembly. If it gives nothing at the
+    requested envelope, its re-checked repair envelope is used (and said so)."""
+    vs = out.get("variants", [])
+    other = "overall" if basis == "housing" else "housing"
+    if basis == "housing" and vs and all(v["envelope_fit"]["fits_overall"] for v in vs):
+        return None                                   # nothing to choose: the whole unit already fits
+    if basis == "overall" and not vs:
+        pass                                          # the housing basis may still give variants
+    elif basis == "overall":
+        return None                                   # whole unit fits: the stricter question is answered
+    req2 = req
+    alt = _generate_basis(req2, n, other, goals, ambient_c)
+    repaired = False
+    min_depth = None
+    if not alt.get("variants") and other == "overall":
+        rep = next((r for r in alt.get("repairs", []) if "envelope_depth" in r["change"]), None)
+        if rep:
+            ch = rep["change"]
+            req2 = replace(req, env_w=ch.get("envelope_width", req.env_w), env_h=ch.get("envelope_height", req.env_h),
+                           env_d=ch["envelope_depth"])
+            alt = _generate_basis(req2, n, other, goals, ambient_c)
+            repaired = True
+            min_depth = req2.env_d
+            # the smallest depth often leaves a single design; offer the depth that gives a real choice
+            want = min(3, n)
+            if 0 < len(alt.get("variants", [])) < want:
+                cand = alt["diagnostics"].get("overall_depth_candidates_mm") or []
+                if len(cand) >= want:
+                    req3 = replace(req2, env_d=float(cand[want - 1]))
+                    alt3 = _generate_basis(req3, n, other, goals, ambient_c)
+                    if len(alt3.get("variants", [])) > len(alt["variants"]):
+                        req2, alt = req3, alt3
+    if not alt.get("variants") and not vs:
+        return None
+    opts = [_option(basis, req, out, True), _option(other, req2, alt, False)]
+    if repaired:
+        opts[1]["label"] += f" (depth enlarged from {req.env_d:g} to {req2.env_d:g} mm: nothing fits at {req.env_d:g})"
+        opts[1]["enlarged_from_mm"] = [req.env_w, req.env_h, req.env_d]
+        opts[1]["min_depth_mm"] = min_depth
+        if min_depth is not None and min_depth < req2.env_d:
+            opts[1]["label"] += f"; the smallest whole unit needs {min_depth:g} mm (1 variant)"
+    q = ("Does your envelope include the shaft ends? The housing fits, but with the shaft ends the unit is "
+         f"{max(b[2] for b in opts[0]['overall_box_mm']):g} mm deep." if basis == "housing" and opts[0]["overall_box_mm"]
+         else "Does your envelope include the shaft ends?")
+    return {"question": q, "options": opts,
+            "note": "Both options are computed by the solver with the full manufacturable assembly; "
+                    "the shaft ends are where the motor and the load are coupled."}
+
+
+def _generate_basis(req: Requirements, n: int, envelope_basis: str, goals: dict | None, ambient_c: float) -> dict:
+    """envelope_basis "overall": the shaft ends (sized for boss + seal + coupling) must also fit."""
     if envelope_basis not in ("housing", "overall"):
         raise ValueError("envelope_basis must be 'housing' or 'overall'")
     if envelope_basis == "overall":
@@ -444,12 +524,15 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
                 made_rejects["goals (re-checked on the manufacturable housing)"] += 1
                 spare.append(r)
                 continue
+        r["_plan"] = plan
         chosen.append(r)
     if not chosen and spare:      # no design keeps every goal once the real housing is in: show the best, honestly
         chosen = spare[:n]
         goal_note = ("Designs met all goals on the gear-level estimate, but none still does with the "
                      "manufacturable housing (bearing bosses, covers, central web). See goal_summary.blocking_goals.")
     diagnostics["rejected_manufacturable_housing"] = dict(made_rejects)
+    if overall_d and depth_need:
+        diagnostics["overall_depth_candidates_mm"] = sorted(math.ceil(d) for d in depth_need)
     if not chosen:
         msg = ("Designs meet strength and ratio, but none can be built in this envelope once the real "
                "bearings, bearing bosses and (2-stage) the central bearing web are included.")
@@ -482,10 +565,11 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         r["warnings"] = []
         if check_variant_shafts is not None:
             try:
-                r["shafts"], r["warnings"] = check_variant_shafts(r, req.input_rpm)
+                r["shafts"], r["warnings"] = check_variant_shafts(r, req.input_rpm, r.get("_plan"))
             except Exception as e:      # never block variant generation on the extra check
                 r["shafts"] = []
                 r["warnings"] = [f"shaft/bearing check unavailable: {e}"]
+        r.pop("_plan", None)
         if goal_engine is not None:
             try:
                 g = goals or {}

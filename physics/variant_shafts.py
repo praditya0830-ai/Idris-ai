@@ -80,7 +80,9 @@ def shaft_plan(variant, input_rpm=None):
     hp0 = dict(variant.get("housing_params") or {})
     depth0 = hp0.get("envelope_depth")
     widths, web = None, None
-    for _ in range(5):
+    history = []
+
+    def solve(widths, web):
         hp = {k: v for k, v in hp0.items() if k != "envelope_depth"}
         if widths:
             hp["bearing_widths"] = widths
@@ -94,12 +96,32 @@ def shaft_plan(variant, input_rpm=None):
             if not res.get("ok"):
                 return None
             results.append((spec, res))
+        return hp, L, results
+
+    web_of = lambda w, L: (w[0][1] + WEB_SEPTUM + w[2][0]) if L["stages"] == 2 else None
+    locked = False
+    for _ in range(6):
+        sol = solve(widths, web)
+        if sol is None:
+            return None
+        hp, L, results = sol
         new_widths = [[float(res["bearings"]["A"]["B_mm"]), float(res["bearings"]["B"]["B_mm"])]
                       for _, res in results]
-        new_web = (new_widths[0][1] + WEB_SEPTUM + new_widths[2][0]) if L["stages"] == 2 else None
-        if new_widths == widths and new_web == web:
+        if new_widths == widths or locked:
             break
-        widths, web = new_widths, new_web
+        if new_widths in history:
+            # the bearing choice oscillates (a wider bearing moves the supports, which lets a narrower one
+            # pass, and back): lock the seats to the widest bearing of the cycle. A narrower bearing then
+            # sits in a slightly deeper bore — a normal shoulder, still fully inside its boss.
+            cyc = history[history.index(new_widths):] + [widths]
+            widths = [[max(c[i][k] for c in cyc if c) for k in (0, 1)] for i in range(len(new_widths))]
+            web = web_of(widths, L)
+            locked = True
+            continue
+        history.append(new_widths)
+        widths, web = new_widths, web_of(new_widths, L)
+    if widths is None:
+        widths = new_widths
     need_D = L["D"]
     D = max(float(depth0 or 0), float(need_D))
     hp_final = dict(hp, envelope_depth=D, bearing_widths=widths)
@@ -111,6 +133,12 @@ def shaft_plan(variant, input_rpm=None):
         results = [(spec, design_shaft(spec)) for spec, _ in results]
         if not all(r.get("ok") for _, r in results):
             return None
+    seat_notes = []
+    for si, (_, res) in enumerate(results):
+        for k, key in enumerate(("A", "B")):
+            if float(res["bearings"][key]["B_mm"]) > widths[si][k] + 1e-6:
+                seat_notes.append(f"{L['shafts'][si]['name']}: bearing {res['bearings'][key]['designation']} is "
+                                  f"wider than its {widths[si][k]:g} mm seat.")
     out = []
     for si, (spec, res) in enumerate(results):
         s = L["shafts"][si]
@@ -123,7 +151,7 @@ def shaft_plan(variant, input_rpm=None):
         out.append({"name": s["name"], "x": s["x"], "segments": segs, "bearings": brg,
                     "journal_mm": res["geometry"]["journal_dia_mm"], "seat_mm": res["geometry"]["seat_dia_mm"],
                     "res": res, "spec": spec})
-    notes = []
+    notes = list(seat_notes)
     t, W, H = L["wall_mm"], L["W"], L["H"]
 
     def fits(x, dia):
@@ -161,9 +189,11 @@ def shaft_plan(variant, input_rpm=None):
             "hp": hp_final, "L": L, "manufacturable": manufacturable, "depth_mm": D, "depth_needed_mm": need_D}
 
 
-def check_variant_shafts(variant, input_rpm):
-    """Returns (shafts_summary list, warnings list) for one variant dict from generate_variants."""
-    plan = shaft_plan(variant, input_rpm)
+def check_variant_shafts(variant, input_rpm, plan=None):
+    """Returns (shafts_summary list, warnings list) for one variant dict from generate_variants.
+    `plan`: the shaft_plan already computed for this variant (saves re-running the shaft solver)."""
+    if plan is None:
+        plan = shaft_plan(variant, input_rpm)
     if plan is None:
         return [], ["Shaft/bearing design failed for this variant: no standard shaft + deep-groove bearing "
                     "combination meets fatigue, stiffness and L10 life."]
