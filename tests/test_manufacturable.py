@@ -77,3 +77,21 @@ def test_envelope_fit_is_reported_by_the_solver():
     asm = build_assembly(v["design"], v["kinematics"], v["shaft"], hp)
     assert asm["layout"]["overall_box_mm"] == ef["overall_box_mm"]
     assert asm["layout"]["housing_box_mm"] == ef["housing_box_mm"]
+
+
+def test_envelope_choice_offers_both_bases():
+    # Arya 17 Oct: let the engineer choose in the chat — housing basis vs the whole unit incl. shaft ends
+    o = generate_variants(S1)
+    c = o["envelope_choice"]
+    assert c and len(c["options"]) == 2
+    h, w = c["options"]
+    assert h["basis"] == "housing" and h["selected"] and h["variant_count"] == len(o["variants"]) == 5
+    assert w["basis"] == "overall" and not w["selected"] and w["variant_count"] == len(w["variants"]) >= 1
+    d = w["request_change"]["envelope_depth"]
+    for v in w["variants"]:
+        assert v["envelope_fit"]["fits_overall"] and v["envelope_fit"]["overall_box_mm"][2] <= d + 0.5
+    # applying the change reproduces the offered variants
+    o2 = generate_variants(Requirements(**{**S1.__dict__, "env_d": d}), envelope_basis="overall", compare_basis=False)
+    assert [v["design"] for v in o2["variants"]] == [v["design"] for v in w["variants"]]
+    # when the whole unit already fits, there is nothing to ask
+    assert generate_variants(S2)["envelope_choice"] is None
