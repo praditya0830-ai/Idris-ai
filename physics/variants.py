@@ -416,7 +416,9 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         st = plan["hp"].get("stickout_mm") or [22.0, 22.0]
         over = depth + float(st[0]) + float(st[1])
         depth_need.append(over if overall_d else depth)
-        if (over > overall_d + 1e-6) if overall_d else (depth > req.env_d + 1e-6):
+        too_tall = bool(overall_d) and goal_engine is not None and \
+            env["height"] + goal_engine.BREATHER_H_MM > req.env_h + 1e-6
+        if too_tall or ((over > overall_d + 1e-6) if overall_d else (depth > req.env_d + 1e-6)):
             made_rejects["envelope (manufacturable housing depth)"] += 1
             continue
         hp = dict(plan["hp"], envelope_depth=depth)
@@ -488,6 +490,8 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
             try:
                 g = goals or {}
                 r["assembly_bbox_mm"] = goal_engine.assembly_bbox(r)
+                r["envelope_fit"] = goal_engine.envelope_fit(r, (req.env_w, req.env_h, overall_d or req.env_d),
+                                                             "overall" if overall_d else "housing")
                 r["notes"] = goal_engine.assembly_notes(r)
                 r["thermal_screen"] = goal_engine.thermal_screen(
                     r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,

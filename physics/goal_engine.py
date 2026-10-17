@@ -198,14 +198,35 @@ def summarize(variants, goals):
             "blocking_goals": {g: f"{n} of {len(variants)} variants miss it" for g, n in blocking.items()}}
 
 
+BREATHER_H_MM = 6.0
+
+
 def assembly_bbox(variant):
     """Box of the whole assembly: housing + the real shaft ends (layout v4 sizes each end for its
     bearing boss, lip seal and coupling; older variants fall back to SHAFT_STICKOUT_MM)."""
     hp = variant["housing_params"]
     sf, sb = hp.get("stickout_mm") or (SHAFT_STICKOUT_MM, SHAFT_STICKOUT_MM)
+    top = BREATHER_H_MM if hp.get("stickout_mm") else 0.0      # v4 breather plug on top
     return {"min": [0.0, 0.0, -float(sf)],
-            "max": [float(hp["envelope_width"]), float(hp["envelope_height"]),
+            "max": [float(hp["envelope_width"]), float(hp["envelope_height"]) + top,
                     float(hp["envelope_depth"]) + float(sb)]}
+
+
+def envelope_fit(variant, envelope, basis):
+    """Solver-side envelope verdict so the UI never has to recompute it (v0.11.1).
+    housing = the housing box (bosses, plugs and shaft ends excluded); overall = everything in the STL."""
+    hp = variant["housing_params"]
+    hb = [float(hp["envelope_width"]), float(hp["envelope_height"]), float(hp["envelope_depth"])]
+    bb = assembly_bbox(variant)
+    ob = [round(bb["max"][i] - bb["min"][i], 1) for i in range(3)]
+    env = [float(e) for e in envelope]
+    fits = lambda box: all(b <= e + 0.5 for b, e in zip(box, env))
+    return {"basis": basis, "envelope_mm": env, "housing_box_mm": hb, "overall_box_mm": ob,
+            "fits_housing": fits(hb), "fits_overall": fits(ob),
+            "fits": fits(ob) if basis == "overall" else fits(hb),
+            "note": ("Envelope checked on the housing box; shaft ends (to the couplings), bearing bosses and the "
+                     "breather stand outside it by design." if basis == "housing" else
+                     "Envelope checked on the whole assembly including shaft ends, bosses and plugs.")}
 
 
 def assembly_notes(variant):
