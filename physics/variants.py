@@ -26,6 +26,8 @@ claimed.
 
 from __future__ import annotations
 
+import math
+from .gears import web_volume_mm3
 from collections import Counter
 
 from dataclasses import replace
@@ -36,9 +38,9 @@ from physics.gears import (
 )
 
 try:                                   # ACE shaft + bearing check (tim solver); optional at import time
-    from physics.variant_shafts import check_variant_shafts
+    from physics.variant_shafts import check_variant_shafts, shaft_plan
 except Exception:                      # pragma: no cover
-    check_variant_shafts = None
+    check_variant_shafts = shaft_plan = None
 
 try:                                   # ACE Goal Engine G1 (tim solver): thermal screen + engineer goals
     from physics import goal_engine
@@ -47,8 +49,8 @@ except Exception:                      # pragma: no cover
 
 MODULE_SWEEP = (1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0)
 PINION_TEETH_SWEEP = range(17, 37)
-FACE_WIDTH_FACTORS = range(8, 31, 2)       # b = k * m
-MAX_WIDTH_TO_DIAMETER = 1.4                # b / pinion pitch diameter
+FACE_WIDTH_FACTORS = range(8, 21, 2)       # b = k * m; b/m ≤ 20 (same guideline as /review DFM, v0.11)
+MAX_WIDTH_TO_DIAMETER = 1.2                # b / pinion pitch diameter (same guideline as /review DFM, v0.11)
 
 
 def _clip01(x: float) -> float:
@@ -291,21 +293,51 @@ def generate_variants(req: Requirements, n: int = 5, envelope_basis: str = "hous
         stick = 2 * (goal_engine.SHAFT_STICKOUT_MM if goal_engine else 22.0)
         if req.env_d - stick <= 0:
             raise ValueError(f"envelope_depth must be larger than {stick:g} mm when shaft ends are included")
-        out = _generate(replace(req, env_d=req.env_d - stick), n, goals, ambient_c)
+        out = _generate(replace(req, env_d=req.env_d - stick), n, goals, ambient_c, overall_d=req.env_d)
         for r in out.get("repairs", []):          # report depth in the engineer's (overall) terms
-            if "envelope_depth" in r["change"]:
+            if "envelope_depth" in r["change"] and not r.pop("_overall", False):
                 r["change"]["envelope_depth"] = r["change"]["envelope_depth"] + stick
+        if not out.get("variants"):
+            # gear-level repairs assume the minimum 22 mm shaft ends; re-check the first one with the real
+            # manufacturable assembly (bearing bosses, seals, couplings) so the count we report is honest
+            for r in out.get("repairs", [])[:1]:
+                ch = r["change"]
+                if "envelope_depth" not in ch:
+                    continue
+                req2 = replace(req, env_w=ch.get("envelope_width", req.env_w), env_h=ch.get("envelope_height", req.env_h),
+                               env_d=ch["envelope_depth"])
+                for _ in range(3):
+                    chk = _generate(replace(req2, env_d=req2.env_d - stick), n, goals, ambient_c, overall_d=req2.env_d)
+                    if chk.get("variants"):
+                        break
+                    more = [x for x in chk.get("repairs", []) if x.pop("_overall", False)]
+                    if not more:
+                        break
+                    req2 = replace(req2, env_d=more[0]["change"]["envelope_depth"])
+                ch["envelope_depth"] = float(req2.env_d)
+                r["feasible_variants"] = len(chk.get("variants", []))
+                r["reason"] = (f"enlarge the envelope to {ch.get('envelope_width', req.env_w):g}×"
+                               f"{ch.get('envelope_height', req.env_h):g}×{req2.env_d:g} mm overall "
+                               "(manufacturable housing + shaft ends, re-checked)")
+                r["_overall"] = True
+            out["suggestions"] = [f"Solver check: {r['reason']} gives {r['feasible_variants']} buildable variants."
+                                  for r in out.get("repairs", []) if r.get("_overall")] + \
+                                 [s_ for s_ in out.get("suggestions", []) if not s_.startswith("Solver check")]
         out["suggestions"] = [s.replace("(shaft ends excluded)", "") for s in out.get("suggestions", [])]
+        for r in out.get("repairs", []):
+            r.pop("_overall", None)
         out["envelope_basis"] = "overall"
-        out["envelope_note"] = (f"Depth checked as housing + 2 × {stick / 2:g} mm shaft ends ≤ {req.env_d:g} mm "
-                                f"(housing depth ≤ {req.env_d - stick:g} mm).")
+        out["envelope_note"] = (f"Depth checked as housing + both shaft ends ≤ {req.env_d:g} mm; each shaft end "
+                                f"is sized for its bearing boss, lip seal and coupling (≥ {stick / 2:g} mm).")
         return out
     out = _generate(req, n, goals, ambient_c)
+    for r in out.get("repairs", []):
+        r.pop("_overall", None)
     out["envelope_basis"] = "housing"
     return out
 
 
-def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -> dict:
+def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, overall_d: float | None = None) -> dict:
     if req.gear_material not in GEAR_MATERIALS:
         raise ValueError(f"unknown gear_material '{req.gear_material}', choose one of {list(GEAR_MATERIALS)}")
     if req.housing_material not in HOUSING_MATERIALS:
@@ -353,7 +385,82 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -
             goal_note = ("No feasible design meets all goals; showing the best designs on strength and size. "
                          "See goal_summary.blocking_goals and each variant's goal_check.")
     _score(feasible, req)
-    chosen = _select(feasible, n)
+    # manufacturable housing (layout v4): every candidate gets its real shafts + bearings, and the
+    # housing is sized around them (bearing bosses, central web for 2-stage). A design is only offered
+    # when that housing can actually be made and still fits the envelope.
+    chosen, made_rejects, depth_need, spare = [], Counter(), [], []
+    pool = _select(feasible, max(3 * n, n + 6)) if shaft_plan is not None else _select(feasible, n)
+    for r in pool:
+        if len(chosen) >= n:
+            break
+        if shaft_plan is None:
+            chosen.append(r)
+            continue
+        env = r["envelope_needed_mm"]
+        r["housing_params"] = {"envelope_width": env["width"], "envelope_height": env["height"],
+                               "envelope_depth": env["depth"], "gear_ratio": r["kinematics"]["ratio_actual"],
+                               "wall_thickness": req.wall_thickness,
+                               "bore_diameter": r["shaft"]["output_diameter_mm"] + 2.0}
+        try:
+            plan = shaft_plan({**r, "housing_params": {k: v for k, v in r["housing_params"].items()
+                                                        if k != "envelope_depth"}}, req.input_rpm)
+        except Exception:
+            plan = None
+        if plan is None:
+            made_rejects["shaft/bearing design"] += 1
+            continue
+        if not plan["manufacturable"]:
+            made_rejects["bearing does not fit"] += 1
+            continue
+        depth = float(plan["depth_needed_mm"])
+        st = plan["hp"].get("stickout_mm") or [22.0, 22.0]
+        over = depth + float(st[0]) + float(st[1])
+        depth_need.append(over if overall_d else depth)
+        if (over > overall_d + 1e-6) if overall_d else (depth > req.env_d + 1e-6):
+            made_rejects["envelope (manufacturable housing depth)"] += 1
+            continue
+        hp = dict(plan["hp"], envelope_depth=depth)
+        r["housing_params"] = {**r["housing_params"], **hp}
+        r["envelope_needed_mm"] = {**env, "depth": depth}
+        t_ = req.wall_thickness
+        W_, H_ = env["width"], env["height"]
+        vol = W_ * H_ * depth - (W_ - 2 * t_) * (H_ - 2 * t_) * (depth - 2 * t_)
+        if hp.get("web_mm"):
+            vol += web_volume_mm3(W_ - 2 * t_, H_ - 2 * t_, hp["web_mm"], t_, hp.get("web_hub_diameter", 0.0),
+                                  [hp.get("web_hole_diameter", 0.0)])
+        rho = HOUSING_MATERIALS[req.housing_material]["density"]
+        r["mass_kg"] = {**r["mass_kg"], "housing": round(vol * 1e-9 * rho, 3)}
+        r["mass_kg"]["total"] = round(r["mass_kg"]["gears"] + r["mass_kg"]["housing"], 3)
+        if goals and goal_engine is not None and diagnostics.get("meeting_goals"):
+            # goals were screened on the gear-level box; re-check them on the manufacturable housing
+            g = goals
+            r["thermal_screen"] = goal_engine.thermal_screen(
+                r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
+                float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"),
+                (req.env_w, req.env_h, req.env_d))
+            if not all(x["pass"] for x in goal_engine.check_goals(r, g).values()):
+                made_rejects["goals (re-checked on the manufacturable housing)"] += 1
+                spare.append(r)
+                continue
+        chosen.append(r)
+    if not chosen and spare:      # no design keeps every goal once the real housing is in: show the best, honestly
+        chosen = spare[:n]
+        goal_note = ("Designs met all goals on the gear-level estimate, but none still does with the "
+                     "manufacturable housing (bearing bosses, covers, central web). See goal_summary.blocking_goals.")
+    diagnostics["rejected_manufacturable_housing"] = dict(made_rejects)
+    if not chosen:
+        msg = ("Designs meet strength and ratio, but none can be built in this envelope once the real "
+               "bearings, bearing bosses and (2-stage) the central bearing web are included.")
+        reps = []
+        if depth_need:
+            dmin = math.ceil(min(depth_need))
+            reps.append({"change": {"envelope_depth": float(dmin)}, "feasible_variants": None,
+                         "reason": f"the smallest manufacturable housing needs a depth of {dmin} mm"
+                                   + (" including both shaft ends" if overall_d else "")})
+            if overall_d:
+                reps[-1]["_overall"] = True
+        return {"variants": [], "diagnostics": diagnostics, "repairs": reps,
+                "suggestions": [msg] + [f"Solver check: {r_['reason']}." for r_ in reps]}
     _label(chosen)
     chosen.sort(key=lambda r: (-r["_phys"], -r["_des"]))        # A = strongest physics ... last = strongest design
 
@@ -361,11 +468,12 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -
     for i, r in enumerate(chosen):
         env = r["envelope_needed_mm"]
         r["name"] = f"Variant {chr(ord('A') + i)}"
-        r["housing_params"] = {                       # feed straight into POST /generate-housing
-            "envelope_width": env["width"], "envelope_height": env["height"], "envelope_depth": env["depth"],
-            "gear_ratio": r["kinematics"]["ratio_actual"], "wall_thickness": req.wall_thickness,
-            "bore_diameter": r["shaft"]["output_diameter_mm"] + 2.0,
-        }
+        if "housing_params" not in r or shaft_plan is None:
+            r["housing_params"] = {                   # feed straight into POST /generate-housing
+                "envelope_width": env["width"], "envelope_height": env["height"], "envelope_depth": env["depth"],
+                "gear_ratio": r["kinematics"]["ratio_actual"], "wall_thickness": req.wall_thickness,
+                "bore_diameter": r["shaft"]["output_diameter_mm"] + 2.0,
+            }
         for k in ("_margin", "_vol", "_phys", "_des"):
             r.pop(k)
         # ACE shaft + bearing check on the same geometry as /generate-assembly (additive fields)
@@ -380,7 +488,7 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float) -
             try:
                 g = goals or {}
                 r["assembly_bbox_mm"] = goal_engine.assembly_bbox(r)
-                r["warnings"] = list(r["warnings"]) + goal_engine.assembly_warnings(r)
+                r["notes"] = goal_engine.assembly_notes(r)
                 r["thermal_screen"] = goal_engine.thermal_screen(
                     r, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
                     float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"),

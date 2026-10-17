@@ -85,18 +85,20 @@ def fin_mass_kg(fl, rho):
     return fl["count"] * fl["length_mm"] * fl["height_mm"] * fl["thickness_mm"] * 1e-9 * rho
 
 
-def box_areas(W, H, D, t):
-    """Outer and inner (oil-wetted) areas of the closed box, m²."""
+def box_areas(W, H, D, t, web_mm=0.0):
+    """Outer and inner (oil-wetted) areas of the closed box, m². A central web (2-stage layout v4) of
+    thickness web_mm splits the inside into two oil chambers: its two faces are wetted too."""
     wi, hi, di = W - 2 * t, H - 2 * t, D - 2 * t
     A_out = 2 * (W * H + W * D + H * D) * 1e-6
-    A_in = 2 * (wi * hi + wi * di + hi * di) * 1e-6
+    web = max(0.0, float(web_mm or 0.0))
+    A_in = (2 * wi * hi * (2 if web else 1) + 2 * (wi + hi) * (di - web)) * 1e-6
     return A_out, A_in
 
 
 def oil_temp_lumped(Q_w, W, H, D, t, k, h_oil, T_amb=25.0, cooling="natural", air_speed=0.0,
-                    fins=None, oil_cooler_w=0.0, emissivity=0.85):
+                    fins=None, oil_cooler_w=0.0, emissivity=0.85, web_mm=0.0):
     """Steady oil temperature of a closed box housing (mm, W, W/mK, W/m²K). Returns a dict."""
-    A_out, A_in = box_areas(W, H, D, t)
+    A_out, A_in = box_areas(W, H, D, t, web_mm)
     Q = max(0.0, Q_w - max(0.0, oil_cooler_w))
     fl = fin_layout(fins, H, D, W) if fins else None
     R_in = 1.0 / (h_oil * A_in)

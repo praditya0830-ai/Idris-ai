@@ -73,7 +73,7 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
     ho = h_oil(variant, input_rpm)
 
     def run(q=Q, **kw):
-        return oil_temp_lumped(q, W, H, D, wall_mm, k, ho, ambient_c, **kw)
+        return oil_temp_lumped(q, W, H, D, wall_mm, k, ho, ambient_c, web_mm=hp.get("web_mm", 0.0), **kw)
 
     nat = run()
     res = {"method": "L1 lumped screen (confirm with /cfd)", "heat_w": round(Q, 1),
@@ -152,6 +152,9 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
         G = Q / max(nat["oil_temp_c"] - ambient_c, 1e-9)        # W/K at the natural state (screen)
         cw = 50.0 * math.ceil(max(0.0, Q - G * dT_t) / 50.0)
         t = run(oil_cooler_w=cw)["oil_temp_c"]
+        while t > limit_c and cw < Q:          # the linear first guess can fall short (h grows with ΔT)
+            cw += 50.0
+            t = run(oil_cooler_w=cw)["oil_temp_c"]
         res["measure"] = {"label": f"Oil cooler {cw:.0f} W", "change": {"oil_cooler_w": cw},
                           "oil_temp_c": round(t, 1), "added_mass_kg": 0.0, "basis": "computed", "assumption": None}
     if res["measure"] is None:
@@ -166,7 +169,8 @@ def check_goals(variant, goals):
     meas = ts.get("measure")
     t_oil = meas["oil_temp_c"] if meas else (ts.get("closest") or {}).get("oil_temp_c", ts.get("oil_temp_natural_c"))
     computed = meas is not None and meas.get("basis", "computed") == "computed"
-    out["oil_temp_max_c"] = {"value": t_oil, "limit": ts.get("limit_c"), "pass": computed,
+    ok = computed and t_oil is not None and (ts.get("limit_c") is None or t_oil <= ts["limit_c"] + 1e-6)
+    out["oil_temp_max_c"] = {"value": t_oil, "limit": ts.get("limit_c"), "pass": ok,
                              "with": meas["label"] if meas else None,
                              # QA Q-020: an assumption alone never makes a goal PASS
                              "passes_only_with_assumption": meas is not None and not computed}
@@ -195,17 +199,31 @@ def summarize(variants, goals):
 
 
 def assembly_bbox(variant):
+    """Box of the whole assembly: housing + the real shaft ends (layout v4 sizes each end for its
+    bearing boss, lip seal and coupling; older variants fall back to SHAFT_STICKOUT_MM)."""
     hp = variant["housing_params"]
-    return {"min": [0.0, 0.0, -SHAFT_STICKOUT_MM],
+    sf, sb = hp.get("stickout_mm") or (SHAFT_STICKOUT_MM, SHAFT_STICKOUT_MM)
+    return {"min": [0.0, 0.0, -float(sf)],
             "max": [float(hp["envelope_width"]), float(hp["envelope_height"]),
-                    float(hp["envelope_depth"]) + SHAFT_STICKOUT_MM]}
+                    float(hp["envelope_depth"]) + float(sb)]}
 
 
-def assembly_warnings(variant):
-    """QA Q-011: how the variant is assembled in /generate-assembly v4 (body + bolted end cover)."""
+def assembly_notes(variant):
+    """How the variant is built (layout v4) — information, not a defect (Arya, 16 Oct: Idris-generated
+    designs must be manufacturable as delivered)."""
     d = variant["design"]
-    tip = d["module_mm"] * (d["gear_teeth"] + 2)
-    t = float(variant["housing_params"].get("wall_thickness") or 4)
-    return [f"Assembly: the Ø{tip:.0f} mm gears go in through the open back of the housing; a bolted end cover "
-            f"closes it. Cover bolts, dowels, gasket and bearing bosses (bearings are wider than the {t:g} mm wall) "
-            "are not modelled yet."]
+    hp = variant["housing_params"]
+    if int(d.get("stages", 1)) == 2:
+        how = ("Housing body with an integral central web, bolted front and back covers. Stage 1 goes in from the "
+               "front, stage 2 from the back; the web carries the inner bearings of the input and output shafts.")
+    else:
+        how = "Housing body with an integral front wall and a bolted back cover; gears go in from the back."
+    return [how, "Every shaft runs in two deep-groove bearings in bosses; lip seals where shafts leave; "
+                 "cover bolts in corner columns with dowels; breather, level and drain plugs."
+            + (f" Central web {hp['web_mm']:g} mm." if hp.get("web_mm") else ""),
+            "Fits: bearing bores N7 in aluminium/magnesium housings (H7 in steel/cast iron), shaft seats k5 "
+            "(≤ Ø40) / m5; inner fillets R ≥ half the wall."]
+
+
+def assembly_warnings(variant):        # kept for compatibility; v4 designs have no assembly defect
+    return []

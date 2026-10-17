@@ -40,7 +40,51 @@ K_A = 1.25                          # application factor (moderate shock, e.g. r
 K_M = 1.30                          # load distribution factor (face-width misalignment)
 Q_V = 7                             # AGMA transmission accuracy number
 CLEARANCE = 6.0                     # mm, gear-to-wall / bearing space
-STAGE_GAP = 6.0                     # mm, axial gap between the two stages
+STAGE_GAP = 6.0                     # mm, axial gap between the two stages (legacy, closed-box model)
+WEB_GAP = 3.0                       # mm, gear face to the central web (2-stage, manufacturable layout v4)
+WEB_SEPTUM = 3.0                    # mm, web material between the two bearing pockets
+_W62 = ((10, 9), (12, 10), (15, 11), (17, 12), (20, 14), (25, 15), (30, 16), (35, 17), (40, 18), (45, 19),
+        (50, 20), (55, 21), (60, 22), (65, 23), (70, 24), (75, 25), (80, 26))
+
+
+def bearing_width_estimate(d_shaft):
+    """Width of a 62-series deep-groove bearing for a shaft of this size (provisional, before the
+    shaft solver picks the real bearing)."""
+    for bore, w in _W62:
+        if bore >= d_shaft - 1e-9:
+            return float(w)
+    return float(_W62[-1][1])
+
+
+WEB_PLATE_MIN = 6.0                 # mm, cast/machined web plate between the two stage chambers
+
+
+def bearing_od_estimate(d_shaft):
+    """Outside diameter of a 62-series deep-groove bearing for this shaft (provisional): D ≈ 1.6·d + 15."""
+    return 1.6 * max(float(d_shaft), 10.0) + 15.0
+
+
+def web_hub_diameter(bearing_od_max):
+    """Hub around the two web bearing pockets: pocket OD + 2 × boss wall (≥ 4 mm, 12 % of the OD)."""
+    return bearing_od_max + 2.0 * max(4.0, 0.12 * bearing_od_max)
+
+
+def web_plate_thickness(wall_mm):
+    return max(float(wall_mm), WEB_PLATE_MIN)
+
+
+def web_volume_mm3(w_in, h_in, web_t, wall_mm, hub_d, hole_ds=()):
+    """Material of the central web: a plate across the inner section (thickness max(wall, 6 mm)) plus a
+    bearing hub of length web_t around the coaxial axis; bearing pockets and holes removed."""
+    tp = min(web_plate_thickness(wall_mm), web_t)
+    plate = w_in * h_in * tp - sum(math.pi / 4.0 * dh ** 2 * tp for dh in hole_ds)
+    hub = math.pi / 4.0 * hub_d ** 2 * max(0.0, web_t - tp)
+    return max(0.0, plate) + hub
+
+
+def web_thickness_estimate(d_in, d_out):
+    """Central web of the 2-stage reverted housing: input-end pocket + septum + output-end pocket."""
+    return bearing_width_estimate(d_in) + WEB_SEPTUM + bearing_width_estimate(d_out)
 TAU_SHAFT = 50.0                    # MPa, allowable shear stress for shaft sizing (conservative)
 
 # Representative values (see module docstring warning)
@@ -193,7 +237,8 @@ def evaluate(req: Requirements, m: float, zp: int, b: float) -> dict:
     else:   # reverted: input/output coaxial (axis A), intermediate shaft (axis B) at distance a
         w_need = a + dag + 2 * CLEARANCE + 2 * t
         h_need = dag + 2 * CLEARANCE + 2 * t
-        d_need = 2 * b + STAGE_GAP + 2 * CLEARANCE + 2 * t
+        web = web_thickness_estimate(shaft_diameter_mm(t_in), shaft_diameter_mm(t_in * ratio_actual * eta_total))
+        d_need = 2 * b + 2 * WEB_GAP + web + 2 * CLEARANCE + 2 * t
     w_need, h_need, d_need = math.ceil(w_need), math.ceil(h_need), math.ceil(d_need)
     fits = w_need <= req.env_w and h_need <= req.env_h and d_need <= req.env_d
 
@@ -202,6 +247,10 @@ def evaluate(req: Requirements, m: float, zp: int, b: float) -> dict:
     gears_kg = gear_vol_mm3 * 1e-9 * gm["density"]
     housing_vol_mm3 = (w_need * h_need * d_need
                        - (w_need - 2 * t) * (h_need - 2 * t) * (d_need - 2 * t))
+    if stages == 2:                                   # central web: plate + bearing hub (pockets ignored)
+        hub = web_hub_diameter(bearing_od_estimate(max(shaft_diameter_mm(t_in),
+                                                      shaft_diameter_mm(t_in * ratio_actual * eta_total))))
+        housing_vol_mm3 += web_volume_mm3(w_need - 2 * t, h_need - 2 * t, web, t, hub)
     housing_kg = housing_vol_mm3 * 1e-9 * hm["density"]
 
     t_out = t_in * ratio_actual * eta_total

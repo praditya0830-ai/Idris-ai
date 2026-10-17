@@ -97,15 +97,26 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
                         f"Gear tip passes {cl:.1f} mm from the {s['name']} (Ø{s['d']:.0f} mm).",
                         "Increase the center distance or relieve the shaft under the gear.",
                         [g["x"] + math.copysign(r, s["x"] - g["x"]), yc, zc])
-        # gear faces vs. front/back walls
+        # gear faces vs. front/back walls and the central web
+        web = L.get("web")
         for g in gears:
             gap_f, gap_b = g["z0"] - t, D - t - (g["z0"] + b)
-            if min(gap_f, gap_b) < 2.0:
-                add("interference", "warning", g["name"],
-                    f"Gear face is {min(gap_f, gap_b):.1f} mm from the housing wall.",
+            f_name, b_name = "front wall", "back wall"
+            if web:
+                if g["z0"] + b <= web["z0"] + 1e-6:
+                    gap_b, b_name = web["z0"] - (g["z0"] + b), "central web"
+                elif g["z0"] >= web["z1"] - 1e-6:
+                    gap_f, f_name = g["z0"] - web["z1"], "central web"
+                else:
+                    gap_f = gap_b = -1.0
+                    f_name = b_name = "central web"
+            gap, where = (gap_f, f_name) if gap_f < gap_b else (gap_b, b_name)
+            if gap < 2.0:
+                add("interference", "critical" if gap < 0 else "warning", g["name"],
+                    f"Gear face is {gap:.1f} mm from the {where}.",
                     "Keep ≥ 2 mm axial clearance (more if a bearing or circlip sits there).",
                     [g["x"], yc, g["z0"] if gap_f < gap_b else g["z0"] + b])
-        if S == 2:
+        if S == 2 and not web:
             s_in, s_out = shafts[0], shafts[2]
             gap = s_out["z0"] - s_in["z1"]
             add("interference", "info", s_in["name"],
@@ -116,28 +127,18 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
 
     # ------------------------------------------------------------- fits / bearings
     if "fits" in checks and plan:
-        # bearings as designed by the ACE shaft solver and drawn by /generate-assembly v4
+        # bearings designed by the ACE shaft solver and drawn by /generate-assembly (layout v4): every seat is
+        # a bored boss in a cover or a pocket in the central web, so only real misfits are reported here.
         for si, ps in enumerate(plan["shafts"]):
             s = shafts[si]
             for br in ps["bearings"]:
-                z_b = br["z"]
-                in_wall = abs(z_b - t / 2) < 1e-6 or abs(z_b - (D - t / 2)) < 1e-6
-                where = ("front wall" if abs(z_b - t / 2) < 1e-6 else "back wall") if in_wall else "pilot (inside the output shaft)"
-                through = any(bo["shaft"] == si and abs((t / 2 if bo["wall"] == "front" else D - t / 2) - z_b) < 1e-6
-                              for bo in L["bores"])
-                if in_wall and br["B"] > t:
+                if br.get("seat") is None:
                     add("fits", "warning", s["name"],
-                        f"Bearing {br['designation']} (Ø{br['d']}×Ø{br['D']}×{br['B']} mm, {where}) is wider than the "
-                        f"{t:.0f} mm wall" + ("" if through else "; this seat is a blind pocket that is not drawn yet") + ".",
-                        f"Add a bearing boss so the seat is ≥ {br['B']} mm long: bore Ø{br['D']} "
-                        f"{'N7' if material.startswith(('Al', 'A356', 'Mg')) else 'H7'}, shaft seat Ø{br['d']} "
-                        f"{'k5' if br['d'] <= 40 else 'm5'}.",
-                        [s["x"], yc, z_b])
-                elif not in_wall:
-                    add("fits", "info", s["name"],
-                        f"Pilot bearing {br['designation']} (Ø{br['d']}×Ø{br['D']}×{br['B']} mm) between the coaxial "
-                        "shafts is part of the shaft check but not drawn.",
-                        "Detail the bore in the output-shaft end (or a central web) for this bearing.", [s["x"], yc, z_b])
+                        f"Bearing {br['designation']} at z = {br['z']:.1f} mm has no seat in the housing.",
+                        "Move the support to a cover boss or the central web.", [s["x"], yc, br["z"]])
+        for n in plan.get("notes", []):
+            add("fits", "warning", "Housing", n, "Re-run /generate-variants (it now sizes the housing for the bearings).",
+                [W / 2, yc, D / 2])
     elif "fits" in checks:
         reac = per_shaft_reactions(L)
         for si, s in enumerate(shafts):
@@ -169,7 +170,8 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
                 [s["x"], yc, z_at])
     if "fits" in checks:
         if material.startswith(("Al", "A356", "Mg")):
-            add("fits", "warning", "Housing",
+            # production advice; for a manufacturable Idris design the N7 fit is already part of the spec
+            add("fits", "info" if plan and plan.get("manufacturable") else "warning", "Housing",
                 f"{material} expands ≈2× more than steel bearing rings (23 vs 12 µm/m·K): at +60 °C a bearing "
                 "bore loosens by tens of µm and the outer ring can creep.",
                 "Use a tighter housing fit (N7), steel bearing liners, or anti-creep O-ring bearings.",
@@ -180,7 +182,13 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
             d_sh = shafts[g["shaft"]]["d"]
             d_root = m * (zp - 2.5)
             rim = (d_root - d_sh) / 2
-            if rim < 1.2 * 2.25 * m:
+            if rim < 1.2 * 2.25 * m and plan and plan.get("manufacturable"):
+                add("fits", "info", g["name"],
+                    f"Root Ø{d_root:.1f} mm leaves no room for a keyed seat on the Ø{d_sh:.0f} mm shaft, so this "
+                    "pinion is designed as an integral pinion shaft (teeth cut on the shaft).",
+                    "No action: drawn and specified as an integral pinion shaft.",
+                    [g["x"], yc + dp / 2, g["z0"] + b / 2])
+            elif rim < 1.2 * 2.25 * m:
                 add("fits", "warning", g["name"],
                     f"Root Ø{d_root:.1f} mm leaves a {rim:.1f} mm rim over the Ø{d_sh:.0f} mm shaft (AGMA backup "
                     f"ratio needs ≥ {1.2 * 2.25 * m:.1f} mm): no room for a keyway.",
@@ -218,19 +226,22 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
             v_part = v_box - (W - 2 * t) * (H - 2 * t) * (D - 2 * t)
             ratio = v_box / max(v_part, 1)
             if ratio > 3:
-                add("dfm", "warning", "Housing",
+                add("dfm", "info" if plan and plan.get("manufacturable") else "warning", "Housing",
                     f"Machining this housing from a {material} billet removes ≈{100 * (1 - 1 / ratio):.0f} % of the "
                     f"stock (buy-to-fly ≈ {ratio:.1f}).",
                     "For series production cast it (A356-T6) or build it from plates; keep billet machining for prototypes.",
                     [0, H, D])
-        add("dfm", "info", "Housing", "Inner and outer corners of the housing are sharp in the current model.",
-            f"Specify fillets R ≥ {max(2, round(t / 2)):.0f} mm inside (stress, castability, cutter radius).", [t, t, t])
+        if not plan:
+            add("dfm", "info", "Housing", "Inner and outer corners of the housing are sharp in the current model.",
+                f"Specify fillets R ≥ {max(2, round(t / 2)):.0f} mm inside (stress, castability, cutter radius).", [t, t, t])
 
     # ------------------------------------------------------------- assembly
     if "assembly" in checks:
         max_tip = max(dap, dag)
         max_hole = max(bo["d"] for bo in L["bores"])
-        if L.get("split_cover"):
+        if plan and plan.get("manufacturable"):
+            pass        # covers, bosses, seals, bolts, dowels and plugs are part of the design (see variant notes)
+        elif L.get("split_cover"):
             add("assembly", "info", "Housing cover",
                 f"Gears (tip Ø{max_tip:.0f} mm) and shafts go in through the open back of the housing body; the "
                 "bolted end cover closes it.",
@@ -244,10 +255,11 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
                 "Split the housing in the shaft plane (y = H/2) into two dowel-located bolted halves, or make the "
                 "back wall a removable bolted cover with a gasket.",
                 [W / 2, yc, D])
-        add("assembly", "info", "Housing", "No breather, oil fill, level or drain plug in the model.",
-            f"Breather on top, oil-level plug at the dip depth of the largest gear (≈{2.5 * m:.0f} mm), magnetic "
-            "drain plug at the lowest point.", [W / 2, H, D / 2])
-        add("assembly", "info", shafts[0]["name"], "Shafts leave the housing without seals.",
-            "Fit radial lip seals (e.g. FKM) in the input and output bores.", [shafts[0]["x"], yc, 0.0])
+        if not (plan and plan.get("manufacturable")):
+            add("assembly", "info", "Housing", "No breather, oil fill, level or drain plug in the model.",
+                f"Breather on top, oil-level plug at the dip depth of the largest gear (≈{2.5 * m:.0f} mm), magnetic "
+                "drain plug at the lowest point.", [W / 2, H, D / 2])
+            add("assembly", "info", shafts[0]["name"], "Shafts leave the housing without seals.",
+                "Fit radial lip seals (e.g. FKM) in the input and output bores.", [shafts[0]["x"], yc, 0.0])
     out.sort(key=lambda f: SEV_ORDER[f["severity"]])
     return out
