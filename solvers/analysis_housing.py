@@ -16,7 +16,7 @@ from physics.variant_shafts import shaft_plan, designed_housing_params
 from .structural3d import VARIANT_DESIGN, VARIANT_KIN, MESH_DIVISIONS, FRAME_NOTE
 from ._example import EXAMPLE_VARIANT
 
-REG_F1 = 1353.95     # regression values, set after a validated run
+REG_F1 = 1478.05     # regression values, set after a validated run (v0.11 layout v4; v0.9 was 1353.95)
 REG_Q = 443.12
 MAX_MODAL_ELEMENTS = int(os.environ.get("IDRIS_MODAL_MAX_ELEMENTS", "12000"))
 MAX_THERMAL_ELEMENTS = int(os.environ.get("IDRIS_THERMAL_MAX_ELEMENTS", "40000"))
@@ -191,7 +191,7 @@ register(SolverSpec(
             "mesh": {"type": "string", "enum": list(MESH_DIVISIONS), "default": "coarse"}},
     run=_run_modal,
     benchmarks=[Benchmark("regression-housing-modal-coarse",
-                          "ACE regression v0.2 on a real variant; LOBPCG and scipy eigsh agree (self-consistency)",
+                          "ACE regression v0.11 (layout v4) on a real variant; LOBPCG and scipy eigsh agree (self-consistency)",
                           {**EXAMPLE_VARIANT, "modes": 4, "mesh": "coarse"},
                           {"outputs.frequencies_hz.0": REG_F1}, 0.01)],
     limitations=["empty housing (no gears/shafts/oil mass)", "linear, undamped, small vibrations",
@@ -287,7 +287,8 @@ class _ThermalCase:
         """L1 lumped estimate on the same geometry (agrees with state() within ~0.3 %): used to RANK
         candidates; every option that is reported is re-solved with state()."""
         return oil_temp_lumped(Q_in, self.W_mm, self.H_mm, self.D_mm, self.L["wall_mm"], self.k, self.h_in,
-                               self.Ta, cooling, speed, fins, emissivity=EMISSIVITY)["oil_temp_c"]
+                               self.Ta, cooling, speed, fins, emissivity=EMISSIVITY,
+                               web_mm=(self.L.get("web") or {}).get("t", 0.0))["oil_temp_c"]
 
     def state(self, dT_oil=None, Q_in=None, cooling="natural", speed=0.0, area_factor=1.0, fins=None):
         Ta = self.Ta
