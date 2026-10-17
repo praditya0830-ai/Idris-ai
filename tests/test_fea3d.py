@@ -5,6 +5,7 @@ from ace_core.http_routes import handle_get, handle_post, encode_json
 from physics.fem3d import box_model, VoxelModel
 from physics.housing import build_layout, build_model, bearing_loads, fixture_nodes
 from solvers._example import EXAMPLE_VARIANT
+from physics.variant_shafts import designed_housing_params
 
 REQ = {"analysis": "static", **EXAMPLE_VARIANT, "fixture": "base", "mesh": "coarse"}
 
@@ -46,10 +47,12 @@ def test_layout_matches_assembly3d():
     from assembly3d import build_assembly
     v = EXAMPLE_VARIANT
     asm = build_assembly(v["design"], v["kinematics"], v["shaft"], v["housing_params"])
-    L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], v["housing_params"])
+    L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], designed_housing_params(v, v["housing_params"]))
     assert np.allclose(asm["layout"]["axis_a_mm"], [L["x_a"], L["yc"]])
     assert np.allclose(asm["layout"]["axis_b_mm"], [L["x_b"], L["yc"]])
-    housing = np.vstack([p["verts"] for p in asm["parts"] if p["kind"] == "housing"])     # body + end cover
+    # body + covers (bosses, bolts and plugs stand proud of the box and are not meshed)
+    housing = np.vstack([np.reshape(p["verts"], (-1, 3)) for p in asm["parts"]
+                         if p["name"] in ("Housing", "Housing front cover", "Housing cover")])
     m = build_model(L, "coarse")
     assert np.allclose(m.nodes.min(0), housing.min(0), atol=1e-6)
     assert np.allclose(m.nodes.max(0), housing.max(0), atol=1e-6)
@@ -59,10 +62,10 @@ def test_layout_matches_assembly3d():
 
 def test_housing_equilibrium():
     v = EXAMPLE_VARIANT
-    L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], v["housing_params"])
+    L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], designed_housing_params(v, v["housing_params"]))
     m = build_model(L, "coarse")
     loads, applied = bearing_loads(m, L)
-    assert len(applied) == 4
+    assert len(applied) == sum(len(s) for s in L["supports"]) == 6       # two bearings per shaft
     assert np.allclose(loads.sum(0), 0, atol=1e-6)
     fx = fixture_nodes(m, L, "base")
     r = m.solve(71700, 0.33, fx, loads)
@@ -86,7 +89,7 @@ def test_fea_job_flow():
     assert len(sf["positions"]) == 3 * n and len(sf["displacement"]) == 3 * n
     assert len(sf["indices"]) % 3 == 0 and max(sf["indices"]) < n
     P = np.array(sf["positions"]).reshape(-1, 3)
-    hp = EXAMPLE_VARIANT["housing_params"]
+    hp = designed_housing_params(EXAMPLE_VARIANT, EXAMPLE_VARIANT["housing_params"])
     assert P.min() >= -1e-6 and np.allclose(P.max(0), [hp["envelope_width"], hp["envelope_height"], hp["envelope_depth"]])
     assert r["yield_mpa"] == 503 and r["mesh"]["elements"] > 0 and r["applied_loads"]
 

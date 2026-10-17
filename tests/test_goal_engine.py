@@ -77,12 +77,19 @@ def test_fin_physics_limits():
 
 
 def test_generator_overall_basis_and_bbox():
+    # layout v4: real shaft ends (boss + seal + coupling) do not fit a 150 mm overall depth -> honest
+    # "no variant" with a re-checked repair; at the repaired depth every assembly box fits
     o = generate_variants(REQ, envelope_basis="overall")
-    assert o["envelope_basis"] == "overall" and o["variants"]
+    assert o["envelope_basis"] == "overall" and not o["variants"]
+    rep = o["repairs"][0]
+    assert rep["feasible_variants"] > 0 and "re-checked" in rep["reason"]
+    d = rep["change"]["envelope_depth"]
+    o = generate_variants(Requirements(**{**REQ.__dict__, "env_d": d}), envelope_basis="overall")
+    assert len(o["variants"]) == rep["feasible_variants"]
     for v in o["variants"]:
         bb = v["assembly_bbox_mm"]
-        assert bb["max"][2] - bb["min"][2] <= 150 + 1e-6
-        assert v["thermal_screen"]["oil_temp_natural_c"] > 90
+        assert bb["max"][2] - bb["min"][2] <= d + 1e-6
+        assert bb["min"][2] <= -22 and v["thermal_screen"]["oil_temp_natural_c"] > 90
 
 
 def test_generator_goals_steer_selection():
@@ -115,12 +122,13 @@ def test_efficiency_assumption_never_alone_makes_pass():
 
 
 def test_screen_vs_fem_on_demo_variants():
-    # QA Q-019: L1 screen vs 3D FEM on demo variants (full 15-variant table in solver/update-v0.8.md: max 0.28 %)
+    # QA Q-019: L1 screen vs 3D FEM on demo variants (layout v4 with the central web: max 1.2 % over 15 variants)
     import json, os
     path = os.path.join(os.path.dirname(__file__), "..", "qa-skenario-demo.json")
     if not os.path.exists(path):
         return
     from physics.goal_engine import h_oil
+    from physics.variant_shafts import designed_housing_params
     D = json.load(open(path))
     for sk in D:
         v = D[sk]["variants"][1]
@@ -129,7 +137,9 @@ def test_screen_vs_fem_on_demo_variants():
         body.update(power_kw=req["power_kw"], input_rpm=req["input_rpm"])
         r = _cfd_body(body)
         W, H, Dd = r["housing_box_mm"]
-        q = oil_temp_lumped(r["heat_to_housing_w"], W, H, Dd, 4, r["conductivity_w_mk"], h_oil(v, req["input_rpm"]))
+        web = designed_housing_params(body, body["housing_params"], req["input_rpm"]).get("web_mm", 0.0)
+        q = oil_temp_lumped(r["heat_to_housing_w"], W, H, Dd, 4, r["conductivity_w_mk"], h_oil(v, req["input_rpm"]),
+                            web_mm=web)
         assert abs(q["oil_temp_c"] - r["oil_temp_c"]) / (r["oil_temp_c"] - 25) < 0.01, (sk, q["oil_temp_c"], r["oil_temp_c"])
 
 

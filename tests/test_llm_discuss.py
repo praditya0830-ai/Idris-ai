@@ -109,3 +109,12 @@ def test_nvidia_backup_used_when_gemini_quota_is_out():
     finally:
         llm._call_one = real_one
         os.environ.pop("NVIDIA_API_KEY", None)
+
+
+def test_plain_text_answer_is_kept_and_checked():
+    os.environ.update(GEMINI_API_KEY="g", IDRIS_LLM_ORDER="gemini")
+    llm.call_provider = lambda prov, system, user, max_tokens=500: (
+        "Oil cooler tidak punya data massa di solver; mungkin sekitar 1,5 kg.", "fake")
+    r = llm.interpret(None, "Berapa beratnya kalau pakai oil cooler?", None, [], "B", CTX)
+    assert r["mode"] == "discussion" and r["actions"] == []
+    assert r["unverified_numbers"] == [1.5] and "belum berasal dari solver" in r["answer"]

@@ -21,10 +21,17 @@ def test_fea_options_try_roundtrip():
 
 def test_modal_speed_map_and_wall_option():
     c, b = handle_post("/modal?sync=1", {**V, "mesh": "coarse", "modes": 4})
+    assert c == 200
+    for sm in b["result"]["speed_map"]:           # flag == operating speed inside the band to avoid
+        assert sm["includes_operating_speed"] == (sm["avoid_input_rpm"][0] <= 6000 <= sm["avoid_input_rpm"][1])
+    # run the same housing at 5200 rpm input: stage-1 mesh (≈1560 Hz) now sits on the first mode
+    kin = dict(V["kinematics"])
+    kin["output_rpm"] = 5200 / kin["ratio_actual"]
+    c, b = handle_post("/modal?sync=1", {**V, "kinematics": kin, "mesh": "coarse", "modes": 4})
     r = b["result"]
     assert c == 200
     hot = [sm for sm in r["speed_map"] if sm["includes_operating_speed"]]
-    assert hot and all(sm["avoid_input_rpm"][0] <= 6000 <= sm["avoid_input_rpm"][1] for sm in hot)
+    assert hot and all(sm["avoid_input_rpm"][0] <= 5200 <= sm["avoid_input_rpm"][1] for sm in hot)
     kinds = {o["kind"] for o in r["options"]}
     assert "speed" in kinds and "wall" in kinds
     w = [o for o in r["options"] if o["kind"] == "wall"][0]
