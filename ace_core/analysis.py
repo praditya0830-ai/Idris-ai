@@ -80,6 +80,11 @@ def _runner(spec, payload):
     # fields this solver understands and report the rest instead of rejecting the request.
     solver = registry.get(spec["solver"])
     known = set(solver.schema)
+    mats = payload.get("materials") if isinstance(payload, dict) else None
+    if isinstance(mats, dict) and mats.get("housing") and "housing_material" not in payload \
+            and "housing_material" in known:
+        payload = {**payload, "housing_material": mats["housing"]}       # variant from /generate-variants
+    payload = {k: v for k, v in payload.items() if k != "materials"}
     ignored = sorted(k for k in payload if k not in known)
     clean = {k: v for k, v in payload.items() if k in known}
 
