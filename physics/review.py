@@ -100,7 +100,8 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
         # gear faces vs. front/back walls and the central web
         web = L.get("web")
         for g in gears:
-            gap_f, gap_b = g["z0"] - t, D - t - (g["z0"] + b)
+            tc_ = L.get("cover_mm", t)
+            gap_f, gap_b = g["z0"] - tc_, D - tc_ - (g["z0"] + b)
             f_name, b_name = "front wall", "back wall"
             if web:
                 if g["z0"] + b <= web["z0"] + 1e-6:

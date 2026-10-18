@@ -481,6 +481,7 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
                                "envelope_depth": env["depth"], "gear_ratio": r["kinematics"]["ratio_actual"],
                                "wall_thickness": req.wall_thickness,
                                "bore_diameter": r["shaft"]["output_diameter_mm"] + 2.0}
+        r["materials"] = {"gear": req.gear_material, "housing": req.housing_material}
         try:
             plan = shaft_plan({**r, "housing_params": {k: v for k, v in r["housing_params"].items()
                                                         if k != "envelope_depth"}}, req.input_rpm)
@@ -506,7 +507,8 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         r["envelope_needed_mm"] = {**env, "depth": depth}
         t_ = req.wall_thickness
         W_, H_ = env["width"], env["height"]
-        vol = W_ * H_ * depth - (W_ - 2 * t_) * (H_ - 2 * t_) * (depth - 2 * t_)
+        tc_ = float(hp.get("cover_mm", t_))
+        vol = W_ * H_ * depth - (W_ - 2 * t_) * (H_ - 2 * t_) * (depth - 2 * tc_)
         if hp.get("web_mm"):
             vol += web_volume_mm3(W_ - 2 * t_, H_ - 2 * t_, hp["web_mm"], t_, hp.get("web_hub_diameter", 0.0),
                                   [hp.get("web_hole_diameter", 0.0)])
@@ -526,10 +528,32 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
                 continue
         r["_plan"] = plan
         chosen.append(r)
-    if not chosen and spare:      # no design keeps every goal once the real housing is in: show the best, honestly
-        chosen = spare[:n]
-        goal_note = ("Designs met all goals on the gear-level estimate, but none still does with the "
-                     "manufacturable housing (bearing bosses, covers, central web). See goal_summary.blocking_goals.")
+    if chosen and spare and len(chosen) < n:
+        # fewer designs than asked keep every goal on the real housing: fill up with the closest ones,
+        # each with its honest goal_check (goal_summary.variants_meeting_all names the ones that pass)
+        k_meet = len(chosen)
+        chosen += spare[:n - len(chosen)]
+        goal_note = (f"Only {k_meet} design(s) keep all goals with the "
+                     "manufacturable housing; the others are the closest designs (see goal_check).")
+    if not chosen and spare:
+        # no design keeps every goal once the real housing is in: show the best designs on strength and
+        # size (a full, unsteered selection), each with its honest goal_check
+        out = _generate(req, n, None, ambient_c, overall_d=overall_d)
+        g = goals
+        for v in out.get("variants", []):
+            v["thermal_screen"] = goal_engine.thermal_screen(
+                v, req.power_kw, req.input_rpm, req.housing_material, req.wall_thickness, ambient_c,
+                float(g.get("oil_temp_max_c", goal_engine.OIL_LIMIT_C)), g.get("cooling_allowed"),
+                (req.env_w, req.env_h, req.env_d))
+            v["goal_check"] = goal_engine.check_goals(v, g)
+        out["diagnostics"]["meeting_goals"] = diagnostics.get("meeting_goals")
+        out["diagnostics"]["meeting_goals_after_housing"] = 0
+        out["suggestions"] = [("Designs met all goals on the gear-level estimate, but none still does with the "
+                               "manufacturable housing (bearing bosses, thicker sealed covers, central web). "
+                               "Showing the best designs on strength and size; see goal_summary.blocking_goals.")] \
+            + out.get("suggestions", [])
+        out["goal_summary"] = goal_engine.summarize(out.get("variants", []), goals)
+        return out
     diagnostics["rejected_manufacturable_housing"] = dict(made_rejects)
     if overall_d and depth_need:
         diagnostics["overall_depth_candidates_mm"] = sorted(math.ceil(d) for d in depth_need)

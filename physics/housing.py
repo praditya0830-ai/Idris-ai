@@ -16,6 +16,8 @@ from .gears import (ALPHA, CLEARANCE, ETA_STAGE, STAGE_GAP, WEB_GAP, WEB_SEPTUM,
 SHAFT_STICKOUT = 22.0       # mm minimum shaft stick-out beyond the wall face
 SEAL_W = 7.0                # mm, radial lip seal width (outside the bearing, in the boss)
 COUPLING_L = 15.0           # mm of free shaft beyond the boss for the coupling
+SEAL_LIP_W = 3.0            # mm, internal lip at a bolted joint: sealing land = wall + lip ≥ O-ring groove + lands
+SEAL_LIP_Z = 3.0            # mm deep along z (gear faces stay ≥ CLEARANCE − SEAL_LIP_Z = 3 mm away)
 
 HOUSING_MATERIALS = {
     # name: (E MPa, nu, yield MPa, density kg/m3, note)
@@ -84,6 +86,10 @@ def build_layout(design, kinematics, loads, shaft, hp):
         web_t = _num(hp, "web_mm") or web_thickness_estimate(d_in, d_out)
         d_need = 2 * b + 2 * WEB_GAP + web_t + 2 * CLEARANCE + 2 * t
     h_need = max(dap, dag) + 2 * CLEARANCE + 2 * t
+    # end walls / bolted covers can be thicker than the side walls (Tahap 1.1: cover stiffness for the
+    # O-ring between the screws); every z-direction wall below uses tc
+    tc = max(t, _num(hp, "cover_mm") or t)
+    d_need += 2 * (tc - t)
     W = _num(hp, "envelope_width", math.ceil(x_right))
     H = _num(hp, "envelope_height", math.ceil(h_need))
     D = _num(hp, "envelope_depth", math.ceil(d_need))
@@ -93,7 +99,7 @@ def build_layout(design, kinematics, loads, shaft, hp):
     x_a += shift
     x_b += shift
     yc = H / 2.0
-    z1 = t + CLEARANCE
+    z1 = tc + CLEARANCE
     if stages == 1:
         z2 = z1 + b + STAGE_GAP          # unused for 1 stage
         web = None
@@ -111,19 +117,19 @@ def build_layout(design, kinematics, loads, shaft, hp):
         web = {"z0": zw0, "z1": zw1, "t": web_t, "plate": (zp0, zp0 + tp), "hub_d": float(hub_d)}
     # bearings: outer face of the bearing flush with the inner wall face, the rest in an outward boss
     # (nothing intrudes into the gear space); web pockets open towards their shaft
-    front = lambda B: t - B / 2.0
-    back = lambda B: D - t + B / 2.0
+    front = lambda B: tc - B / 2.0
+    back = lambda B: D - tc + B / 2.0
     # shaft ends leave through boss + lip seal (7 mm) and keep 15 mm for the coupling
-    stick_f = max(SHAFT_STICKOUT, bw[0][0] - t + SEAL_W + COUPLING_L)
-    stick_b = max(SHAFT_STICKOUT, bw[-1][1] - t + SEAL_W + COUPLING_L)
+    stick_f = max(SHAFT_STICKOUT, bw[0][0] - tc + SEAL_W + COUPLING_L)
+    stick_b = max(SHAFT_STICKOUT, bw[-1][1] - tc + SEAL_W + COUPLING_L)
     stick = stick_f
 
     # shafts (z extents as in assembly3d v4: every shaft ends inside its two bearing seats)
     if stages == 1:
         supports = [(front(bw[0][0]), back(bw[0][1])), (front(bw[1][0]), back(bw[1][1]))]
-        shafts = [{"name": "Input shaft", "x": x_a, "d": d_in, "z0": -stick, "z1": D - t + bw[0][1],
+        shafts = [{"name": "Input shaft", "x": x_a, "d": d_in, "z0": -stick, "z1": D - tc + bw[0][1],
                    "torque": T_in, "rpm_factor": 1.0},
-                  {"name": "Output shaft", "x": x_b, "d": d_out, "z0": t - bw[1][0], "z1": D + stick_b,
+                  {"name": "Output shaft", "x": x_b, "d": d_out, "z0": tc - bw[1][0], "z1": D + stick_b,
                    "torque": T_in * u * ETA_STAGE, "rpm_factor": 1 / u}]
         gears = [{"name": "Pinion", "shaft": 0, "x": x_a, "z0": z1, "d": dp, "tip": dap, "teeth": zp, "stage": 0},
                  {"name": "Gear", "shaft": 1, "x": x_b, "z0": z1, "d": dg, "tip": dag, "teeth": zg, "stage": 0}]
@@ -135,7 +141,7 @@ def build_layout(design, kinematics, loads, shaft, hp):
                     (web["z1"] - bw[2][0] / 2.0, back(bw[2][1]))]
         shafts = [{"name": "Input shaft", "x": x_a, "d": d_in, "z0": -stick, "z1": web["z0"] + bw[0][1],
                    "torque": T_in, "rpm_factor": 1.0},
-                  {"name": "Intermediate shaft", "x": x_b, "d": d_mid, "z0": t - bw[1][0], "z1": D - t + bw[1][1],
+                  {"name": "Intermediate shaft", "x": x_b, "d": d_mid, "z0": tc - bw[1][0], "z1": D - tc + bw[1][1],
                    "torque": T_in * u * ETA_STAGE, "rpm_factor": 1 / u},
                   {"name": "Output shaft", "x": x_a, "d": d_out, "z0": web["z1"] - bw[2][0], "z1": D + stick_b,
                    "torque": T_in * u * u * ETA_STAGE ** 2, "rpm_factor": 1 / u ** 2}]
@@ -170,13 +176,16 @@ def build_layout(design, kinematics, loads, shaft, hp):
         meshes.append({"stage": s, "z": zc, "Wt": Wt, "Wr": Wr, "pinion": 2 * s, "gear": 2 * s + 1,
                        "f_on_gear": f_on_gear, "f_on_pinion": -f_on_gear})
     return {"stages": stages, "module_mm": m, "face_width_mm": b, "teeth": (zp, zg),
-            "center_distance_mm": a, "W": W, "H": H, "D": D, "wall_mm": t, "yc": yc, "z1": z1, "z2": z2,
+            "center_distance_mm": a, "W": W, "H": H, "D": D, "wall_mm": t, "cover_mm": tc, "yc": yc, "z1": z1, "z2": z2,
             "x_a": x_a, "x_b": x_b, "shafts": shafts, "gears": gears, "bores": bores, "meshes": meshes,
             "input_torque_Nm": T_in, "designed_bearings": bool(fb or bb),
             "web": web, "supports": supports, "bearing_widths": bw, "stickout": (stick_f, stick_b),
+            "bearing_ods": hp.get("bearing_ods") if isinstance(hp, dict) else None,
             "web_hole_mm": _num(hp, "web_hole_diameter") or ((d_mid or 0) + 4 if stages == 2 else None),
             "split_cover": bool(isinstance(hp, dict) and hp.get("split_cover")),
-            "inner": {"x0": t, "x1": W - t, "y0": t, "y1": H - t, "z0": t, "z1": D - t},
+            "inner": {"x0": t, "x1": W - t, "y0": t, "y1": H - t, "z0": tc, "z1": D - tc},
+            "lip": {"width_mm": SEAL_LIP_W, "depth_mm": SEAL_LIP_Z,
+                    "walls": ["back"] if stages == 1 else ["front", "back"]},
             "offset": np.zeros(3)}
 
 
@@ -210,6 +219,47 @@ def _axis_planes(L_len, t, layers, s, extra=()):
     return np.array(out)
 
 
+def seat_features(L):
+    """Bearing seats as modelled in 3D (v0.12): for every support its bore radius, width and centre, and for
+    cover seats the outward boss (wall b_w = max(4, 0.12 D)) with a lip-seal recess (exit shafts) or a 3 mm
+    closing cap. Needs L['bearing_ods'] (set by the shaft plan); [] for older layouts."""
+    ods = L.get("bearing_ods")
+    if not ods:
+        return []
+    tc = L.get("cover_mm", L["wall_mm"])
+    D = L["D"]
+    n = len(L["shafts"])
+    out = []
+    for si, sh in enumerate(L["shafts"]):
+        for k in (0, 1):
+            seat = support_seat(L, si, k)
+            Dbr = float(ods[si][k])
+            B = float(L["bearing_widths"][si][k])
+            zb = shaft_supports_z(L, si)[k]
+            f = {"shaft": si, "k": k, "seat": seat, "x": sh["x"], "R": Dbr / 2.0, "B": B, "z": zb}
+            if seat in ("front", "back"):
+                exits = (si == 0 and seat == "front") or (si == n - 1 and seat == "back")
+                out_len = max(0.0, B - tc) + (7.0 if exits else 3.0)
+                f.update(exit=exits, wb=max(4.0, 0.12 * Dbr),
+                         boss=(-out_len, 0.0) if seat == "front" else (D, D + out_len))
+            out.append(f)
+    return out
+
+
+def boss_extra_area_mm2(L):
+    """Outer area the bearing bosses add to the plain box (side of every boss; an exit bore is open, so its
+    hole area is removed). Used by the lumped thermal screen so it matches the 3D model."""
+    a = 0.0
+    for f in seat_features(L):
+        if "boss" not in f:
+            continue
+        ro = f["R"] + f["wb"]
+        a += 2 * math.pi * ro * (f["boss"][1] - f["boss"][0])
+        if f["exit"]:
+            a -= math.pi * f["R"] ** 2
+    return a
+
+
 def build_model(L, mesh="coarse"):
     """Rectilinear brick model of the assembly housing: exact wall thickness, coarser in-plane."""
     if isinstance(mesh, (int, float)):           # legacy: uniform element size
@@ -229,19 +279,59 @@ def build_model(L, mesh="coarse"):
     xs = _axis_planes(W, t, layers, s)
     ys = _axis_planes(H, t, layers, s)
     web = L.get("web")
-    zs = _axis_planes(D, t, layers, s, extra=(web["z0"], web["z1"]) + tuple(web.get("plate", ())) if web else ())
+    tc = L.get("cover_mm", t)
+    lip = L.get("lip")
+    extra_z = (web["z0"], web["z1"]) + tuple(web.get("plate", ())) if web else ()
+    if lip:
+        extra_z += tuple(tc + lip["depth_mm"] if w == "front" else D - tc - lip["depth_mm"] for w in lip["walls"])
+    zs = _axis_planes(D, tc, layers, s, extra=extra_z)
+    feats = seat_features(L)
+    zmin = min([f["boss"][0] for f in feats if "boss" in f] + [0.0])
+    zmax = max([f["boss"][1] for f in feats if "boss" in f] + [D])
+    if zmin < 0 or zmax > D:                     # bearing bosses outside the box: extra planes along z
+        front = [z for z in np.linspace(zmin, 0.0, max(2, int(round(-zmin / s))) + 1)][:-1] if zmin < 0 else []
+        back = [z for z in np.linspace(D, zmax, max(2, int(round((zmax - D) / s))) + 1)][1:] if zmax > D else []
+        cap_planes = []
+        for f in feats:
+            if "boss" in f and not f["exit"]:
+                cap_planes.append(f["boss"][0] + 3.0 if f["seat"] == "front" else f["boss"][1] - 3.0)
+        zs = np.array(sorted(set(np.round(np.r_[front, zs, back, cap_planes], 6))))
+        keep = [zs[0]]
+        for z in zs[1:]:                         # merge planes closer than 1 mm (keeps the mesh small)
+            if z - keep[-1] >= 1.0 or z in (0.0, D):
+                keep.append(z)
+        zs = np.array(keep)
     cx, cy, cz = (0.5 * (pl[1:] + pl[:-1]) for pl in (xs, ys, zs))
     X, Y, Z = np.meshgrid(cx, cy, cz, indexing="ij")
-    cavity = (X > t) & (X < W - t) & (Y > t) & (Y < H - t) & (Z > t) & (Z < D - t)
-    solid = ~cavity
+    cavity = (X > t) & (X < W - t) & (Y > t) & (Y < H - t) & (Z > tc) & (Z < D - tc)
+    solid = ~cavity & (Z > 0) & (Z < D)
     for bo in L["bores"]:
         r2 = (X - bo["x"]) ** 2 + (Y - yc) ** 2
-        in_wall = (Z < t) if bo["wall"] == "front" else (Z > D - t)
+        in_wall = (Z < tc) if bo["wall"] == "front" else (Z > D - tc)
         solid &= ~(in_wall & (r2 < (bo["d"] / 2) ** 2))
+    if lip:                                      # internal sealing lip at the bolted joints
+        w_, dz = lip["width_mm"], lip["depth_mm"]
+        ring = cavity & ((X < t + w_) | (X > W - t - w_) | (Y < t + w_) | (Y > H - t - w_))
+        for wall in lip["walls"]:
+            band = (Z < tc + dz) if wall == "front" else (Z > D - tc - dz)
+            solid |= ring & band
     if web:
-        # central web (2-stage): plate + bearing hub, clearance hole of the intermediate shaft; the two
-        # bearing pockets inside the hub are not cut (stiffer locally, see limitations)
+        # central web (2-stage): plate + bearing hub, clearance hole of the intermediate shaft
         solid |= web_solid(L, X, Y, Z)
+    for f in feats:                              # bearing seats (v0.12): pockets, bosses, caps
+        r2 = (X - f["x"]) ** 2 + (Y - yc) ** 2
+        if f["seat"] == "web":
+            pocket = (r2 < f["R"] ** 2) & (Z > f["z"] - f["B"] / 2) & (Z < f["z"] + f["B"] / 2)
+            solid &= ~pocket
+            continue
+        in_cover = (Z < tc) if f["seat"] == "front" else (Z > D - tc)
+        z0, z1 = f["boss"]
+        ring = (r2 < (f["R"] + f["wb"]) ** 2) & (Z > z0) & (Z < z1)
+        solid |= ring
+        solid &= ~((in_cover | ((Z > z0) & (Z < z1))) & (r2 < f["R"] ** 2))      # bore through cover + boss
+        if not f["exit"]:                        # closed boss: 3 mm cap at its outer end
+            cap = (Z < z0 + 3.0) if f["seat"] == "front" else (Z > z1 - 3.0)
+            solid |= cap & (r2 < f["R"] ** 2) & (Z > z0) & (Z < z1)
     return VoxelModel(solid, planes=(xs, ys, zs))
 
 
@@ -297,7 +387,7 @@ def shaft_supports_z(L, si):
 def support_seat(L, si, k):
     """Where support k (0 = lower z, 1 = upper z) of shaft si sits: 'front', 'back' or 'web'."""
     z = shaft_supports_z(L, si)[k]
-    t, D = L["wall_mm"], L["D"]
+    t, D = L.get("cover_mm", L["wall_mm"]), L["D"]
     if z <= t + 1e-6:
         return "front"
     if z >= D - t - 1e-6:
@@ -333,7 +423,8 @@ def bearing_loads(model, L):
     applied = []
     zs = np.unique(np.round(P[:, 2], 6))
     near = lambda z: zs[np.argmin(np.abs(zs - z))]
-    z_in_front, z_in_back = near(t), near(D - t)
+    tc = L.get("cover_mm", t)
+    z_in_front, z_in_back = near(tc), near(D - tc)
     web = L.get("web")
     reac = per_shaft_reactions(L)
     for si, s in enumerate(L["shafts"]):
@@ -349,7 +440,16 @@ def bearing_loads(model, L):
             bo = next((b for b in L["bores"] if b["shaft"] == si and b["wall"] == seat_at), None)
             B = L["bearing_widths"][si][k] if L.get("bearing_widths") else 12.0
             r_seat = max(s["d"] / 2 + h, (bo["d"] / 2) if bo else 0)
-            if seat_at in ("front", "back") and bo is not None:
+            feat = next((f for f in seat_features(L) if f["shaft"] == si and f["k"] == k), None)
+            if feat is not None:
+                # v0.12: the outer ring presses on its seat bore (cover + boss, or the web pocket):
+                # cosine-law pressure on the bore surface over the bearing width
+                zlo, zhi = feat["z"] - feat["B"] / 2 - 1e-6, feat["z"] + feat["B"] / 2 + 1e-6
+                sel = (r > feat["R"] - 0.1 * h) & (r < feat["R"] + 0.95 * h) & (P[:, 2] >= zlo) & (P[:, 2] <= zhi)
+                where = {"front": "front cover boss", "back": "back cover boss", "web": "central web pocket"}[seat_at]
+                seat = f"bearing seat Ø{2 * feat['R']:.0f} ({where})"
+                cosw = True
+            elif seat_at in ("front", "back") and bo is not None:
                 in_wall = (P[:, 2] <= z_in_front + 1e-6) if seat_at == "front" else (P[:, 2] >= z_in_back - 1e-6)
                 sel = in_wall & (r < bo["d"] / 2 + 0.9 * h)
                 seat = f"bore Ø{bo['d']:.0f} ({seat_at} wall)"
@@ -383,8 +483,27 @@ def fixture_nodes(model, L, fixture):
     if fixture == "base":
         return np.where(P[:, 1] < 1e-6)[0]
     if fixture == "flange":
-        return np.where(P[:, 2] > L["D"] - 1e-6)[0]
+        return np.where(np.abs(P[:, 2] - L["D"]) < 1e-6)[0]
     raise ValueError("fixture must be 'base' or 'flange'")
+
+
+def seat_face_mask(thermal_model, L):
+    """True for faces of the bearing-seat bores (covers, bosses, web pockets): the bearing outer ring sits
+    there, so they are neither oil-wetted cavity wall nor air-cooled outer skin (treated as adiabatic)."""
+    c, n = thermal_model.centres, thermal_model.normals
+    probe = c + 0.25 * thermal_model.m.h * n
+    yc, D, tc = L["yc"], L["D"], L.get("cover_mm", L["wall_mm"])
+    mask = np.zeros(len(c), dtype=bool)
+    for f in seat_features(L):
+        r2 = (probe[:, 0] - f["x"]) ** 2 + (probe[:, 1] - yc) ** 2
+        if f["seat"] == "web":
+            zr = (probe[:, 2] > f["z"] - f["B"] / 2) & (probe[:, 2] < f["z"] + f["B"] / 2)
+        else:
+            z0, z1 = f["boss"]
+            lo, hi = (z0, tc) if f["seat"] == "front" else (D - tc, z1)
+            zr = (probe[:, 2] > lo) & (probe[:, 2] < hi)
+        mask |= (r2 < f["R"] ** 2) & zr
+    return mask
 
 
 def wetted_face_mask(thermal_model, L):
@@ -397,4 +516,4 @@ def wetted_face_mask(thermal_model, L):
     web = L.get("web")
     if web:                                   # faces whose probe lands inside the web are not wetted
         wet &= ~web_solid(L, probe[:, 0], probe[:, 1], probe[:, 2])
-    return wet
+    return wet & ~seat_face_mask(thermal_model, L)

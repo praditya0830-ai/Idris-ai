@@ -73,7 +73,8 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
     ho = h_oil(variant, input_rpm)
 
     def run(q=Q, **kw):
-        return oil_temp_lumped(q, W, H, D, wall_mm, k, ho, ambient_c, web_mm=hp.get("web_mm", 0.0), **kw)
+        return oil_temp_lumped(q, W, H, D, wall_mm, k, ho, ambient_c, web_mm=hp.get("web_mm", 0.0),
+                               cover_mm=hp.get("cover_mm"), extra_out_mm2=hp.get("boss_area_mm2", 0.0), **kw)
 
     nat = run()
     res = {"method": "L1 lumped screen (confirm with /cfd)", "heat_w": round(Q, 1),

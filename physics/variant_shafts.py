@@ -8,7 +8,8 @@ gears.shaft_diameter_mm gives (used by the 3D model) are compared with what comb
 """
 import math
 from .gears import web_hub_diameter
-from .housing import build_layout, shaft_supports_z, support_seat
+from .cover_joint import design_cover_joints, required_cover_thickness, _material as cover_material
+from .housing import build_layout, shaft_supports_z, support_seat, boss_extra_area_mm2
 from .gears import WEB_SEPTUM
 from .gears import ETA_STAGE
 from .shaft_design import design_shaft
@@ -81,6 +82,12 @@ def shaft_plan(variant, input_rpm=None):
     depth0 = hp0.get("envelope_depth")
     widths, web = None, None
     history = []
+    # cover thickness for the O-ring between the corner screws (Tahap 1.1), from the gear-layout box
+    mat = (variant.get("materials") or {}).get("housing") or variant.get("housing_material") or "Al7075-T6"
+    L0 = _layout_for(variant, {k: v for k, v in hp0.items() if k not in ("envelope_depth", "cover_mm")})
+    E_h = cover_material(mat)[1]
+    tc, span, defl, tc_ok = required_cover_thickness(L0["W"], L0["H"], L0["wall_mm"], E_h)
+    hp0 = dict(hp0, cover_mm=tc)
 
     def solve(widths, web):
         hp = {k: v for k, v in hp0.items() if k != "envelope_depth"}
@@ -182,11 +189,24 @@ def shaft_plan(variant, input_rpm=None):
             notes.append(f"Web bearing hub Ø{hub:.0f} mm collides with the intermediate shaft.")
         hp_final["web_hub_diameter"] = round(hub, 1)
     hp_final["split_cover"] = True
+    hp_final["bearing_ods"] = [[float(b["D"]) for b in sorted(ps["bearings"], key=lambda b: b["z"])] for ps in out]
     L = _layout_for(variant, hp_final)
+    hp_final["boss_area_mm2"] = round(boss_extra_area_mm2(L), 1)
+    # cover screws + dowels sized by the bolted-joint solver (Tahap 1.1)
+    joints, joints_ok = design_cover_joints(L, [(g["x"], g["tip"] / 2.0) for g in L["gears"]], mat)
+    for r in joints.values():
+        r["cover"] = {"thickness_mm": tc, "corner_screw_span_mm": round(span, 1), "oring_lift_mm": round(defl, 3),
+                      "allowed_lift_mm": round(0.1 * 2.62, 3), "basis": "edge strip (wall + lip) as a fixed-fixed beam "
+                      "between screws under the O-ring force (1.5 N/mm)"}
+    if not tc_ok:
+        notes.append(f"The covers would need more than 12 mm to keep the O-ring sealed over a {span:.0f} mm screw span.")
+    if not joints_ok:
+        bad = [w for w, r in joints.items() if not r.get("pass")]
+        notes.append(f"No cover screw up to M8 class 12.9 holds the {', '.join(bad)} cover with the columns that fit.")
     manufacturable = not notes
     hp_final["stickout_mm"] = list(L["stickout"])
     return {"shafts": out, "front_bore_mm": front, "back_bore_mm": back, "input_rpm": rpm, "notes": notes,
-            "hp": hp_final, "L": L, "manufacturable": manufacturable, "depth_mm": D, "depth_needed_mm": need_D}
+            "hp": hp_final, "L": L, "manufacturable": manufacturable, "joints": joints, "depth_mm": D, "depth_needed_mm": need_D}
 
 
 def check_variant_shafts(variant, input_rpm, plan=None):
