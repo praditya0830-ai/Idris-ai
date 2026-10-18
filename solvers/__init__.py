@@ -8,3 +8,4 @@ from . import structural        # noqa: F401
 from . import structural3d      # noqa: F401
 from . import analysis_housing  # noqa: F401
 from . import gear_iso          # noqa: F401
+from . import bolted          # noqa: F401

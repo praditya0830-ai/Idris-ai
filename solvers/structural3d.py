@@ -10,15 +10,16 @@ from physics.housing import (HOUSING_MATERIALS, find_material, build_layout, bui
                              bearing_loads, fixture_nodes)
 
 MESH_DIVISIONS = {"coarse": 1, "standard": 2, "fine": 3}      # elements through the wall
-REG_VM = 9.2362    # v0.11: layout v4 (central ribbed web, two bearings per shaft, deeper housing); v0.9 was 11.7776
+REG_VM = 5.781    # v0.12: sealed 7 mm covers + lip + meshed bearing seats (v0.11: 9.2362, v0.9: 11.7776)
 MAX_ELEMENTS = int(os.environ.get("IDRIS_FEA_MAX_ELEMENTS", "60000"))
 KNOWN_HP_KEYS = {"envelope_width", "envelope_height", "envelope_depth", "wall_thickness", "gear_ratio",
                  "bore_diameter", "bearing_widths", "web_mm", "front_bore_diameter", "back_bore_diameter",
-                 "web_hole_diameter", "split_cover", "stickout_mm", "web_hub_diameter"}
+                 "web_hole_diameter", "split_cover", "stickout_mm", "web_hub_diameter",
+                 "cover_mm", "bearing_ods", "boss_area_mm2"}
 FRAME_NOTE = ("Same coordinate frame as /generate-assembly: housing x∈[0,W], y∈[0,H], z∈[0,D] mm, "
               "shafts along +z at y = H/2. Body, central web and bolted covers are analysed as one rigidly joined "
-              "part; bores = bearing outside diameter; bearing bosses, web pockets, bolts and plugs are not meshed "
-              "(the plain wall is analysed, which is conservative for the seats).")
+              "part; bearing seats are meshed (bores = bearing OD, outward bosses with caps, web pockets); corner columns (conservative), screws, "
+              "O-rings, lip seals and plugs are not.")
 
 
 # ------------------------------------------------------------------ solid block (verification)
@@ -280,7 +281,7 @@ register(SolverSpec(
     },
     run=_run_housing,
     benchmarks=[Benchmark(
-        "regression-housing-2stage-coarse", "ACE regression v0.11 on a real /generate-variants variant, manufacturable layout v4 (central web, bearing seats), bores = bearing OD (self-consistency)",
+        "regression-housing-2stage-coarse", "ACE regression v0.12 on a real /generate-variants variant, manufacturable layout v4 (central web, meshed bearing seats + bosses, sealed covers), bores = bearing OD (self-consistency)",
         {**EXAMPLE_VARIANT, "mesh": "coarse"},
         {"outputs.max_von_mises_MPa": REG_VM}, 0.02)],
     limitations=["housing = closed box of /generate-assembly (no ribs, feet, fillets or bearing bosses)",
