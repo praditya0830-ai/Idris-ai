@@ -5,6 +5,7 @@ so the drawing cannot disagree with the model. Dimensions, fits (ISO 286) and no
 layout and the solver results. Sheets: housing (two sections), covers, shafts.
 """
 import math
+from .iso2768 import note as iso2768_note
 import numpy as np
 from .iso286 import label as fit_label
 from .bolted_joint import METRIC
@@ -170,6 +171,7 @@ def housing_sheet(asm, materials=None):
         sh.leader(*P(D + 4, xa), *P(D + 6, W + 22), fit_label(bores["back"], hole_fit) + " bearing seat, back cover boss")
     sh.text(ox, notes_y + 12, f"Covers ({tc:g} mm) are separate parts — see sheet COVERS. Side walls {t:g} mm.", 2.8)
     sh.text(ox, notes_y + 17, "Internal sealing lip 3 × 3 mm at both joint faces (land for the cover O-ring).", 2.8)
+    sh.text(ox, notes_y + 22, "Untoleranced dimensions " + iso2768_note([W, H, D, t, tc, xa, xb]), 2.8)
     # view B: section through the back sealing lip (z just inside the back joint): x → right, y → up
     lip_z = D - tc - 1.5
     s2 = _scale_for(W + 40, H + 40, 170, 130)

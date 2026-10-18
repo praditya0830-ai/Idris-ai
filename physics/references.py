@@ -25,6 +25,24 @@ REFERENCES = {
 }
 BENDING_METHOD = {"lewis": "lewis", "iso6336": "iso"}
 
+# Heat-source references for the thermal analysis (/cfd `loss_model`, Tahap 2.1)
+LOSS_REFERENCES = {
+    "constant": {
+        "label": "Constant efficiency per stage (assumption, conservative default)",
+        "status": "assumption",
+        "evidence": "typical 0.97–0.99 per spur mesh; Idris uses 0.98 per stage",
+        "default": True,
+    },
+    "iso14179_load": {
+        "label": "ISO/TR 14179-2 load-dependent losses (Schlenk μ_mz, Ohlendorf H_V, bearings, seals)",
+        "status": "partial",
+        "evidence": "H_V: FZG type-C benchmark within 1 % (gear_loss_factor); oil viscosity ASTM D341 within 3 % "
+                    "(oil_viscosity); Schlenk μ_mz formula cross-checked in FVA KnowledgeBase and Paschold 2022 "
+                    "(no published numeric example yet); no-load churning NOT included → lower bound",
+        "default": False,
+    },
+}
+
 
 def resolve(name):
     key = (name or "lewis").strip().lower().replace(" ", "").replace("-", "").replace("_", "")

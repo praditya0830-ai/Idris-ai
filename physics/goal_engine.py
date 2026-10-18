@@ -59,6 +59,30 @@ def _fits(fs, W, H, envelope):
     return W + 2 * fs["height_mm"] <= envelope[0] + 0.5
 
 
+def load_loss_estimate(variant, input_rpm, run, oil_vg=68):
+    """Tahap 2.1: computed load-dependent losses (ISO/TR 14179-2) and the natural-convection oil temperature
+    they give. A LOWER BOUND (no churning); shown next to the constant-efficiency result, never instead."""
+    try:
+        from .housing import build_layout
+        from .power_loss import gearbox_losses
+        L = build_layout(variant["design"], variant["kinematics"], variant.get("loads") or {},
+                         variant.get("shaft") or {}, variant["housing_params"])
+        T = 80.0
+        for _ in range(12):
+            r = gearbox_losses(L, input_rpm, oil_vg, T)
+            Tn = run(r["total_load_dependent_w"])["oil_temp_c"]
+            if abs(Tn - T) < 0.2:
+                break
+            T = Tn
+        return {"load_losses_w": round(r["total_load_dependent_w"], 1), "mesh_w": round(r["mesh_w"], 1),
+                "bearings_w": round(r["bearings_w"], 1), "seals_w": round(r["seals_w"], 1),
+                "efficiency_load_dependent": round(r["efficiency_load_dependent"], 4),
+                "oil_temp_natural_c": round(Tn, 1), "oil": "ISO VG 68",
+                "basis": "computed lower bound (ISO/TR 14179-2 load-dependent; churning not included)"}
+    except Exception as e:
+        return {"error": f"loss estimate unavailable: {e}"}
+
+
 def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambient_c=25.0,
                    limit_c=OIL_LIMIT_C, allowed=None, envelope=None):
     allowed = allowed or DEFAULT_ALLOWED
@@ -79,7 +103,9 @@ def thermal_screen(variant, power_kw, input_rpm, housing_material, wall_mm, ambi
     nat = run()
     res = {"method": "L1 lumped screen (confirm with /cfd)", "heat_w": round(Q, 1),
            "oil_temp_natural_c": round(nat["oil_temp_c"], 1), "area_outer_m2": round(nat["area_outer_m2"], 4),
-           "limit_c": limit_c, "pass_natural": nat["oil_temp_c"] <= limit_c, "measure": None}
+           "limit_c": limit_c, "pass_natural": nat["oil_temp_c"] <= limit_c, "measure": None,
+           "heat_basis": f"assumed efficiency {eta:.4f} (constant per stage)"}
+    res["load_loss_estimate"] = load_loss_estimate(variant, input_rpm, run)
     if res["pass_natural"]:
         res["measure"] = {"label": "No cooling needed (natural convection)", "change": {},
                           "oil_temp_c": res["oil_temp_natural_c"], "added_mass_kg": 0.0, "basis": "computed",
