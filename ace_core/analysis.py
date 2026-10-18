@@ -21,7 +21,8 @@ def _fea_result(env):
             "verdict": env["verdict"], "checks": env["checks"], "material": o["material"],
             "summary": {"max_von_mises_mpa": o["max_von_mises_MPa"],
                         "max_displacement_mm": o["max_displacement_mm"],
-                        "min_safety_factor": o["min_safety_factor"]},
+                        "min_safety_factor": o["min_safety_factor"],
+                        "margin_of_safety": o.get("margin_of_safety"), "factor_of_safety": o.get("factor_of_safety")},
             "model": o["model"], "solver": f"{env['solver']} {env['version']}",
             "options": o.get("options", []), "outer_size_mm": o.get("outer_size_mm"),
             "fits_envelope": o.get("fits_envelope"),
@@ -51,7 +52,7 @@ def _thermal_result(env):
             "target_oil_temp_c", "fixes", "options", "surface_area_m2", "heat_to_housing_w",
             "oil_cooler_w", "housing_box_mm", "housing_scale", "fins", "efficiency_total", "oil_limit_c",
             "goal_report", "best_without_assumption", "closest_without_assumption", "validation",
-            "outer_size_mm", "fits_envelope")
+            "outer_size_mm", "fits_envelope", "loss_model", "power_loss")
     return {"surface": o["surface"], "mesh": o["mesh"], "solve_time_s": o["solve_time_s"],
             **{k: o[k] for k in keep}, **_common(env, o)}
 
