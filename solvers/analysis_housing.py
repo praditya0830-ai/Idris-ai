@@ -13,6 +13,7 @@ from physics.thermal_lumped import (fin_layout, fin_conv_factor, fin_mass_kg, FI
                                     FIN_MIN_GAP_MM)
 from physics.review import review
 from physics.variant_shafts import shaft_plan, designed_housing_params
+from physics.power_loss import gearbox_losses, rounded as pl_rounded
 from .structural3d import VARIANT_DESIGN, VARIANT_KIN, MESH_DIVISIONS, FRAME_NOTE
 from ._example import EXAMPLE_VARIANT
 
@@ -397,6 +398,33 @@ def _run_thermal(p, progress):
     except ValueError as ex:
         return {"ok": False, "errors": [str(ex)]}
     model, h, ne = case.model, case.model.h, case.ne
+    # ---- heat source: assumed efficiency (default) or computed load-dependent losses (Tahap 2.1)
+    loss_model = p.get("loss_model", "constant")
+    try:
+        _plan = shaft_plan({k: p.get(k) for k in ("design", "kinematics", "loads", "shaft", "housing_params")},
+                           p.get("input_rpm"))
+        _brgs = [(si, k_, float(br["d"])) for si, ps in enumerate(_plan["shafts"])
+                 for k_, br in enumerate(ps["bearings"])] if _plan else None
+    except Exception:
+        _brgs = None
+    L_loss = _layout(p)
+
+    def losses_at(T_c):
+        return gearbox_losses(L_loss, p["input_rpm"], OIL_GRADES[p["oil"]], T_c, bearings=_brgs)
+    if loss_model == "iso14179_load":
+        T_g = 80.0
+        for _ in range(10):
+            r_ = losses_at(T_g)
+            T_n = case.quick(max(0.0, r_["total_load_dependent_w"] - cooler), p["cooling"], p["air_speed_ms"], fins)
+            if abs(T_n - T_g) < 0.2:
+                break
+            T_g = T_n
+        Q_gen = r_["total_load_dependent_w"]
+        Q = max(0.0, Q_gen - cooler)
+        eta = 1 - Q_gen / (p["power_kw"] * 1000)
+        warnings.append("Heat source = computed LOAD-DEPENDENT losses (ISO/TR 14179-2: Schlenk μ_mz, Ohlendorf H_V, "
+                        "bearings, seals). Gear churning and bearing drag are NOT included, so the oil temperature "
+                        "is a LOWER BOUND; the constant-efficiency result is the conservative one.")
     fl_now = fin_layout(fins, case.H_mm, case.D_mm, case.W_mm) if fins else None
     if fl_now and fl_now["gap_mm"] < FIN_MIN_GAP_MM:
         return {"ok": False, "errors": [f"{fins['count']} fins do not fit on {case.D_mm:.0f} mm depth: gap "
@@ -406,7 +434,21 @@ def _run_thermal(p, progress):
     progress("Solving", 0.2)
     t0 = time.perf_counter()
     st = case.state(Q_in=Q, cooling=cool, speed=spd, fins=fins)
+    if loss_model == "iso14179_load":            # one correction on the FEM oil temperature
+        r_ = losses_at(st["T_oil"])
+        if abs(r_["total_load_dependent_w"] - Q_gen) > 0.01 * max(Q_gen, 1.0):
+            Q_gen = r_["total_load_dependent_w"]
+            Q = max(0.0, Q_gen - cooler)
+            eta = 1 - Q_gen / (p["power_kw"] * 1000)
+            st = case.state(Q_in=Q, cooling=cool, speed=spd, fins=fins)
     T_oil, hc, hr, T_s, G_out = st["T_oil"], st["hc"], st["hr"], st["T_s"], st["G_out"]
+    try:
+        pl_now = losses_at(T_oil)
+        power_loss = {**pl_rounded(pl_now), "used_as_heat_source": loss_model == "iso14179_load",
+                      "assumed_loss_w": round(p["power_kw"] * 1000 * (1 - eta), 1) if loss_model == "constant" else None,
+                      "basis": "computed (lower bound: no-load losses not included)"}
+    except Exception as ex_:
+        power_loss = {"error": f"loss model unavailable: {ex_}"}
     T = case.Ta + st["b"] * st["dT"]
     Ta = case.Ta
     fin_mass_now = fin_mass_kg(fl_now, rho)
@@ -684,7 +726,8 @@ def _run_thermal(p, progress):
            "fins": ({**fl_now, "factor": round(st["fin_factor"], 3),
                      "efficiency": round(st["fin_efficiency"] or 0, 3), "mass_kg": round(fin_mass_now, 3)}
                     if fl_now else None),
-           "efficiency_total": round(eta, 5), "oil_limit_c": limit,
+           "efficiency_total": round(eta, 5), "oil_limit_c": limit, "loss_model": loss_model,
+           "power_loss": power_loss,
            "material": mat, "conductivity_w_mk": k,
            "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8 (rectilinear brick)",
                     "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
@@ -710,6 +753,7 @@ register(SolverSpec(
             "cooling": {"type": "string", "enum": ["natural", "forced"], "default": "natural"},
             "air_speed_ms": {"type": "number", "min": 0, "max": 50, "default": 0.0},
             "oil": {"type": "string", "enum": list(OIL_GRADES), "default": "ISO VG 68"},
+            "loss_model": {"type": "string", "enum": ["constant", "iso14179_load"], "default": "constant"},
             "fins": {"type": "object", "default": {}, "allow_extra": False,
                      "fields": {"count": {"type": "integer", "min": 0, "max": 200},
                                 "height_mm": {"type": "number", "min": 0, "max": 100},
@@ -735,7 +779,8 @@ register(SolverSpec(
     limitations=["not CFD: convection from correlations, oil assumed well mixed",
                  "fins are not meshed: their effect is a fin-efficiency-weighted factor on outer convection",
                  "screening-level: not yet validated against test data",
-                 "gear efficiency is an input (variant value or assumption), not computed from a loss model",
+                 "default heat source: gear efficiency is an input (variant value or assumption); loss_model "
+                 "'iso14179_load' computes the load-dependent losses (no churning: lower bound)",
                  "no sun load, housing emissivity assumed 0.85 (painted)"],
     example={**EXAMPLE_VARIANT, "power_kw": 11.19, "input_rpm": 6000, "ambient_c": 25, "cooling": "natural",
              "air_speed_ms": 0, "oil": "ISO VG 68"},

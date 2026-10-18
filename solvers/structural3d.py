@@ -150,6 +150,8 @@ def _run_housing(p, progress):
         "applied_loads": applied,
         "max_von_mises_MPa": vmax, "max_displacement_mm": float(np.linalg.norm(r["u"], axis=1).max()),
         "min_safety_factor": sf, "fixture": p["fixture"],
+        # NASA-style margin of safety (KSC-STD-Z-0015 form): MS = S_y / (σ_vm · FoS) − 1, FoS = design_factor
+        "margin_of_safety": sf / p["design_factor"] - 1, "factor_of_safety": p["design_factor"],
         "model": {"envelope_mm": [L["W"], L["H"], L["D"]], "wall_mm": L["wall_mm"],
                   "shafts": [{"name": s["name"], "x_mm": round(s["x"], 2), "diameter_mm": s["d"],
                               "torque_Nm": round(s["torque"], 2)} for s in L["shafts"]],
@@ -161,7 +163,11 @@ def _run_housing(p, progress):
         "equilibrium_error": balance,
     }
     checks = [Check("housing safety factor on yield", sf, p["design_factor"], "-", "min"),
+              Check("margin of safety (yield)", sf / p["design_factor"] - 1, 0.0, "-", "min",
+                    f"MS = S_y/(σ_vm·FoS) − 1, FoS = {p['design_factor']:g}; alert when MS < 0"),
               Check("force equilibrium error", balance, 1e-3, "-", "max", "solver self-check")]
+    if sf / p["design_factor"] - 1 < 0:
+        warnings.append(f"Margin of safety {sf / p['design_factor'] - 1:.2f} < 0 at FoS {p['design_factor']:g}.")
     if not p.get("_inner"):
         out["options"] = _fea_options(p, L, mat, vmax, sf, out["model"]["approx_mass_kg"], solve_s, progress)
         out["outer_size_mm"], out["fits_envelope"], _why = _envelope_fit(p, [L["W"], L["H"], L["D"]])
