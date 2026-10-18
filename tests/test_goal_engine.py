@@ -19,9 +19,13 @@ def _cfd(extra=None):
 
 
 def test_lumped_screen_matches_3d_fem():
+    from physics.variant_shafts import designed_housing_params
     r = _cfd()
     W, H, D = r["housing_box_mm"]
-    q = oil_temp_lumped(r["heat_to_housing_w"], W, H, D, 4, r["conductivity_w_mk"], r["h_oil_w_m2k"])
+    hp = designed_housing_params(BASE, BASE["housing_params"], 6000)
+    q = oil_temp_lumped(r["heat_to_housing_w"], W, H, D, 4, r["conductivity_w_mk"], r["h_oil_w_m2k"],
+                        web_mm=hp.get("web_mm", 0.0), cover_mm=hp.get("cover_mm"),
+                        extra_out_mm2=hp.get("boss_area_mm2", 0.0))
     assert abs(q["oil_temp_c"] - r["oil_temp_c"]) / (r["oil_temp_c"] - 25) < 0.02
     assert r["surface_area_m2"] == r["area_outer_m2"] > 0
 
@@ -93,12 +97,21 @@ def test_generator_overall_basis_and_bbox():
 
 
 def test_generator_goals_steer_selection():
-    o = generate_variants(REQ, goals={"oil_temp_max_c": 90, "mass_max_kg": 5.0,
+    # v0.12: goals are re-checked on the manufacturable housing (sealed 7 mm covers, bosses, web)
+    o = generate_variants(REQ, goals={"oil_temp_max_c": 90, "mass_max_kg": 6.5,
                                       "cooling_allowed": ["natural", "fan", "fins", "efficiency", "oil_cooler"]})
     assert o["diagnostics"]["meeting_goals"] > 0
+    met = o["goal_summary"]["variants_meeting_all"]
+    assert met and len(o["variants"]) == 5
     for v in o["variants"]:
-        assert all(x["pass"] for x in v["goal_check"].values())
-        assert v["goal_check"]["mass_max_kg"]["value"] <= 5.0
+        ok = all(x["pass"] for x in v["goal_check"].values())
+        assert ok == (v["name"] in met)
+        if ok:
+            assert v["goal_check"]["mass_max_kg"]["value"] <= 6.5
+    # 5 kg cannot be met with a buildable housing: honest "no variant meets", best designs shown
+    o5 = generate_variants(REQ, goals={"mass_max_kg": 5.0, "cooling_allowed": ["natural", "fan", "oil_cooler"]})
+    assert o5["variants"] and o5["goal_summary"]["variants_meeting_all"] == []
+    assert "mass_max_kg" in o5["goal_summary"]["blocking_goals"]
     o2 = generate_variants(REQ, goals={"cooling_allowed": ["natural"]})
     assert o2["goal_summary"]["variants_meeting_all"] == []
     assert "oil_temp_max_c" in o2["goal_summary"]["blocking_goals"]
@@ -122,7 +135,8 @@ def test_efficiency_assumption_never_alone_makes_pass():
 
 
 def test_screen_vs_fem_on_demo_variants():
-    # QA Q-019: L1 screen vs 3D FEM on demo variants (layout v4 with the central web: max 1.2 % over 15 variants)
+    # QA Q-019: L1 screen vs 3D FEM on demo variants (v0.12: meshed bosses, sealed covers, web pockets:
+    # max 0.9 % over 15 variants)
     import json, os
     path = os.path.join(os.path.dirname(__file__), "..", "qa-skenario-demo.json")
     if not os.path.exists(path):
@@ -137,9 +151,10 @@ def test_screen_vs_fem_on_demo_variants():
         body.update(power_kw=req["power_kw"], input_rpm=req["input_rpm"])
         r = _cfd_body(body)
         W, H, Dd = r["housing_box_mm"]
-        web = designed_housing_params(body, body["housing_params"], req["input_rpm"]).get("web_mm", 0.0)
+        dhp = designed_housing_params(body, body["housing_params"], req["input_rpm"])
         q = oil_temp_lumped(r["heat_to_housing_w"], W, H, Dd, 4, r["conductivity_w_mk"], h_oil(v, req["input_rpm"]),
-                            web_mm=web)
+                            web_mm=dhp.get("web_mm", 0.0), cover_mm=dhp.get("cover_mm"),
+                            extra_out_mm2=dhp.get("boss_area_mm2", 0.0))
         assert abs(q["oil_temp_c"] - r["oil_temp_c"]) / (r["oil_temp_c"] - 25) < 0.01, (sk, q["oil_temp_c"], r["oil_temp_c"])
 
 

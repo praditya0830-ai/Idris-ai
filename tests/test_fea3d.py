@@ -50,9 +50,9 @@ def test_layout_matches_assembly3d():
     L = build_layout(v["design"], v["kinematics"], {}, v["shaft"], designed_housing_params(v, v["housing_params"]))
     assert np.allclose(asm["layout"]["axis_a_mm"], [L["x_a"], L["yc"]])
     assert np.allclose(asm["layout"]["axis_b_mm"], [L["x_b"], L["yc"]])
-    # body + covers (bosses, bolts and plugs stand proud of the box and are not meshed)
+    # v0.12: body + covers + bearing bosses are meshed (screws, seals and plugs are not)
     housing = np.vstack([np.reshape(p["verts"], (-1, 3)) for p in asm["parts"]
-                         if p["name"] in ("Housing", "Housing front cover", "Housing cover")])
+                         if p["name"] in ("Housing", "Housing front cover", "Housing cover", "Bearing bosses")])
     m = build_model(L, "coarse")
     assert np.allclose(m.nodes.min(0), housing.min(0), atol=1e-6)
     assert np.allclose(m.nodes.max(0), housing.max(0), atol=1e-6)
@@ -90,7 +90,10 @@ def test_fea_job_flow():
     assert len(sf["indices"]) % 3 == 0 and max(sf["indices"]) < n
     P = np.array(sf["positions"]).reshape(-1, 3)
     hp = designed_housing_params(EXAMPLE_VARIANT, EXAMPLE_VARIANT["housing_params"])
-    assert P.min() >= -1e-6 and np.allclose(P.max(0), [hp["envelope_width"], hp["envelope_height"], hp["envelope_depth"]])
+    # x, y = the housing box; along z the bearing bosses stand outside the box (meshed since v0.12)
+    assert P[:, :2].min() >= -1e-6 and np.allclose(P[:, :2].max(0), [hp["envelope_width"], hp["envelope_height"]])
+    assert P[:, 2].min() < 0 < hp["envelope_depth"] < P[:, 2].max()
+
     assert r["yield_mpa"] == 503 and r["mesh"]["elements"] > 0 and r["applied_loads"]
 
 

@@ -95,3 +95,71 @@ def test_envelope_choice_offers_both_bases():
     assert [v["design"] for v in o2["variants"]] == [v["design"] for v in w["variants"]]
     # when the whole unit already fits, there is nothing to ask
     assert generate_variants(S2)["envelope_choice"] is None
+
+
+def test_cover_joints_are_sized_and_sealed():
+    # Tahap 1.1: screws + dowels from the bolted-joint solver; covers thick enough for the O-ring
+    for req, stages in ((S1, 2), (S2, 1)):
+        v = generate_variants(req, compare_basis=False)["variants"][0]
+        asm = build_assembly(v["design"], v["kinematics"], v["shaft"], v["housing_params"])
+        joints = asm["layout"]["joints"]
+        assert set(joints) == ({"front", "back"} if stages == 2 else {"back"})
+        for wall, j in joints.items():
+            assert j["pass"] and j["size"] in ("M5", "M6", "M8") and j["count"] >= 3
+            assert all(sf is None or sf >= j["targets"][k] for k, sf in j["safety_factors"].items())
+            assert j["cover"]["oring_lift_mm"] <= j["cover"]["allowed_lift_mm"] + 1e-9
+            assert j["cover"]["thickness_mm"] == asm["layout"]["cover_mm"] >= v["housing_params"]["wall_thickness"]
+        names = {p["name"] for p in asm["parts"]}
+        assert {"Cover O-rings", "Cover bolts", "Housing corner columns"} <= names
+        spec = next(p for p in asm["parts"] if p["name"] == "Cover bolts")["spec"]
+        assert "ISO 4762" in spec and "ISO 8734" in spec and "DIN 7603" in spec
+
+
+def test_bom_lists_every_part():
+    # Tahap 1.2: BOM from the assembly; made parts carry a mass from the closed STL volume
+    v = generate_variants(S1, compare_basis=False)["variants"][0]
+    asm = build_assembly(v["design"], v["kinematics"], v["shaft"], v["housing_params"], v.get("materials"))
+    bom = asm["bom"]
+    names = " | ".join(r["name"] for r in bom)
+    for must in ("Housing", "Input shaft", "Gear (stage 2)", "Deep-groove ball bearing", "Radial lip seal",
+                 "Socket head cap screw", "Dowel pin", "O-ring", "Magnetic drain plug"):
+        assert must in names, must
+    assert sum(r["qty"] for r in bom if r["name"].startswith("Deep-groove")) == 6
+    for r in bom:
+        if r["kind"] == "made":
+            assert r["mass_kg_each"] and r["mass_kg_each"] > 0
+    from physics.bom import bom_csv
+    assert bom_csv(bom).splitlines()[0].startswith("item,name,qty")
+
+
+def test_step_export_reproduces_the_solids():
+    # Tahap 1.3: faceted STEP AP214; an independent re-read gives back every solid's volume
+    from physics.step_export import write_step, check_step, step_solid_volumes
+    from physics.bom import _volume_mm3
+    v = generate_variants(S2, compare_basis=False)["variants"][0]
+    asm = build_assembly(v["design"], v["kinematics"], v["shaft"], v["housing_params"], v.get("materials"))
+    txt, stats = write_step(asm["parts"])
+    assert txt.startswith("ISO-10303-21;") and "AUTOMOTIVE_DESIGN" in txt and txt.rstrip().endswith("END-ISO-10303-21;")
+    ok, msg = check_step(txt)
+    assert ok, msg
+    vols = step_solid_volumes(txt)
+    assert len(vols) == len(stats) and min(vols.values()) > 0
+    for p in asm["parts"]:
+        sv = sum(val for k, val in vols.items() if k == p["name"] or k.startswith(p["name"] + " #"))
+        assert abs(sv / _volume_mm3(p) - 1) < 1e-6, p["name"]
+
+
+def test_drawings_are_valid_svg_with_fits():
+    # Tahap 1.4: housing / covers / shafts sheets, outlines cut from the same meshes, ISO 286 fits
+    import xml.etree.ElementTree as ET
+    from physics.drawing import make_drawings
+    from physics.variant_shafts import shaft_plan
+    v = generate_variants(S1, compare_basis=False)["variants"][0]
+    asm = build_assembly(v["design"], v["kinematics"], v["shaft"], v["housing_params"], v.get("materials"))
+    plan = shaft_plan(v)
+    d = make_drawings(asm, plan, v.get("materials"))
+    assert set(d) == {"housing", "covers", "shafts"}
+    for name, svg in d.items():
+        root = ET.fromstring(svg.split("?>", 1)[1])
+        assert root.tag.endswith("svg") and len(root) > 20, name
+    assert "N7 (-0.0" in d["housing"] and "k5 (+0.0" in d["shafts"] and "ISO 4762" in d["covers"]
