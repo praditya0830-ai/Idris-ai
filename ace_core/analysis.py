@@ -12,6 +12,14 @@ from . import registry, jobs, SOLVER_VERSION
 SYNC_ELEMENT_HINT = {"coarse"}      # small meshes may be answered directly with ?sync=1
 
 
+def _evidence(env):
+    try:
+        from physics.evidence import EVIDENCE
+        return EVIDENCE.get(env.get("solver"))
+    except Exception:
+        return None
+
+
 def _fea_result(env):
     o = env["outputs"]
     return {"surface": o["surface"], "yield_mpa": o["yield_mpa"], "mesh": o["mesh"],
@@ -25,12 +33,12 @@ def _fea_result(env):
                         "margin_of_safety": o.get("margin_of_safety"), "factor_of_safety": o.get("factor_of_safety")},
             "model": o["model"], "solver": f"{env['solver']} {env['version']}",
             "options": o.get("options", []), "outer_size_mm": o.get("outer_size_mm"),
-            "fits_envelope": o.get("fits_envelope"),
-            "method": env["method"], "limitations": env["limitations"]}
+            "fits_envelope": o.get("fits_envelope"), "mesh_convergence": o.get("mesh_convergence"),
+            "method": env["method"], "limitations": env["limitations"], "evidence": _evidence(env)}
 
 
 def _common(env, o):
-    return {"warnings": env["warnings"], "verdict": env["verdict"], "checks": env["checks"],
+    return {"evidence": _evidence(env), "warnings": env["warnings"], "verdict": env["verdict"], "checks": env["checks"],
             "solver": f"{env['solver']} {env['version']}", "method": env["method"],
             "limitations": env["limitations"]}
 

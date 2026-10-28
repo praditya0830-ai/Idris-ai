@@ -4,6 +4,7 @@
     GET  /solvers/tools        -> LLM function declarations (Gemini format)
     GET  /verify               -> cached benchmark report (runs in background; ?refresh=1 re-runs)
     GET  /verify/<name>        -> run one solver's benchmarks
+    GET  /selfcheck            -> end-to-end check of the 3 demo scenarios (background, cached; ?refresh=1)
     POST /solve/<name>         -> run a solver; body = JSON inputs
     POST /fea                  -> housing FEA in the UI team's job format (see analysis.py)
     GET  /fea/<job_id>         -> job status / result
@@ -70,6 +71,9 @@ def handle_get(path):
         return 200, {"function_declarations": registry.llm_tools()}
     if path == "/verify":
         return verify_page(query)
+    if path == "/selfcheck":
+        from . import selfcheck
+        return selfcheck.page(query)
     if path.startswith("/verify/"):
         name = path[len("/verify/"):]
         if registry.get(name) is None:
