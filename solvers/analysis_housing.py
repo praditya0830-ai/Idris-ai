@@ -24,7 +24,7 @@ MAX_THERMAL_ELEMENTS = int(os.environ.get("IDRIS_THERMAL_MAX_ELEMENTS", "40000")
 # thermal conductivity W/(m·K) of the housing materials
 CONDUCTIVITY = {"Al7075-T6": 130, "Al6061-T6": 167, "Al2024-T3": 121, "A356-T6": 151, "Ti-6Al-4V": 6.7,
                 "Steel-1045": 50, "Steel-4140": 42, "CastIron-GG25": 48, "Mg-AZ91D": 72}
-OIL_GRADES = {"ISO VG 68": 68, "ISO VG 100": 100, "ISO VG 150": 150, "ISO VG 220": 220}
+OIL_GRADES = {"ISO VG 68": 68, "ISO VG 100": 100, "ISO VG 150": 150, "ISO VG 220": 220, "ISO VG 320": 320}
 OIL_LIMIT_C = 90.0          # common continuous limit for mineral gear oils
 TARGET_OIL_C = 85.0         # design target used by the repair options (5 °C margin)
 EMISSIVITY = 0.85           # painted / anodised housing (bare machined Al ≈ 0.1–0.2)
@@ -340,6 +340,9 @@ def _fin_candidates(case):
 
 
 def _run_thermal(p, progress):
+    lub = (p.get("lubricant") or {}).get("iso_vg")
+    if lub and p.get("oil") == "ISO VG 68" and f"ISO VG {int(lub)}" in OIL_GRADES:
+        p = {**p, "oil": f"ISO VG {int(lub)}"}
     try:
         mat = _material(p)
         L = _scaled_layout(p, p["housing_scale"])
@@ -754,6 +757,8 @@ register(SolverSpec(
             "air_speed_ms": {"type": "number", "min": 0, "max": 50, "default": 0.0},
             "oil": {"type": "string", "enum": list(OIL_GRADES), "default": "ISO VG 68"},
             "loss_model": {"type": "string", "enum": ["constant", "iso14179_load"], "default": "constant"},
+            "lubricant": {"type": "object", "desc": "variant lubricant {iso_vg} from /generate-variants; used when "
+                                                    "'oil' is left at its default"},
             "fins": {"type": "object", "default": {}, "allow_extra": False,
                      "fields": {"count": {"type": "integer", "min": 0, "max": 200},
                                 "height_mm": {"type": "number", "min": 0, "max": 100},

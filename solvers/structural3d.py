@@ -145,7 +145,8 @@ def _run_housing(p, progress):
     out = {
         "surface": surface, "yield_mpa": Sy, "material": mat,
         "mesh": {"elements": ne, "nodes": model.n_nodes, "type": "hex8-im (rectilinear brick)",
-                 "element_size_mm": round(h, 3), "surface_triangles": int(len(tris))},
+                 "element_size_mm": round(h, 3), "surface_triangles": int(len(tris)),
+                 "level": p["mesh"], "h_rep_mm": round(float((model.evol.sum() / ne) ** (1 / 3)), 4)},
         "solve_time_s": round(solve_s, 2), "cg_iterations": r["iterations"],
         "applied_loads": applied,
         "max_von_mises_MPa": vmax, "max_displacement_mm": float(np.linalg.norm(r["u"], axis=1).max()),
@@ -171,8 +172,74 @@ def _run_housing(p, progress):
     if not p.get("_inner"):
         out["options"] = _fea_options(p, L, mat, vmax, sf, out["model"]["approx_mass_kg"], solve_s, progress)
         out["outer_size_mm"], out["fits_envelope"], _why = _envelope_fit(p, [L["W"], L["H"], L["D"]])
+        if p.get("convergence_study"):
+            mc = _convergence_study(p, out, progress)
+            out["mesh_convergence"] = mc
+            warnings.extend(mc["warnings"])
+            checks.extend(mc["checks"])
     progress("Post-processing", 1.0)
     return {"outputs": out, "checks": checks, "warnings": warnings}
+
+
+CONVERGENCE_QUANTITIES = (("max_von_mises_MPa", "peak von Mises stress", "MPa"),
+                          ("max_displacement_mm", "peak displacement", "mm"))
+
+
+def _convergence_study(p, out, progress):
+    """Solve the same housing on every mesh level that fits the server cap and apply the GCI (Celik 2008).
+
+    The three levels are not nested refinements of one grid (each level re-places the planes and re-steps the
+    bores), so the observed order is the honest test: non-monotonic results are reported as such, not hidden.
+    """
+    from physics.gci import celik_gci, converged, two_level, GCI_OK
+    levels = {p["mesh"]: out}
+    for k, m in enumerate(lv for lv in MESH_DIVISIONS if lv != p["mesh"]):
+        progress(f"Convergence study: {m} mesh", 0.9 + 0.04 * k)
+        r = _run_housing({**p, "mesh": m, "_inner": True, "convergence_study": False}, lambda *a, **kw: None)
+        if r.get("outputs"):
+            levels[m] = r["outputs"]
+    order = [lv for lv in sorted(MESH_DIVISIONS, key=MESH_DIVISIONS.get, reverse=True) if lv in levels]
+    table = [{"mesh": lv, "elements": levels[lv]["mesh"]["elements"], "h_rep_mm": levels[lv]["mesh"]["h_rep_mm"],
+              **{q: levels[lv][q] for q, _, _ in CONVERGENCE_QUANTITIES}} for lv in order]
+    skipped = [lv for lv in MESH_DIVISIONS if lv not in levels]
+    res, warnings, checks = {}, [], []
+    for q, name, unit in CONVERGENCE_QUANTITIES:
+        if len(order) >= 3:
+            rep = celik_gci([levels[lv][q] for lv in order[:3]], [levels[lv]["mesh"]["h_rep_mm"] for lv in order[:3]])
+            rep["mesh_converged"] = converged(rep)
+            if rep["mesh_converged"]:
+                checks.append(Check(f"GCI {name} (finest mesh)", rep["gci_fine21"], GCI_OK, "-", "max",
+                                    "Celik et al. 2008 / Roache, Fs = 1.25"))
+            else:
+                why = rep.get("note") or (f"GCI {100 * rep['gci_fine21']:.1f} %, observed order "
+                                          f"{rep['observed_order']:.2f}" if rep.get("gci_fine21") is not None else "")
+                warnings.append(f"{name[0].upper() + name[1:]} is not mesh-converged ({why}). "
+                                f"Use the finest-mesh value with a spread of {100 * (rep.get('spread_rel') or 0):.0f} %.")
+        elif len(order) == 2:
+            rep = two_level(levels[order[0]][q], levels[order[1]][q])
+            rep["mesh_converged"] = False
+            warnings.append(f"{name[0].upper() + name[1:]}: only two meshes fit the server ({', '.join(skipped)} skipped), "
+                            f"change {100 * (rep['relative_change'] or 0):.1f} %; no GCI.")
+        else:
+            rep = {"convergence": "not run", "mesh_converged": False, "note": "no second mesh fits the server cap"}
+        res[q] = rep
+    # robustness of the verdict: the yield check on the worst (highest-stress) mesh level
+    Sy = out["yield_mpa"]
+    worst = max(t["max_von_mises_MPa"] for t in table)
+    sf_all = Sy / max(worst, 1e-12)
+    checks.append(Check("safety factor on yield, worst mesh level", sf_all, p["design_factor"], "-", "min",
+                        f"S_y / max σ_vm over {len(table)} mesh levels"))
+    robust = sf_all >= p["design_factor"]
+    if len(table) > 1:
+        warnings.append(f"Yield check {'passes' if robust else 'FAILS'} on every mesh level "
+                        f"(worst SF {sf_all:.2f} vs required {p['design_factor']:g})."
+                        + ("" if robust else " Do not rely on the single-mesh safety factor."))
+    return {"levels": table, "skipped_levels": skipped, "quantities": res,
+            "safety_factor_worst_level": sf_all, "verdict_holds_on_all_levels": robust, "warnings": warnings, "checks": checks,
+            "method": "Grid Convergence Index, Celik et al. 2008 (ASME J. Fluids Eng. 130 078001); "
+                      "h = (V/N)^(1/3); GCI only for monotonic convergence with observed order 0.5–4",
+            "note": "Levels are re-meshed, not nested: bore stair-steps change with the mesh, so peak stress at "
+                    "bore edges may not converge. The finest-mesh value and its spread are the honest result."}
 
 
 def _envelope_fit(p, size):
@@ -284,6 +351,8 @@ register(SolverSpec(
                                    "depth": {"type": "number", "min": 0, "max": 1e5}}},
         "envelope_basis": {"type": "string", "enum": ["housing", "overall"], "default": "housing"},
         "input_rpm": {"type": "number", "exclusive_min": 0, "max": 1e5},
+        "convergence_study": {"type": "boolean", "default": False,
+                              "desc": "also solve the other mesh levels and report a GCI (about 3× the solve time)"},
     },
     run=_run_housing,
     benchmarks=[Benchmark(
