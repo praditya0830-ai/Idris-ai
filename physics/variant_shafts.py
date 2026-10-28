@@ -209,6 +209,42 @@ def shaft_plan(variant, input_rpm=None):
             "hp": hp_final, "L": L, "manufacturable": manufacturable, "joints": joints, "depth_mm": D, "depth_needed_mm": need_D}
 
 
+DESIGN_OIL_C = 90.0          # oil temperature the cooling measures are sized for (thermal limit)
+
+
+OIL_VGS = (68, 100, 150, 220, 320)
+APPLICATION_FACTOR = 1.2      # same a_f as the L10 bearing selection
+
+
+def _mod_life(b, rb, rpm, vg=68):
+    """ISO 281:2007 modified life at the design oil temperature (ISO VG `vg`, normal cleanliness)."""
+    try:
+        from .bearing_life import modified_life
+        from .bearings import DEEP_GROOVE
+        from .power_loss import oil_props
+        d, D, B, C, C0 = DEEP_GROOVE[b["designation"]]
+        nu = oil_props(vg, DESIGN_OIL_C)["nu_mm2_s"]
+        r = modified_life(d, D, C * 1e3, C0 * 1e3, APPLICATION_FACTOR * float(rb["Fr_N"]), rpm, nu)
+        return {"L_nm_h": round(r["L_nm_h"]) if r["L_nm_h"] is not None else None, "a_ISO": round(r["a_ISO"], 2)
+                if r["a_ISO"] is not None else None, "kappa": round(r["kappa"], 2), "L10_basic_h": round(r["L10_h"]),
+                "oil_iso_vg": vg,
+                "basis": f"ISO 281:2007 a_ISO at {DESIGN_OIL_C:g} °C oil (ISO VG {vg}), normal cleanliness, "
+                         f"90 % reliability, P = {APPLICATION_FACTOR:g}·F_r",
+                "note": r["note"]}
+    except Exception as e:      # never block the variant
+        return {"error": str(e)}
+
+
+def choose_oil(entries):
+    """Smallest ISO VG for which every bearing reaches LIFE_H as modified life (ISO 281) at 90 °C.
+    entries: [(bearing dict, solver bearing result, rpm)]. Returns (vg or None, {id: modified_life})."""
+    for vg in OIL_VGS:
+        lives = [_mod_life(b, rb, rpm, vg) for b, rb, rpm in entries]
+        if all((m.get("L_nm_h") or 0) >= LIFE_H for m in lives):
+            return vg, lives
+    return None, [_mod_life(b, rb, rpm, OIL_VGS[-1]) for b, rb, rpm in entries]
+
+
 def check_variant_shafts(variant, input_rpm, plan=None):
     """Returns (shafts_summary list, warnings list) for one variant dict from generate_variants.
     `plan`: the shaft_plan already computed for this variant (saves re-running the shaft solver)."""
@@ -237,7 +273,8 @@ def check_variant_shafts(variant, input_rpm, plan=None):
             "bearings": [{"position": b["position"], "seat": b["seat"], "designation": b["designation"],
                           "bore_mm": b["d"], "outer_mm": b["D"], "width_mm": b["B"],
                           "radial_load_n": round(res["bearings"][b["position"]]["Fr_N"], 1),
-                          "life_h_L10": round(res["bearings"][b["position"]]["life_h_at_reliability"])}
+                          "life_h_L10": round(res["bearings"][b["position"]]["life_h_at_reliability"]),
+                          "modified_life": None}
                          for b in ps["bearings"]],
             "min_fatigue_safety_factor": round(n_fat, 2),
             "max_deflection_mm": round(max(c["value"] for k, c in res["checks"].items() if k.endswith("deflection")), 5),
@@ -253,6 +290,20 @@ def check_variant_shafts(variant, input_rpm, plan=None):
         })
         if not out[-1]["all_checks_pass"]:
             warns.append(f"{s['name']}: not every shaft check passes — see shafts[].")
+    # oil grade from the ISO 281 modified bearing life at the design oil temperature (Tahap 2)
+    entries, refs = [], []
+    for si, ps in enumerate(plan["shafts"]):
+        for j, b in enumerate(ps["bearings"]):
+            entries.append((b, ps["res"]["bearings"][b["position"]], ps["spec"]["rpm"]))
+            refs.append((si, j))
+    vg, lives = choose_oil(entries)
+    for (si, j), m in zip(refs, lives):
+        out[si]["bearings"][j]["modified_life"] = m
+    for o in out:
+        o["oil_iso_vg"] = vg
+    if vg is None:
+        warns.append(f"Even with ISO VG {OIL_VGS[-1]} at {DESIGN_OIL_C:g} °C a bearing stays below {LIFE_H} h "
+                     "modified life (ISO 281): use a larger bearing or keep the oil cooler.")
     return out, warns
 
 

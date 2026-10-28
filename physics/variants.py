@@ -365,7 +365,8 @@ def _envelope_choice(req, n, basis, goals, ambient_c, out):
                     "the shaft ends are where the motor and the load are coupled."}
 
 
-def _generate_basis(req: Requirements, n: int, envelope_basis: str, goals: dict | None, ambient_c: float) -> dict:
+def _generate_basis(req: Requirements, n: int, envelope_basis: str, goals: dict | None, ambient_c: float,
+                    **kw) -> dict:
     """envelope_basis "overall": the shaft ends (sized for boss + seal + coupling) must also fit."""
     if envelope_basis not in ("housing", "overall"):
         raise ValueError("envelope_basis must be 'housing' or 'overall'")
@@ -373,7 +374,7 @@ def _generate_basis(req: Requirements, n: int, envelope_basis: str, goals: dict 
         stick = 2 * (goal_engine.SHAFT_STICKOUT_MM if goal_engine else 22.0)
         if req.env_d - stick <= 0:
             raise ValueError(f"envelope_depth must be larger than {stick:g} mm when shaft ends are included")
-        out = _generate(replace(req, env_d=req.env_d - stick), n, goals, ambient_c, overall_d=req.env_d)
+        out = _generate(replace(req, env_d=req.env_d - stick), n, goals, ambient_c, overall_d=req.env_d, **kw)
         for r in out.get("repairs", []):          # report depth in the engineer's (overall) terms
             if "envelope_depth" in r["change"] and not r.pop("_overall", False):
                 r["change"]["envelope_depth"] = r["change"]["envelope_depth"] + stick
@@ -410,14 +411,17 @@ def _generate_basis(req: Requirements, n: int, envelope_basis: str, goals: dict 
         out["envelope_note"] = (f"Depth checked as housing + both shaft ends ≤ {req.env_d:g} mm; each shaft end "
                                 f"is sized for its bearing boss, lip seal and coupling (≥ {stick / 2:g} mm).")
         return out
-    out = _generate(req, n, goals, ambient_c)
+    out = _generate(req, n, goals, ambient_c, **kw)
     for r in out.get("repairs", []):
         r.pop("_overall", None)
     out["envelope_basis"] = "housing"
     return out
 
 
-def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, overall_d: float | None = None) -> dict:
+def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, overall_d: float | None = None,
+              only: tuple | None = None, score_pool: list | None = None) -> dict:
+    """only = (module, pinion teeth, face width): evaluate just that design (POST /edit-variant);
+    score_pool = the full feasible design space, so its scores stay comparable with /generate-variants."""
     if req.gear_material not in GEAR_MATERIALS:
         raise ValueError(f"unknown gear_material '{req.gear_material}', choose one of {list(GEAR_MATERIALS)}")
     if req.housing_material not in HOUSING_MATERIALS:
@@ -426,12 +430,21 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         raise ValueError("power_kw and input_rpm must be positive")
     stages_for_ratio(req.gear_ratio)          # raises for unsupported ratios
 
-    feasible, rejected = sweep(req)
+    if only:
+        r0 = evaluate(req, *only)
+        feasible = [r0] if r0["feasible"] else []
+        rejected = Counter(r0["violations"])
+        rejected["_total_candidates"] = 1
+    else:
+        feasible, rejected = sweep(req)
     diagnostics = {
         "candidates_evaluated": rejected.pop("_total_candidates"),
         "feasible": len(feasible),
         "rejected_by": dict(rejected),
     }
+    if not feasible and only:
+        return {"variants": [], "diagnostics": diagnostics, "repairs": [],
+                "suggestions": [f"This change fails: {v}" for v in rejected if v != "_total_candidates"]}
     if not feasible:
         repairs = propose_repairs(req, rejected)
         extra = [] if repairs else [
@@ -464,7 +477,10 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         else:
             goal_note = ("No feasible design meets all goals; showing the best designs on strength and size. "
                          "See goal_summary.blocking_goals and each variant's goal_check.")
-    _score(feasible, req)
+    if score_pool:
+        _score(score_pool + feasible, req)     # duplicates of the edited design do not change min/max
+    else:
+        _score(feasible, req)
     # manufacturable housing (layout v4): every candidate gets its real shafts + bearings, and the
     # housing is sized around them (bearing bosses, central web for 2-stage). A design is only offered
     # when that housing can actually be made and still fits the envelope.
@@ -590,6 +606,10 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         if check_variant_shafts is not None:
             try:
                 r["shafts"], r["warnings"] = check_variant_shafts(r, req.input_rpm, r.get("_plan"))
+                vg_ = (r["shafts"] or [{}])[0].get("oil_iso_vg")
+                if vg_:
+                    r["lubricant"] = {"iso_vg": vg_, "name": f"ISO VG {vg_}", "basis": "smallest ISO VG giving every bearing ≥ 5000 h modified "
+                                                         "life (ISO 281:2007 a_ISO) at 90 °C oil, normal cleanliness"}
             except Exception as e:      # never block variant generation on the extra check
                 r["shafts"] = []
                 r["warnings"] = [f"shaft/bearing check unavailable: {e}"]
@@ -611,6 +631,12 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
                 r["warnings"].append(f"thermal screen unavailable: {e}")
         variants.append(r)
 
+    try:
+        from .evidence import EVIDENCE
+        for r in variants:
+            r["evidence"] = EVIDENCE["variants"]
+    except Exception:
+        pass
     out = {"variants": variants, "diagnostics": diagnostics, "suggestions": [goal_note] if goal_note else [],
            "repairs": []}
     if goals and goal_engine is not None:

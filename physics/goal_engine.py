@@ -59,7 +59,7 @@ def _fits(fs, W, H, envelope):
     return W + 2 * fs["height_mm"] <= envelope[0] + 0.5
 
 
-def load_loss_estimate(variant, input_rpm, run, oil_vg=68):
+def load_loss_estimate(variant, input_rpm, run, oil_vg=None):
     """Tahap 2.1: computed load-dependent losses (ISO/TR 14179-2) and the natural-convection oil temperature
     they give. A LOWER BOUND (no churning); shown next to the constant-efficiency result, never instead."""
     try:
@@ -67,6 +67,7 @@ def load_loss_estimate(variant, input_rpm, run, oil_vg=68):
         from .power_loss import gearbox_losses
         L = build_layout(variant["design"], variant["kinematics"], variant.get("loads") or {},
                          variant.get("shaft") or {}, variant["housing_params"])
+        oil_vg = oil_vg or (variant.get("lubricant") or {}).get("iso_vg") or 68
         T = 80.0
         for _ in range(12):
             r = gearbox_losses(L, input_rpm, oil_vg, T)
@@ -77,7 +78,7 @@ def load_loss_estimate(variant, input_rpm, run, oil_vg=68):
         return {"load_losses_w": round(r["total_load_dependent_w"], 1), "mesh_w": round(r["mesh_w"], 1),
                 "bearings_w": round(r["bearings_w"], 1), "seals_w": round(r["seals_w"], 1),
                 "efficiency_load_dependent": round(r["efficiency_load_dependent"], 4),
-                "oil_temp_natural_c": round(Tn, 1), "oil": "ISO VG 68",
+                "oil_temp_natural_c": round(Tn, 1), "oil": f"ISO VG {oil_vg}",
                 "basis": "computed lower bound (ISO/TR 14179-2 load-dependent; churning not included)"}
     except Exception as e:
         return {"error": f"loss estimate unavailable: {e}"}
@@ -270,7 +271,9 @@ def assembly_notes(variant):
                  "cover bolts in corner columns with dowels; breather, level and drain plugs."
             + (f" Central web {hp['web_mm']:g} mm." if hp.get("web_mm") else ""),
             "Fits: bearing bores N7 in aluminium/magnesium housings (H7 in steel/cast iron), shaft seats k5 "
-            "(≤ Ø40) / m5; inner fillets R ≥ half the wall."]
+            "(≤ Ø40) / m5; inner fillets R ≥ half the wall."] + (
+        [f"Oil: ISO VG {variant['lubricant']['iso_vg']} mineral gear oil (chosen so every bearing reaches 5000 h "
+         "ISO 281 modified life at 90 °C)."] if (variant.get("lubricant") or {}).get("iso_vg") else [])
 
 
 def assembly_warnings(variant):        # kept for compatibility; v4 designs have no assembly defect
