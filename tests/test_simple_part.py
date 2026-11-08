@@ -1,0 +1,65 @@
+import json
+import math
+import os
+import tempfile
+
+import llm
+from physics.simple_part import (builtin_parse, design_from_message, looks_like_part_request, make_part, validate)
+
+OUT = tempfile.mkdtemp()
+
+
+def test_cube_exact_volume_and_mass():
+    r = make_part({"shape": "box", "length": 50, "width": 50, "height": 50, "material": "steel"}, OUT, "a")
+    assert r["ok"] and r["results"]["volume_mm3"] == 125000.0
+    assert math.isclose(r["results"]["mass_g"], 981.25, rel_tol=1e-6)
+    assert r["self_check"]["ok"] and os.path.getsize(os.path.join(OUT, r["files"]["stl"])) == 84 + 50 * 12
+
+
+def test_curved_parts_self_check_within_1_percent():
+    for sp in ({"shape": "cylinder", "diameter": 40, "height": 60, "bore": 20}, {"shape": "sphere", "diameter": 25},
+               {"shape": "box", "length": 80, "width": 50, "height": 10,
+                "holes": [{"diameter": 6, "x": 8, "y": 8}, {"diameter": 6, "x": 72, "y": 42}]}):
+        r = make_part(sp, OUT, "b")
+        assert r["ok"] and r["self_check"]["difference_pct"] < 1.0, (sp, r["self_check"])
+
+
+def test_bad_specs_are_refused_not_guessed():
+    for sp, word in (({"shape": "box", "length": 20, "width": 20, "height": 5,
+                       "holes": [{"diameter": 25, "x": 10, "y": 10}]}, "does not fit"),
+                     ({"shape": "cylinder", "diameter": 20, "height": 10, "bore": 20}, "wall"),
+                     ({"shape": "torus", "diameter": 20}, "not supported"),
+                     ({"shape": "box", "missing": ["side length"]}, "missing size")):
+        _, errs, _ = validate(sp)
+        assert any(word in e for e in errs), (sp, errs)
+
+
+def test_builtin_parser_indonesian():
+    assert builtin_parse("buat kubus 4 cm dari baja") == {"material": "baja", "shape": "box", "length": 40.0,
+                                                          "width": 40.0, "height": 40.0, "name": "cube"}
+    assert builtin_parse("tabung d40 lubang 20 tinggi 60")["bore"] == 20.0
+    assert looks_like_part_request("tolong design kubus") and not looks_like_part_request("gearbox 5 kW ratio 8 kubus")
+
+
+def test_ai_reads_sentence_solver_builds(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setenv("IDRIS_LLM_ORDER", "gemini")
+    spec = {"shape": "box", "length": 80, "width": 50, "height": 10, "material": "aluminium",
+            "holes": [{"diameter": 6, "x": 8, "y": 8}, {"diameter": 6, "x": 72, "y": 8},
+                      {"diameter": 6, "x": 8, "y": 42}, {"diameter": 6, "x": 72, "y": 42}]}
+    monkeypatch.setattr(llm, "call_provider", lambda *a, **k: (json.dumps(spec), "gemini-test"))
+    r = design_from_message("plat 80x50x10 dengan 4 lubang 6 mm di pojok", OUT, "c",
+                            lambda m: llm.parse_part(m), "https://x")
+    assert r["ok"] and r["read_by"].startswith("gemini") and len(r["spec"]["holes"]) == 4
+    assert r["files"]["step_url"].startswith("https://x/download/")
+    assert math.isclose(r["results"]["volume_mm3"], 80 * 50 * 10 - 4 * math.pi * 9 * 10, rel_tol=1e-6)
+
+
+def test_ai_failure_falls_back_to_builtin(monkeypatch):
+    def boom(*a, **k):
+        raise llm.LLMError("provider returned HTTP 429: quota")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setenv("IDRIS_LLM_ORDER", "gemini")
+    monkeypatch.setattr(llm, "call_provider", boom)
+    r = design_from_message("kubus 30 mm", OUT, "d", lambda m: llm.parse_part(m))
+    assert r["ok"] and "AI failed" in r["read_by"] and r["results"]["volume_mm3"] == 27000.0
