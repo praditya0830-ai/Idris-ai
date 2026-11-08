@@ -15,7 +15,7 @@ MAX_ELEMENTS = int(os.environ.get("IDRIS_FEA_MAX_ELEMENTS", "60000"))
 KNOWN_HP_KEYS = {"envelope_width", "envelope_height", "envelope_depth", "wall_thickness", "gear_ratio",
                  "bore_diameter", "bearing_widths", "web_mm", "front_bore_diameter", "back_bore_diameter",
                  "web_hole_diameter", "split_cover", "stickout_mm", "web_hub_diameter",
-                 "cover_mm", "bearing_ods", "boss_area_mm2"}
+                 "cover_mm", "bearing_ods", "boss_area_mm2", "flange_allow_mm", "lug_mm"}
 FRAME_NOTE = ("Same coordinate frame as /generate-assembly: housing x∈[0,W], y∈[0,H], z∈[0,D] mm, "
               "shafts along +z at y = H/2. Body, central web and bolted covers are analysed as one rigidly joined "
               "part; bearing seats are meshed (bores = bearing OD, outward bosses with caps, web pockets); corner columns (conservative), screws, "
