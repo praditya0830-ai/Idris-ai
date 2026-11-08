@@ -120,17 +120,22 @@ def selftest():
             return rd.OneShape()
         back = step("read STEP back", _read)
 
+        def _static(cls, name):
+            # OCP < 7.8 exposes static methods as Name_s; newer builds (cadquery-ocp 8.x) drop the suffix
+            return getattr(cls, name + "_s", None) or getattr(cls, name)
+
         def _vols():
             vols, ncyl = [], 0
+            vol_props, as_face = _static(BRepGProp, "VolumeProperties"), _static(TopoDS, "Face")
             ex = TopExp_Explorer(back, TopAbs_SOLID)
             while ex.More():
                 pr = GProp_GProps()
-                BRepGProp.VolumeProperties_s(ex.Current(), pr)
+                vol_props(ex.Current(), pr)
                 vols.append(pr.Mass())
                 ex.Next()
             ef = TopExp_Explorer(back, TopAbs_FACE)
             while ef.More():
-                if BRepAdaptor_Surface(TopoDS.Face_s(ef.Current())).GetType() == GeomAbs_Cylinder:
+                if BRepAdaptor_Surface(as_face(ef.Current())).GetType() == GeomAbs_Cylinder:
                     ncyl += 1
                 ef.Next()
             return sorted(vols), ncyl
