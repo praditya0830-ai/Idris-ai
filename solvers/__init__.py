@@ -13,3 +13,4 @@ from . import power_loss      # noqa: F401
 from . import nafems          # noqa: F401
 from . import bearing_life    # noqa: F401
 from . import mesh_convergence  # noqa: F401
+from . import gear_pair_iso   # noqa: F401
