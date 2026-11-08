@@ -73,7 +73,8 @@ def test_envelope_fit_is_reported_by_the_solver():
     ef = v["envelope_fit"]
     hp = v["housing_params"]
     assert ef["basis"] == "housing" and ef["fits"] is True and ef["fits_housing"] is True
-    assert ef["housing_box_mm"] == [hp["envelope_width"], hp["envelope_height"], hp["envelope_depth"]]
+    px, py = hp.get("lug_mm") or [0, 0]          # v0.20: outside screw lugs belong to the housing box
+    assert ef["housing_box_mm"] == [hp["envelope_width"] + 2 * px, hp["envelope_height"] + 2 * py, hp["envelope_depth"]]
     asm = build_assembly(v["design"], v["kinematics"], v["shaft"], hp)
     assert asm["layout"]["overall_box_mm"] == ef["overall_box_mm"]
     assert asm["layout"]["housing_box_mm"] == ef["housing_box_mm"]

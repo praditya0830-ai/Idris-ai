@@ -69,7 +69,8 @@ def test_review_job():
     # v0.9: assembly3d builds a body + bolted end cover, so the closed-box critical is gone (QA Q-001)
     assert not any(f["severity"] == "critical" for f in fs)
     # layout v4 is manufacturable: covers, seals and plugs are designed, so no assembly finding remains
-    assert not any(f["check"] == "assembly" for f in fs)
+    # v0.20: only the honest screw-pitch note may appear (info), never an assembly defect
+    assert all(f["severity"] == "info" and "cover screws" in f["message"] for f in fs if f["check"] == "assembly")
     assert {f["part"] for f in fs} <= {p["name"] for p in parts}
     hp = EXAMPLE_VARIANT["housing_params"]
     for f in fs:          # every pin lies inside (or on) the housing box of the assembly
