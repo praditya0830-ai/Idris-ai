@@ -1,0 +1,5 @@
+numpy
+scipy
+# OpenCascade (exact CAD kernel, LGPL 2.1) - optional: the server starts without it,
+# /occt/selftest measures it (solver/arahan-occt-untuk-solver.md)
+cadquery-ocp>=7.7
