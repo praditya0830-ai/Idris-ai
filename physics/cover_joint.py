@@ -16,6 +16,10 @@ K_A = 1.25
 SU = {"Al7075-T6": 572.0, "Al6061-T6": 310.0, "Al2024-T3": 483.0, "A356-T6": 234.0, "Ti-6Al-4V": 950.0,
       "Steel-1045": 625.0, "Steel-4140": 1020.0, "CastIron-GG25": 250.0, "Mg-AZ91D": 230.0}
 STD_LENGTHS = (6, 8, 10, 12, 16, 20, 25, 30, 35, 40, 45, 50)
+# Bolt pitch along a sealed cover joint. Design guideline (rule of thumb used for gasketed / O-ring cover
+# flanges: pitch ≈ 5–10 × d): screws at most 10·d apart, so the cover is clamped all round, not only at
+# the corners (Arya 28 Oct: four corner screws on a 200 mm cover looked wrong — and they are).
+PITCH_MAX_D = 10.0
 
 
 def _material(name):
@@ -42,7 +46,7 @@ def _rect_clear(rect, tips, yc, extra_clear=2.0):
 
 
 def bolt_positions(L, tips, size, extra_clear=2.0):
-    """Corner (and, if needed, mid-side) column positions that clear every gear tip circle."""
+    """Corner (and, if needed, mid-side) column positions that clear every gear tip and bearing boss."""
     t, W, H, yc = L["wall_mm"], L["W"], L["H"], L["yc"]
     col = column_size(size)
     corners = [(t, t), (W - t - col, t), (t, H - t - col), (W - t - col, H - t - col)]
@@ -51,6 +55,78 @@ def bolt_positions(L, tips, size, extra_clear=2.0):
     if len(ok) < 4:
         ok += [c for c in mids if _rect_clear((c[0], c[1], col, col), tips, yc, extra_clear)]
     return [(cx0, cy0, col) for cx0, cy0 in ok]
+
+
+def _overlap(a, b, gap=1.0):
+    return not (a[0] + a[2] + gap <= b[0] or b[0] + b[2] + gap <= a[0] or
+                a[1] + a[3] + gap <= b[1] or b[1] + b[3] + gap <= a[1])
+
+
+def perimeter_pads(L, tips, size, corners, avoid=(), extra_clear=2.0, allow=(0.0, 0.0)):
+    """Extra screw pads along the four walls so that neighbouring screws are at most PITCH_MAX_D·d apart.
+    A pad is a col × col boss against the inner wall face at the joint; it is moved along the wall (up to
+    half a pitch) to clear gear tips and bearing bosses, and left out if no clear spot exists.
+    Where no internal spot is free (gears fill the housing), an external lug outside the wall is used if the
+    envelope allows it (allow = (x, y) room per side). Returns (internal pad rects [x0, y0, w, h],
+    external lug rects, screw centres in perimeter order incl. corners, max gap, limit)."""
+    t, W, H, yc = L["wall_mm"], L["W"], L["H"], L["yc"]
+    d = METRIC[size][0]
+    col = column_size(size)
+    pmax = PITCH_MAX_D * d
+    lo_x, hi_x, lo_y, hi_y = t + col / 2, W - t - col / 2, t + col / 2, H - t - col / 2
+    corner_c = {(round(cx0 + c / 2, 3), round(cy0 + c / 2, 3)) for cx0, cy0, c in corners}
+    sides = [("bottom", (lo_x, lo_y), (hi_x, lo_y)), ("right", (hi_x, lo_y), (hi_x, hi_y)),
+             ("top", (hi_x, hi_y), (lo_x, hi_y)), ("left", (lo_x, hi_y), (lo_x, lo_y))]
+    pads, lugs, ring = [], [], []
+    out = col - t                                   # how far a lug stands outside the wall
+    for name, a, b in sides:
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        n = max(1, math.ceil(length / pmax))
+        if (round(a[0], 3), round(a[1], 3)) in corner_c:
+            ring.append(a)
+        for k in range(1, n):
+            f0 = k / n
+            best = None
+            step = 2.0 / length
+            for j in range(0, int(0.5 * length / n / 2.0) + 1):
+                for sgn in ((0,) if j == 0 else (1, -1)):
+                    fr = f0 + sgn * j * step
+                    if not 0.0 < fr < 1.0:
+                        continue
+                    cx, cy = a[0] + fr * (b[0] - a[0]), a[1] + fr * (b[1] - a[1])
+                    rect = [cx - col / 2, cy - col / 2, col, col]
+                    if not _rect_clear(rect, tips, yc, extra_clear):
+                        continue
+                    if any(_overlap(rect, o) for o in avoid) or any(_overlap(rect, p) for p in pads):
+                        continue
+                    best = (cx, cy, rect)
+                    break
+                if best:
+                    break
+            if best:
+                pads.append(best[2])
+                ring.append((best[0], best[1]))
+                continue
+            # external lug at the ideal spot: the lug and a matching cover ear stand outside the wall
+            cx, cy = a[0] + f0 * (b[0] - a[0]), a[1] + f0 * (b[1] - a[1])
+            room = allow[0] if name in ("left", "right") else allow[1]
+            if out > room + 1e-6:
+                continue
+            if name == "bottom":
+                rect = [cx - col / 2, t - col, col, col]
+            elif name == "top":
+                rect = [cx - col / 2, H - t, col, col]
+            elif name == "left":
+                rect = [t - col, cy - col / 2, col, col]
+            else:
+                rect = [W - t, cy - col / 2, col, col]
+            if any(_overlap(rect, o) for o in lugs):
+                continue
+            lugs.append(rect)
+            ring.append((rect[0] + col / 2, rect[1] + col / 2))
+    gaps = [math.hypot(ring[i][0] - ring[i - 1][0], ring[i][1] - ring[i - 1][1]) for i in range(len(ring))] \
+        if len(ring) > 1 else [float("inf")]
+    return pads, lugs, ring, max(gaps), pmax
 
 
 def dowel_layout(L, tips, cols, d):
@@ -132,8 +208,10 @@ def required_cover_thickness(W, H, t, E, lip=3.0, col=12.0, q=ORING_LOAD_N_MM, m
     return min(tc, max_mm), s, delta, tc <= max_mm
 
 
-def design_cover_joints(L, tips, housing_material="Al7075-T6"):
-    """Per bolted cover: screws, dowels, columns. Returns {wall: result} and an `ok` flag."""
+def design_cover_joints(L, tips, housing_material="Al7075-T6", bosses=(), allow=(0.0, 0.0)):
+    """Per bolted cover: screws, dowels, columns, perimeter pads. Returns {wall: result} and an `ok` flag.
+    bosses: (x, r) keep-out circles of the bearing bosses at y = yc (screws never go through them)."""
+    tips = list(tips) + list(bosses)
     key, E, Sy, Su = _material(housing_material)
     t = L["wall_mm"]
     tc = L.get("cover_mm", t)
@@ -143,10 +221,18 @@ def design_cover_joints(L, tips, housing_material="Al7075-T6"):
         V, M, items = cover_loads(L, wall)
         pos_cache = {}
 
+        pad_cache = {}
+
         def positions_for(size):
             if size not in pos_cache:
                 pos_cache[size] = bolt_positions(L, tips, size)
-            return [(cx0 + c / 2, cy0 + c / 2) for cx0, cy0, c in pos_cache[size]]
+                cols_ = pos_cache[size]
+                # dowel columns are lengthened along the wall: keep pads clear of that extension too
+                d_ = METRIC[size][0]
+                ext = [[cx0 - d_ - 6, cy0 - d_ - 6, c + 2 * (d_ + 6), c + 2 * (d_ + 6)] for cx0, cy0, c in cols_]
+                pad_cache[size] = perimeter_pads(L, tips, size, cols_, avoid=ext, allow=allow)
+            ring = pad_cache[size][2]
+            return [tuple(p) for p in ring] or [(cx0 + c / 2, cy0 + c / 2) for cx0, cy0, c in pos_cache[size]]
         # M5 is the smallest screw used in a tapped aluminium housing (thread wear on reassembly, handling)
         r = select_cover_bolts(tc, E, E, positions_for, V, M, sizes=("M5", "M6", "M8"), Su_body=Su, Sy_cover=Sy)
         r["loads"] = {"shear_n": round(V, 1), "moment_nmm": [round(M[0], 0), round(M[1], 0)],
@@ -165,6 +251,21 @@ def design_cover_joints(L, tips, housing_material="Al7075-T6"):
                 ok = False
                 rects, dpos = [[cx0, cy0, c, c] for cx0, cy0, c in cols], []
             r["column_rects"] = [[round(v, 2) for v in rc] for rc in rects]
+            pads, lugs, ring, gmax, pmax = pad_cache[r["size"]]
+            r["pads"] = [[round(v, 2) for v in p] for p in pads]
+            r["lugs"] = [[round(v, 2) for v in p] for p in lugs]
+            W_, H_ = L["W"], L["H"]
+            r["lug_protrusion_mm"] = [round(max([0.0] + [max(-p[0], p[0] + p[2] - W_) for p in lugs]), 2),
+                                      round(max([0.0] + [max(-p[1], p[1] + p[3] - H_) for p in lugs]), 2)]
+            r["pad_depth_mm"] = round(2.5 * d + 3.0, 1)
+            r["pitch"] = {"max_gap_mm": round(gmax, 1), "limit_mm": round(pmax, 1),
+                          "ok": bool(gmax <= pmax + 0.5),
+                          "basis": f"neighbouring screws ≤ {PITCH_MAX_D:g}·d apart (design guideline for sealed covers)",
+                          "note": None if gmax <= pmax + 0.5 else
+                          (f"Between two screws the gap is {gmax:.0f} mm (guideline {pmax:.0f} mm): the gears leave no "
+                           "room for a screw boss there and the envelope none for an outside lug. The cover "
+                           "thickness is sized for the corner span by the O-ring lift check, so the joint stays "
+                           "sealed by calculation.")}
             r["dowels"] = {"count": 2, "diameter_mm": d, "fit": "m6 (holes H7)", "standard": "ISO 8734",
                            "positions": [[round(x, 2), round(y, 2)] for x, y in dpos],
                            "length_mm": next((s for s in STD_LENGTHS if s >= tc + 1.5 * d), STD_LENGTHS[-1])}

@@ -241,7 +241,16 @@ def review(design, kinematics, L, material, checks, parts=None, input_rpm=None, 
         max_tip = max(dap, dag)
         max_hole = max(bo["d"] for bo in L["bores"])
         if plan and plan.get("manufacturable"):
-            pass        # covers, bosses, seals, bolts, dowels and plugs are part of the design (see variant notes)
+            # covers, bosses, seals, bolts, dowels and plugs are part of the design (see variant notes);
+            # report honestly where the screw pitch is wider than the guideline (Arya 28 Oct)
+            for wall, j in (plan.get("joints") or {}).items():
+                pt = j.get("pitch") or {}
+                if pt and not pt.get("ok", True):
+                    add("assembly", "info", "Housing",
+                        f"{wall.capitalize()} cover: largest gap between two cover screws is {pt['max_gap_mm']:.0f} mm (guideline "
+                        f"≤ {pt['limit_mm']:.0f} mm = 10·d). " + (pt.get("note") or ""),
+                        "If the joint must look conventional, allow a slightly larger envelope (room for outside "
+                        "screw lugs) or a larger screw.", [W / 2, yc, D if wall == "back" else 0.0])
         elif L.get("split_cover"):
             add("assembly", "info", "Housing cover",
                 f"Gears (tip Ø{max_tip:.0f} mm) and shafts go in through the open back of the housing body; the "

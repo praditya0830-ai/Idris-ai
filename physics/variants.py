@@ -496,7 +496,11 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         r["housing_params"] = {"envelope_width": env["width"], "envelope_height": env["height"],
                                "envelope_depth": env["depth"], "gear_ratio": r["kinematics"]["ratio_actual"],
                                "wall_thickness": req.wall_thickness,
-                               "bore_diameter": r["shaft"]["output_diameter_mm"] + 2.0}
+                               "bore_diameter": r["shaft"]["output_diameter_mm"] + 2.0,
+                               # room per side for outside screw lugs on the cover joint (envelope minus box)
+                               "flange_allow_mm": [round(max(0.0, (req.env_w - env["width"]) / 2.0), 2),
+                                                   round(max(0.0, (req.env_h - env["height"]
+                                                                   - (goal_engine.BREATHER_H_MM if overall_d and goal_engine else 0.0)) / 2.0), 2)]}
         r["materials"] = {"gear": req.gear_material, "housing": req.housing_material}
         try:
             plan = shaft_plan({**r, "housing_params": {k: v for k, v in r["housing_params"].items()
@@ -635,6 +639,11 @@ def _generate(req: Requirements, n: int, goals: dict | None, ambient_c: float, o
         from .evidence import EVIDENCE
         for r in variants:
             r["evidence"] = EVIDENCE["variants"]
+            # every factor behind S_F and S_H, with formula, source and basis (research 7 Nov: "I need
+            # individual factors out as a check")
+            from physics.gear_report import factor_report, to_markdown
+            r["factor_report"] = factor_report(req, r["design"])
+            r["factor_report"]["export_markdown"] = to_markdown(r["factor_report"])
     except Exception:
         pass
     out = {"variants": variants, "diagnostics": diagnostics, "suggestions": [goal_note] if goal_note else [],

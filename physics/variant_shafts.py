@@ -193,7 +193,12 @@ def shaft_plan(variant, input_rpm=None):
     L = _layout_for(variant, hp_final)
     hp_final["boss_area_mm2"] = round(boss_extra_area_mm2(L), 1)
     # cover screws + dowels sized by the bolted-joint solver (Tahap 1.1)
-    joints, joints_ok = design_cover_joints(L, [(g["x"], g["tip"] / 2.0) for g in L["gears"]], mat)
+    bosses = [(float(L["shafts"][i]["x"]), max(ods) / 2.0 + max(4.0, 0.12 * max(ods)))
+              for i, ods in enumerate(hp_final["bearing_ods"]) if ods]
+    allow = hp_final.get("flange_allow_mm") or [0.0, 0.0]
+    joints, joints_ok = design_cover_joints(L, [(g["x"], g["tip"] / 2.0) for g in L["gears"]], mat, bosses,
+                                            (float(allow[0]), float(allow[1])))
+    hp_final["lug_mm"] = [max([0.0] + [r.get("lug_protrusion_mm", [0, 0])[k] for r in joints.values()]) for k in (0, 1)]
     for r in joints.values():
         r["cover"] = {"thickness_mm": tc, "corner_screw_span_mm": round(span, 1), "oring_lift_mm": round(defl, 3),
                       "allowed_lift_mm": round(0.1 * 2.62, 3), "basis": "edge strip (wall + lip) as a fixed-fixed beam "

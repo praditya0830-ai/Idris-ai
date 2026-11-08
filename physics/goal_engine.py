@@ -235,8 +235,9 @@ def assembly_bbox(variant):
     hp = variant["housing_params"]
     sf, sb = hp.get("stickout_mm") or (SHAFT_STICKOUT_MM, SHAFT_STICKOUT_MM)
     top = BREATHER_H_MM if hp.get("stickout_mm") else 0.0      # v4 breather plug on top
-    return {"min": [0.0, 0.0, -float(sf)],
-            "max": [float(hp["envelope_width"]), float(hp["envelope_height"]) + top,
+    px, py = (hp.get("lug_mm") or [0.0, 0.0])[:2]               # outside screw lugs at the cover joint (v5)
+    return {"min": [-float(px), -float(py), -float(sf)],
+            "max": [float(hp["envelope_width"]) + float(px), float(hp["envelope_height"]) + max(top, float(py)),
                     float(hp["envelope_depth"]) + float(sb)]}
 
 
@@ -244,7 +245,9 @@ def envelope_fit(variant, envelope, basis):
     """Solver-side envelope verdict so the UI never has to recompute it (v0.11.1).
     housing = the housing box (bosses, plugs and shaft ends excluded); overall = everything in the STL."""
     hp = variant["housing_params"]
-    hb = [float(hp["envelope_width"]), float(hp["envelope_height"]), float(hp["envelope_depth"])]
+    px, py = (hp.get("lug_mm") or [0.0, 0.0])[:2]
+    hb = [round(float(hp["envelope_width"]) + 2 * float(px), 2), round(float(hp["envelope_height"]) + 2 * float(py), 2),
+          float(hp["envelope_depth"])]
     bb = assembly_bbox(variant)
     ob = [round(bb["max"][i] - bb["min"][i], 1) for i in range(3)]
     env = [float(e) for e in envelope]
