@@ -7,7 +7,7 @@ CUT = ('{"intent":"set_params|ask","answer":"Berikut beberapa hal yang perlu dip
 
 def test_cut_off_reply_is_salvaged_not_shown_raw(monkeypatch):
     monkeypatch.setattr(llm, "call_provider", lambda *a, **k: (CUT, "test-model"))
-    res = llm.discuss("nvidia", "gearbox 15 kW, 6000 rpm input, ratio 8:1", {}, [], None, {})
+    res = llm.discuss("nvidia", "gearbox 15 kW, 6000 rpm input, ratio 8:1", {}, [], None, {}, "auto")
     assert not res["answer"].lstrip().startswith("{") and '"intent"' not in res["answer"]
     assert res["answer"].startswith("Berikut beberapa hal")
     assert res["intent"] == "discuss" and res["language"] == "id"

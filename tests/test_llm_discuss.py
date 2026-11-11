@@ -72,7 +72,7 @@ BAIT = [  # QA kerangka 3.11 — (question, invented reply, honest reply)
 def test_q018_bait_questions_flag_invented_numbers():
     for q, invented, honest in BAIT:
         _with_reply({"intent": "discuss", "language": "id", "answer": invented, "actions": []})
-        r = llm.interpret(None, q, None, [], "B", CTX)
+        r = llm.interpret(None, q, None, [], "B", CTX, "auto")
         assert r["numbers_verified"] is False and r["unverified_numbers"], (q, r)
         assert "belum berasal dari solver" in r["answer"]
         _with_reply({"intent": "discuss", "language": "id", "answer": honest, "actions": []})
@@ -115,6 +115,18 @@ def test_plain_text_answer_is_kept_and_checked():
     os.environ.update(GEMINI_API_KEY="g", IDRIS_LLM_ORDER="gemini")
     llm.call_provider = lambda prov, system, user, max_tokens=500: (
         "Oil cooler tidak punya data massa di solver; mungkin sekitar 1,5 kg.", "fake")
-    r = llm.interpret(None, "Berapa beratnya kalau pakai oil cooler?", None, [], "B", CTX)
+    r = llm.interpret(None, "Berapa beratnya kalau pakai oil cooler?", None, [], "B", CTX, "auto")
     assert r["mode"] == "discussion" and r["actions"] == []
     assert r["unverified_numbers"] == [1.5] and "belum berasal dari solver" in r["answer"]
+
+
+def test_default_reply_is_english_even_for_indonesian():
+    real = llm.call_provider
+    llm.call_provider = lambda prov, system, user, max_tokens=500, timeout=None: (
+        json.dumps({"intent": "discuss", "answer": "Oli jadi 95 °C.", "actions": []}), "fake")
+    try:
+        os.environ.setdefault("GEMINI_API_KEY", "x")
+        r = llm.interpret(None, "Kalau sirip 20 mm, oli jadi berapa °C?", None, [], "B", CTX)
+        assert r["language"] == "en" and "did not come from the solver" in r["answer"]
+    finally:
+        llm.call_provider = real
