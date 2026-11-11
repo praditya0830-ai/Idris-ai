@@ -236,7 +236,7 @@ def test_slow_first_ai_falls_through_to_next_and_reports_all(monkeypatch):
 
     def fake(prov, system, user, max_tokens=500, timeout=None):
         timeouts.append(timeout)
-        if prov == "gemini":
+        if prov.startswith("gemini"):
             raise llm.LLMError("could not reach the AI provider (TimeoutError)")
         return json.dumps(GOOD), "nemotron"
     monkeypatch.setattr(llm, "call_provider", fake)
@@ -246,3 +246,77 @@ def test_slow_first_ai_falls_through_to_next_and_reports_all(monkeypatch):
     monkeypatch.setattr(llm, "call_provider", lambda *a, **k: (_ for _ in ()).throw(llm.LLMError("HTTP 429 quota")))
     r = cg.generate(MSG)
     assert not r["ok"] and "gemini: HTTP 429" in r["answer"] and "nvidia: HTTP 429" in r["answer"]
+
+
+def test_busy_gemini_falls_to_next_model_then_second_chance(monkeypatch):
+    """v0.30.2: HTTP 503 on one model -> the next model is asked; overloaded models get one more turn at the end."""
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setenv("IDRIS_CAD_ORDER", "gemini")
+    monkeypatch.setenv("IDRIS_MODEL_GEMINI", "g-a,g-b")
+    monkeypatch.setenv("IDRIS_LLM_RETRY_SLEEP", "0")
+    seen = []
+
+    def fake(prov, system, user, max_tokens=500, timeout=None):
+        seen.append(prov)
+        if prov == "gemini:g-a":
+            raise llm.LLMError("provider returned HTTP 503: high demand", http=503)
+        return json.dumps(GOOD), "g-b"
+    monkeypatch.setattr(llm, "call_provider", fake)
+    r = cg.generate(MSG)
+    assert r["ok"] and r["cad"]["read_by"] == "gemini (g-b)" and seen == ["gemini:g-a", "gemini:g-b"]
+
+    seen.clear()
+    state = {"n": 0}
+
+    def flaky(prov, system, user, max_tokens=500, timeout=None):
+        seen.append(prov)
+        state["n"] += 1
+        if state["n"] <= 2:
+            raise llm.LLMError("provider returned HTTP 503: high demand", http=503)
+        return json.dumps(GOOD), prov.split(":")[1]
+    monkeypatch.setattr(llm, "call_provider", flaky)
+    r = cg.generate(MSG)
+    assert r["ok"] and seen == ["gemini:g-a", "gemini:g-b", "gemini:g-a"]
+
+
+def test_all_busy_message_blames_the_service_not_the_sentence(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setenv("NVIDIA_API_KEY", "x")
+    monkeypatch.setenv("IDRIS_CAD_ORDER", "gemini,nvidia")
+    monkeypatch.setenv("IDRIS_LLM_RETRY_SLEEP", "0")
+
+    def down(prov, system, user, max_tokens=500, timeout=None):
+        if prov.startswith("gemini"):
+            raise llm.LLMError("provider returned HTTP 503: high demand", http=503)
+        raise llm.LLMError("could not reach the AI provider (TimeoutError)")
+    monkeypatch.setattr(llm, "call_provider", down)
+    r = cg.generate(MSG)
+    assert not r["ok"] and "not caused by your sentence" in r["answer"]
+    assert "gemini: provider returned HTTP 503" in r["answer"] and "3 models tried" in r["answer"]
+
+
+def test_nvidia_honours_the_callers_time_limit_and_cad_model_order(monkeypatch):
+    got = {}
+    monkeypatch.setenv("NVIDIA_API_KEY", "x")
+    monkeypatch.delenv("IDRIS_MODEL_NVIDIA", raising=False)
+    monkeypatch.delenv("IDRIS_MODEL_NVIDIA_CAD", raising=False)
+
+    def post(url, headers, body, timeout=25.0):
+        got["timeout"], got["model"] = timeout, body["model"]
+        return {"choices": [{"message": {"content": "{}"}}]}
+    monkeypatch.setattr(llm, "_post", post)
+    llm.call_provider("nvidia:" + llm.cad_models_for("nvidia")[0], "s", "u", 500, timeout=30)
+    assert got["timeout"] == 30 and got["model"] == "openai/gpt-oss-20b"
+    monkeypatch.setenv("IDRIS_MODEL_NVIDIA", "a/b")
+    assert llm.cad_models_for("nvidia") == ["a/b"]
+    monkeypatch.setenv("IDRIS_MODEL_NVIDIA_CAD", "c/d,e/f")
+    assert llm.cad_models_for("nvidia") == ["c/d", "e/f"]
+
+
+def test_door_key_is_not_a_machine_key():
+    from physics import parts_library as lib
+    assert lib.match_sentence("design a door key 60 mm long") is None
+    assert lib.match_sentence("a keychain tag 40 mm") is None
+    assert lib.match_sentence("parallel key shaft 20 length 32")[0] == "parallel_key"
+    assert lib.match_sentence("pasak poros 20 panjang 32")[0] == "parallel_key"
