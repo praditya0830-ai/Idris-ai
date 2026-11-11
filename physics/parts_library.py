@@ -342,6 +342,13 @@ def match_sentence(msg: str):
         if any(hit(w) for w in TEMPLATES[cand]["words"]):
             tid = cand
             break
+    if tid == "parallel_key" and not any(hit(w) for w in TEMPLATES[tid]["words"] if w != "key"):
+        # "key" alone is also a door key, a hex key, a keychain: a machine key needs a shaft-side word next to it
+        if re.search(r"door|pintu|house|rumah|car |mobil|motor|hex key|allen|keychain|key chain|gantungan|keyboard|keycap|"
+                     r"key holder|key ring|keyring|piano", m):
+            tid = None
+        elif not re.search(r"parallel|feather|shaft|keyway|machine key|din\s?6885|poros|welle|hub|b\s?=|\d+\s?x\s?\d+", m):
+            tid = None
     if not tid:
         return None
     q = {}
