@@ -208,3 +208,41 @@ def test_parts_not_in_library_go_to_cad_and_open_gearbox_is_safe():
     assert not cg.looks_like_object_request("make the cover thicker", has_gearbox=True)
     assert not cg.looks_like_object_request("ganti seal", has_gearbox=True)
     assert cg.looks_like_object_request("design a phone holder", has_gearbox=True)
+
+
+def test_gemini_thinking_level_sent_and_dropped_on_400(monkeypatch):
+    seen = []
+
+    def fake_post(url, headers, body, timeout=25.0):
+        seen.append(body["generationConfig"].get("thinkingConfig"))
+        if body["generationConfig"].get("thinkingConfig"):
+            raise llm.LLMError("provider returned HTTP 400: unknown field thinkingLevel", http=400)
+        return {"candidates": [{"content": {"parts": [{"text": "hidden", "thought": True}, {"text": '{"ok": true}'}]}}]}
+    monkeypatch.setattr(llm, "_post", fake_post)
+    llm._GEMINI_NO_THINKING_CFG.clear()
+    d = llm._gemini_post("https://x/models/m:generateContent", "k", {"generationConfig": {}}, 10)
+    assert llm._gemini_text(d) == '{"ok": true}'
+    assert seen == [{"thinkingLevel": "low"}, None]
+    llm._gemini_post("https://x/models/m:generateContent", "k", {"generationConfig": {}}, 10)
+    assert seen[-1] is None and len(seen) == 3                    # remembered: not sent again
+    llm._GEMINI_NO_THINKING_CFG.clear()
+
+
+def test_slow_first_ai_falls_through_to_next_and_reports_all(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setenv("NVIDIA_API_KEY", "x")
+    monkeypatch.setenv("IDRIS_CAD_ORDER", "gemini,nvidia")
+    timeouts = []
+
+    def fake(prov, system, user, max_tokens=500, timeout=None):
+        timeouts.append(timeout)
+        if prov == "gemini":
+            raise llm.LLMError("could not reach the AI provider (TimeoutError)")
+        return json.dumps(GOOD), "nemotron"
+    monkeypatch.setattr(llm, "call_provider", fake)
+    r = cg.generate(MSG)
+    assert r["ok"] and r["cad"]["read_by"].startswith("nvidia") and max(timeouts) <= 45
+    assert r["attempts"][0]["provider"] == "gemini"
+    monkeypatch.setattr(llm, "call_provider", lambda *a, **k: (_ for _ in ()).throw(llm.LLMError("HTTP 429 quota")))
+    r = cg.generate(MSG)
+    assert not r["ok"] and "gemini: HTTP 429" in r["answer"] and "nvidia: HTTP 429" in r["answer"]
