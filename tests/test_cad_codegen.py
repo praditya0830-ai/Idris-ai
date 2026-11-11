@@ -191,3 +191,20 @@ def test_holes_are_validated_against_catalog():
     assert not errs and len(cad["holes"]) == 3
     assert [h["catalog_ok"] for h in cad["holes"]] == [True, False, True]
     assert any("not the ISO 273 clearance for M4" in w for w in warns) and any("hole 4 dropped" in w for w in warns)
+
+
+def test_free_form_design_requests_route_to_cad():
+    for q in ("Buatkan aku design kunci", "Buatkan aku design frame sepeda", "design a bottle opener", "bikin desain asbak"):
+        assert cg.looks_like_object_request(q), q
+    for q in ("buat lebih ringan", "make it stronger", "buat gearbox 5 kW", "design 3 kW 3000 rpm"):
+        assert not cg.looks_like_object_request(q), q
+    nums = cg.message_numbers("29 inch, 20 inch, 135 mm")
+    assert {736.6, 508.0, 135.0} <= nums
+
+
+def test_parts_not_in_library_go_to_cad_and_open_gearbox_is_safe():
+    for q in ("circlip 10 mm", "dowel pin 6x20", "spur gear module 2 20 teeth", "shaft 20 mm panjang 100"):
+        assert cg.looks_like_object_request(q), q
+    assert not cg.looks_like_object_request("make the cover thicker", has_gearbox=True)
+    assert not cg.looks_like_object_request("ganti seal", has_gearbox=True)
+    assert cg.looks_like_object_request("design a phone holder", has_gearbox=True)
