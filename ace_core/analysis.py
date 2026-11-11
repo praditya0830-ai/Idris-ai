@@ -71,7 +71,20 @@ def _review_result(env):
             "solve_time_s": o["solve_time_s"], **_common(env, o)}
 
 
+def _part_result(env):
+    o = env["outputs"]
+    return {"surface": o["surface"], "yield_mpa": o["yield_mpa"], "mesh": o["mesh"], "material": o["material"],
+            "solve_time_s": o["solve_time_s"], "applied_loads": o["applied_loads"], "reaction_n": o["reaction_N"],
+            "summary": {"max_von_mises_mpa": o["max_von_mises_MPa"], "von_mises_p995_mpa": o["von_mises_p995_MPa"],
+                        "max_displacement_mm": o["max_displacement_mm"], "min_safety_factor": o["min_safety_factor"],
+                        "margin_of_safety": o["margin_of_safety"], "factor_of_safety": o["design_factor"],
+                        "mass_kg": o["mass_kg"]},
+            "volume": o["volume"], "equilibrium_error": o["equilibrium_error"],
+            "mesh_convergence": o.get("mesh_convergence"), **_common(env, o)}
+
+
 ANALYSES = {
+    "/part-check": {"solver": "fea_part_3d", "adapt": _part_result},
     "/fea": {"solver": "fea_housing_3d", "adapt": _fea_result},
     "/modal": {"solver": "modal_housing_3d", "adapt": _modal_result},
     "/cfd": {"solver": "thermal_housing_3d", "adapt": _thermal_result},
