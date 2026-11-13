@@ -275,8 +275,18 @@ PART_WORDS = ("kubus", "cube", "box", "balok", "block", "silinder", "cylinder", 
 GEAR_WORDS = ("gear", "gearbox", "roda gigi", "reducer", "rasio", "ratio", "kw", "rpm", "torsi", "torque")
 
 
+# A primitive word inside a real design request is not a primitive: "pillow block bearing housing", "engine block",
+# "ball bearing holder", "pipe clamp". Those go to the CAD designer, not to the box/cylinder builder.
+NOT_PRIMITIVE = re.compile(
+    r"pillow|plummer|engine block|terminal block|block bearing|bearing|bantalan|laher|housing|rumah|bracket|braket|"
+    r"holder|dudukan|clamp|klem|mount|slot|flange|flens|\brib|rusuk|fillet|chamfer|thread|ulir|hinge|engsel|"
+    r"cent(?:re|er) height|\bfor an? \b|\buntuk\b")
+
+
 def looks_like_part_request(msg: str) -> bool:
     m = (msg or "").lower()
+    if NOT_PRIMITIVE.search(m):
+        return False
     return any(re.search(rf"\b{w}\b", m) for w in PART_WORDS) and not any(w in m for w in GEAR_WORDS)
 
 

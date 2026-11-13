@@ -96,6 +96,24 @@ const R = id / 2 + w / 2;
 const body = draw([R + w / 2, 0]).threePointsArcTo([R - w / 2, 0], [R, w / 2]).threePointsArcTo([R + w / 2, 0], [R, -w / 2])
   .close().sketchOnPlane('XZ').revolve();
 return { body };""",
+    "plow_blade": """const { W, H, c, t, dr, tr, ce_h, ce_t } = P;
+// Welded snow plow blade, side profile drawn in XZ (x = travel direction, z = up), width along Y.
+// Moldboard = rolled sheet (circular arc, concave face forward); ribs = plates on the back; cutting edge = flat bar.
+const R = (H * H / 4 + c * c) / (2 * c);            // mid-surface radius from chord H and sagitta c
+const a = Math.asin(H / (2 * R));                   // half angle of the arc
+const xc = R - c, zc = H / 2;                       // arc centre
+const pt = (r, f) => [xc - r * Math.cos(f), zc + r * Math.sin(f)];
+const sector = (r1, r2, y, len) => draw(pt(r1, -a)).threePointsArcTo(pt(r1, a), pt(r1, 0)).lineTo(pt(r2, a))
+  .threePointsArcTo(pt(r2, -a), pt(r2, 0)).close().sketchOnPlane('XZ', y).extrude(len);
+const Ri = R - t / 2, Ro = R + t / 2;
+let body = sector(Ri, Ro, 0, W);                    // moldboard
+const n = Math.max(2, Math.round(W / 600) + 1);     // ribs about every 600 mm
+for (let i = 0; i < n; i++) body = body.fuse(sector(R, Ro + dr, i * (W - tr) / (n - 1), tr));
+const b = pt(Ri, -a), drop = ce_h / 3;              // cutting edge: on the front of the bottom edge, 1/3 below it
+const edge = draw([b[0] - t / 2, -drop]).lineTo([b[0] - t / 2 + ce_t, -drop]).lineTo([b[0] - t / 2 + ce_t, ce_h - drop])
+  .lineTo([b[0] - t / 2, ce_h - drop]).close().sketchOnPlane('XZ', 0).extrude(W);
+body = body.fuse(edge);
+return { body };""",
     "spacer": """const { OD, ID, L } = P;
 let body = makeCylinder(OD / 2, L, [0, 0, 0], [0, 0, 1]);
 if (ID > 0) body = body.cut(makeCylinder(ID / 2, L + 2, [0, 0, -1], [0, 0, 1]));
@@ -130,11 +148,105 @@ TEMPLATES = {
                      "category": "bearings", "words": ("bearing", "laher", "lager", "łożysko")},
     "parallel_key": {"name": "Parallel key (form A)", "name_id": "Pasak", "standard": "DIN 6885",
                      "category": "shaft", "words": ("key", "pasak", "spie", "wpust")},
+    "plow_blade": {"name": "Snow plow blade (welded)", "name_id": "Bilah bajak salju (las)", "standard": None,
+                   "category": "weldments", "words": ("snow plow", "snowplow", "snow plough", "plow blade", "plough blade",
+                                                     "bajak salju", "schneepflug", "pług")},
     "o_ring": {"name": "O-ring", "name_id": "O-ring", "standard": "ISO 3601-1", "category": "seals",
                "words": ("o-ring", "oring", "o ring", "seal ring")},
     "spacer": {"name": "Spacer / sleeve", "name_id": "Spacer / bus", "standard": None, "category": "general",
                "words": ("spacer", "sleeve", "bushing", "bus ", "standoff")},
 }
+
+
+# Welded snow plow blade: one parametric family. W (working width) is the only input IDRIS must be given.
+PLOW_INPUTS = {   # k: (label, min, max, default)
+    "W": ("Working width (mm)", 1000, 4500, None),
+    "H": ("Blade height, chord (mm)", 400, 1500, 900),
+    "c": ("Curl depth of the moldboard (mm)", 40, 400, None),      # default 0.18 H
+    "t": ("Moldboard sheet thickness (mm)", 3, 12, 6),
+    "dr": ("Rib depth (mm)", 40, 300, 120),
+    "tr": ("Rib plate thickness (mm)", 4, 20, 8),
+    "ce_h": ("Cutting edge height (mm)", 80, 250, 150),
+    "ce_t": ("Cutting edge thickness (mm)", 8, 30, 16),
+}
+STEEL_RHO = 7850.0      # kg/m3, structural steel (EN 10025 S235/S355)
+
+
+def plow_geometry(v: dict) -> dict:
+    """Exact geometry of the plow blade family from its 8 dimensions (mm). No strength numbers."""
+    W, H, c, t, dr, tr, ce_h, ce_t = (v[k] for k in ("W", "H", "c", "t", "dr", "tr", "ce_h", "ce_t"))
+    R = (H * H / 4 + c * c) / (2 * c)
+    a = math.asin(H / (2 * R))
+    Ri, Ro = R - t / 2, R + t / 2
+    n = max(2, round(W / 600) + 1)
+    xb = (R - c) - Ri * math.cos(a)                       # front face at the bottom end
+    drop = ce_h / 3
+    x_min, x_max = -(c + t / 2 + dr), xb - t / 2 + ce_t
+    z_min, z_max = -drop, H / 2 + (Ro + dr) * math.sin(a)
+    dev = 2 * a * R                                       # developed length of the sheet (neutral axis at mid-thickness)
+    v_sheet = 2 * a * R * t * W                           # = a (Ro^2 - Ri^2) W
+    v_rib = a * ((Ro + dr) ** 2 - Ro ** 2) * tr           # part of one rib outside the sheet
+    v_edge = ce_h * ce_t * W
+    mass = STEEL_RHO * (v_sheet + n * v_rib + v_edge) * 1e-9
+    return {"R": R, "half_angle_deg": math.degrees(a), "ribs": n, "rib_pitch": (W - tr) / (n - 1),
+            "bbox": {"x": x_max - x_min, "y": W, "z": z_max - z_min}, "developed_length": dev,
+            "mass_kg": mass,
+            "cut_list": [
+                {"item": "Moldboard sheet", "qty": 1, "size": f"{W:g} x {dev:.0f} x {t:g} mm (flat blank, rolled to R {R:.0f})",
+                 "mass_kg": round(STEEL_RHO * v_sheet * 1e-9, 2)},
+                {"item": "Rib plate", "qty": n, "size": f"arc segment {dr:g} deep x {tr:g} mm, inner R {Ro:.0f}",
+                 "mass_kg": round(STEEL_RHO * v_rib * 1e-9, 2)},
+                {"item": "Cutting edge flat bar", "qty": 1, "size": f"{W:g} x {ce_h:g} x {ce_t:g} mm",
+                 "mass_kg": round(STEEL_RHO * v_edge * 1e-9, 2)}]}
+
+
+def _resolve_plow(q: dict) -> dict:
+    errs, vals, given = [], {}, set()
+    for k, (lab, lo, hi, dv) in PLOW_INPUTS.items():
+        raw = q.get(k)
+        if raw in (None, ""):
+            vals[k] = dv
+            continue
+        try:
+            x = float(str(raw).replace(",", "."))
+        except ValueError:
+            errs.append(f"{lab}: {raw!r} is not a number")
+            continue
+        if not lo <= x <= hi:
+            errs.append(f"{lab} must be between {lo:g} and {hi:g} (got {x:g})")
+        vals[k] = x
+        given.add(k)
+    if errs:
+        return {"ok": False, "missing": [], "errors": errs}
+    if vals["W"] is None:
+        return {"ok": False, "errors": [],
+                "missing": [{"k": "W", "question": "Working width of the blade in mm (1000 to 4500)?"}]}
+    if vals["c"] is None:
+        vals["c"] = round(0.18 * vals["H"], 1)
+    if vals["c"] > 0.45 * vals["H"]:
+        return {"ok": False, "missing": [], "errors": [f"curl depth {vals['c']:g} mm is more than 45 % of the height "
+                                                       f"{vals['H']:g} mm: the sheet would be bent past a half circle"]}
+    g = plow_geometry(vals)
+    params = [{"k": k, "label": PLOW_INPUTS[k][0].split(" (")[0], "label_id": PLOW_INPUTS[k][0].split(" (")[0],
+               "unit": "mm", "value": round(vals[k], 4), "min": PLOW_INPUTS[k][1], "max": PLOW_INPUTS[k][2],
+               "source": "user" if k in given else "default"} for k in PLOW_INPUTS]
+    b = g["bbox"]
+    cad = {"title": f"Snow plow blade {vals['W']:g} mm", "kind": "functional", "process": "weld", "material": "steel",
+           "params": params, "code": CODE["plow_blade"],
+           "expect": [{"label": "Working width", "axis": "y", "value": round(b["y"], 3), "tol": 0.5, "from_param": "W"},
+                      {"label": "Overall height", "axis": "z", "value": round(b["z"], 3), "tol": 1.0},
+                      {"label": "Overall depth", "axis": "x", "value": round(b["x"], 3), "tol": 1.0}],
+           "missing": [], "variants": [], "holes": [], "read_by": "IDRIS library (parametric weldment)",
+           "library": {"id": "plow_blade", "standard": None, "parametric": True,
+                       "sources": {"dims": "engineer's input and IDRIS defaults (shown per parameter)",
+                                   "geometry": "circular arc from chord H and sagitta c: R = (H²/4 + c²) / (2c)",
+                                   "mass": f"steel {STEEL_RHO:g} kg/m³ x volume of sheet, ribs and cutting edge"},
+                       "ribs": g["ribs"], "rib_pitch": round(g["rib_pitch"], 1), "radius": round(g["R"], 1),
+                       "developed_length": round(g["developed_length"], 1), "mass_kg": round(g["mass_kg"], 1),
+                       "cut_list": g["cut_list"]},
+           "note": ("Strength is NOT checked: a welded sheet structure needs shell FEA with the real plowing load, "
+                    "which IDRIS does not have yet. Mounting frame, trip springs and weld sizes are not modelled.")}
+    return {"ok": True, "cad": cad}
 
 
 def catalog_index() -> list:
@@ -166,6 +278,9 @@ def inputs_for(tid: str) -> list:
         return [{"k": "code", "label": "ISO 3601 size code", "type": "choice", "options": list(O_RINGS)[:400]},
                 {"k": "id", "label": "or: inner diameter (mm) - nearest size", "type": "number", "min": 0.5, "max": 700},
                 {"k": "w", "label": "cross-section (mm), optional", "type": "number", "min": 0.5, "max": 10}]
+    if tid == "plow_blade":
+        return [{"k": k, "label": lab, "type": "number", "min": lo, "max": hi, **({"default": dv} if dv is not None else {})}
+                for k, (lab, lo, hi, dv) in PLOW_INPUTS.items()]
     return [{"k": "OD", "label": "Outer diameter (mm)", "type": "number", "min": 1, "max": 500},
             {"k": "ID", "label": "Inner diameter (mm, 0 = solid)", "type": "number", "min": 0, "max": 490},
             {"k": "L", "label": "Length (mm)", "type": "number", "min": 0.5, "max": 1000}]
@@ -180,6 +295,8 @@ def resolve(tid: str, q: dict) -> dict:
     """q = engineer's choices -> {ok, cad | missing | errors}. Returns the `cad` contract (UI v55)."""
     if tid not in TEMPLATES:
         return {"ok": False, "errors": [f"unknown part {tid!r}; see GET /library"]}
+    if tid == "plow_blade":
+        return _resolve_plow(q)
     t = TEMPLATES[tid]
     errs, missing, params, expect, holes, extra = [], [], [], [], [], {}
     src = {}
@@ -332,6 +449,8 @@ def match_sentence(msg: str):
     """'baut M6 panjang 20', 'socket head M5x16', 'mur M8', 'bearing 6205', 'pasak poros 20 panjang 32',
     'o-ring id 20' -> (template id, query) or None."""
     m = " " + (msg or "").lower().replace("×", "x") + " "
+    if any(w in m for w in TEMPLATES["plow_blade"]["words"]):
+        return "plow_blade", _plow_query(m)
     # a part designed AROUND a standard part ("bushing for bearing 608", "holder for M6 nut") is not a library part
     if re.search(r"(?<![a-z])(holder|dudukan|bracket|braket|housing|cover|tutup|adapter|adaptor|mount|bushing|standoff|"
                  r"klem|clamp|enclosure|kotak|untuk|for|für|dla)(?![a-z])", m):
@@ -382,8 +501,50 @@ def match_sentence(msg: str):
     return tid, q
 
 
+_LEN = r"(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?(?![a-z])"
+
+
+def _mm(num: str, unit: str | None, bare_small_is_m: bool = False) -> float:
+    x = float(num.replace(",", "."))
+    if unit == "m" or (unit is None and bare_small_is_m and x < 10):
+        return x * 1000
+    return x * 10 if unit == "cm" else x
+
+
+def _plow_query(m: str) -> dict:
+    """'snow plow blade 2.4 m wide, 900 high, sheet 6 mm' -> {W, H, t}. Only what the sentence says."""
+    q = {}
+    keys = (("W", r"(?:working width|width|wide|lebar|breite|szeroko\w*)", True),
+            ("H", r"(?:height|high|tall|tinggi|höhe|wysoko\w*)", True),
+            ("t", r"(?:thickness|thick|tebal|sheet|plat|blech)", False))
+    for k, words, small_m in keys:
+        hit = (re.search(words + r"\D{0,12}?" + _LEN, m) or re.search(_LEN + r"\s*(?:of\s+)?" + words, m))
+        if hit:
+            q[k] = f"{_mm(hit.group(1), hit.group(2), small_m):g}"
+    if "W" not in q:                       # "snow plow blade 3000 mm": the one large length is the width
+        big = [_mm(a, u, True) for a, u in re.findall(_LEN, m)]
+        big = [x for x in big if x >= 1000 and f"{x:g}" not in q.values()]
+        if len(big) == 1:
+            q["W"] = f"{big[0]:g}"
+    return q
+
+
 def chat_answer(tid: str, r: dict) -> str:
     t = TEMPLATES[tid]
+    if tid == "plow_blade" and r.get("ok"):
+        c = r["cad"]
+        lib = c["library"]
+        dflt = [p for p in c["params"] if p["source"] == "default"]
+        lines = [f"{c['title']} from the IDRIS library (parametric welded part). The browser builds the model; "
+                 "change any size, for example the working width, and it rebuilds.",
+                 "From you: " + (", ".join(f"{p['label']} {p['value']:g} mm" for p in c["params"] if p["source"] == "user")),
+                 ("IDRIS defaults (change them freely): " + ", ".join(f"{p['label']} {p['value']:g} mm" for p in dflt))
+                 if dflt else "",
+                 f"Result: {lib['ribs']} ribs every {lib['rib_pitch']:g} mm, moldboard radius {lib['radius']:g} mm, "
+                 f"mass about {lib['mass_kg']:g} kg (steel).",
+                 "Cut list: " + "; ".join(f"{x['qty']} x {x['item']} {x['size']}" for x in lib["cut_list"]) + ".",
+                 c["note"]]
+        return "\n".join(x for x in lines if x)
     if r.get("ok"):
         c = r["cad"]
         lib = c["library"]
