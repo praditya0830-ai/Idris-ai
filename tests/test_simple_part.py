@@ -63,3 +63,12 @@ def test_ai_failure_falls_back_to_builtin(monkeypatch):
     monkeypatch.setattr(llm, "call_provider", boom)
     r = design_from_message("kubus 30 mm", OUT, "d", lambda m: llm.parse_part(m))
     assert r["ok"] and "AI failed" in r["read_by"] and r["results"]["volume_mm3"] == 27000.0
+
+
+def test_pillow_block_is_a_design_request_not_a_block():
+    """v0.31.1: a primitive word inside a real design sentence must not start the box builder."""
+    from physics.simple_part import looks_like_part_request as lp
+    assert not lp("Design a pillow block bearing housing for a 6205 bearing, base 130 × 38 mm, cast iron")
+    assert not lp("engine block 300 mm") and not lp("ball bearing holder 40 mm") and not lp("pipe clamp 30 mm")
+    for plain in ("kubus 50 mm", "block 100 × 60 × 20 mm", "tabung d40 lubang 20 tinggi 60", "plate 100x50x5 with 4 holes"):
+        assert lp(plain), plain

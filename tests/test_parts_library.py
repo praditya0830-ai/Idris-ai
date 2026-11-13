@@ -6,7 +6,7 @@ from physics import parts_library as L
 
 
 def test_every_template_resolves_with_clean_code():
-    q = {"size": "M6", "length": "20", "designation": "6205", "shaft_d": "20", "id": "20", "OD": "10", "ID": "5", "L": "15"}
+    q = {"size": "M6", "length": "20", "designation": "6205", "shaft_d": "20", "id": "20", "OD": "10", "ID": "5", "L": "15", "W": "2400"}
     for tid in L.TEMPLATES:
         r = L.resolve(tid, q)
         assert r["ok"], (tid, r)
@@ -52,3 +52,47 @@ def test_follow_up_answers():
     assert L.follow_up("baut", "M8 x 30", [{"k": "size"}]) == ("hex_bolt", {"size": "M8", "length": "30"})
     assert L.follow_up("socket head M5", "16", [{"k": "length"}]) == ("socket_head_cap_screw", {"size": "M5", "length": "16"})
     assert L.follow_up("holder hp", "9", [{"k": "T"}]) is None
+
+
+def test_plow_blade_geometry_is_exact_and_width_is_a_parameter():
+    """Weldment family: numbers are closed-form geometry, checked here against an independent calculation."""
+    r = L.resolve("plow_blade", {"W": 2400})
+    assert r["ok"]
+    c = r["cad"]
+    lib = c["library"]
+    assert c["process"] == "weld" and c["kind"] == "functional" and "NOT checked" in c["note"]
+    # H 900, c 162 -> R = (900^2/4 + 162^2) / (2*162) = 706 mm exactly
+    assert math.isclose(lib["radius"], 706.0, abs_tol=0.05) and lib["ribs"] == 5
+    a = math.asin(900 / (2 * 706.0))
+    assert math.isclose(lib["developed_length"], 2 * a * 706.0, abs_tol=0.06)
+    # independent mass: annulus-sector areas by the r2^2 - r1^2 form
+    sheet = a * (709.0 ** 2 - 703.0 ** 2) * 2400
+    rib = a * (829.0 ** 2 - 709.0 ** 2) * 8
+    edge = 150 * 16 * 2400
+    assert math.isclose(lib["mass_kg"], 7850e-9 * (sheet + 5 * rib + edge), abs_tol=0.06)
+    assert math.isclose(sum(x["qty"] * x["mass_kg"] for x in lib["cut_list"]), lib["mass_kg"], abs_tol=0.1)
+    exp = {e["axis"]: e["value"] for e in c["expect"]}
+    assert exp["y"] == 2400 and math.isclose(exp["z"], 50 + 450 + 829.0 * 900 / 1412.0, abs_tol=0.01)
+    # a wider blade: same family, more ribs, heavier; only W changed
+    c2 = L.resolve("plow_blade", {"W": 3000})["cad"]
+    assert c2["code"] == c["code"] and c2["library"]["ribs"] == 6 and c2["library"]["mass_kg"] > lib["mass_kg"]
+    w = [p for p in c2["params"] if p["k"] == "W"][0]
+    assert (w["value"], w["min"], w["max"], w["source"]) == (3000, 1000, 4500, "user")
+    assert [p["source"] for p in c2["params"] if p["k"] == "H"] == ["default"]
+
+
+def test_plow_blade_limits_and_questions():
+    assert L.resolve("plow_blade", {})["missing"][0]["k"] == "W"
+    assert "between 1000 and 4500" in L.resolve("plow_blade", {"W": 9000})["errors"][0]
+    assert "half circle" in L.resolve("plow_blade", {"W": 2400, "H": 600, "c": 300})["errors"][0]
+
+
+def test_plow_blade_from_a_sentence():
+    assert L.match_sentence("snow plow blade 2.4 m wide for a pickup truck") == ("plow_blade", {"W": "2400"})
+    assert L.match_sentence("bilah bajak salju lebar 3000 mm tinggi 800 tebal 5 mm") == (
+        "plow_blade", {"W": "3000", "H": "800", "t": "5"})
+    assert L.match_sentence("Design a snow plow blade 3200 mm") == ("plow_blade", {"W": "3200"})
+    assert L.match_sentence("a snow plow blade")[1] == {}
+    tid, q = L.follow_up("a snow plow blade", "2800", [{"k": "W"}])
+    assert (tid, q) == ("plow_blade", {"W": "2800"})
+    assert "rebuilds" in L.chat_answer("plow_blade", L.resolve(tid, q)) and "Cut list" in L.chat_answer("plow_blade", L.resolve(tid, q))
