@@ -320,3 +320,23 @@ def test_door_key_is_not_a_machine_key():
     assert lib.match_sentence("a keychain tag 40 mm") is None
     assert lib.match_sentence("parallel key shaft 20 length 32")[0] == "parallel_key"
     assert lib.match_sentence("pasak poros 20 panjang 32")[0] == "parallel_key"
+
+
+def test_repair_keeps_which_sizes_came_from_the_engineer(monkeypatch):
+    """v0.31.3: after an automatic fix the design tree showed the engineer's 60/30/5 as 'default'."""
+    fixed = json.loads(json.dumps(GOOD))
+    fixed["params"] = [{"k": "PH", "label": "Plate height", "unit": "mm", "value": 60, "min": 40, "max": 120},
+                       {"k": "t", "label": "Thickness", "unit": "mm", "value": 5, "min": 3, "max": 10},
+                       {"k": "Lh", "label": "Arm reach", "unit": "mm", "value": 35, "min": 20, "max": 60}]
+    fixed["code"] = "const { PH, t, Lh } = P;\nconst body = makeBaseBox(Lh, t, PH);\nreturn { body };"
+    fixed["expect"] = []
+    _fake(monkeypatch, [fixed])
+    ctx = {"cad_error": {"attempt": 1, "error": "Cannot read properties of undefined (reading 'firstPoint')",
+                         "code": "x", "params": [{"k": "H", "value": 60, "source": "user"},
+                                                 {"k": "t", "value": 5, "source": "user"},
+                                                 {"k": "Lh", "value": 35, "source": "default"}]}}
+    r = cg.generate("", ctx)
+    assert r["ok"], r
+    src = {p["k"]: p["source"] for p in r["cad"]["params"]}
+    assert src["PH"] == "user" and src["t"] == "user" and src["Lh"] != "user"
+    assert "From you" in r["answer"]
