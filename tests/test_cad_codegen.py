@@ -340,3 +340,45 @@ def test_repair_keeps_which_sizes_came_from_the_engineer(monkeypatch):
     src = {p["k"]: p["source"] for p in r["cad"]["params"]}
     assert src["PH"] == "user" and src["t"] == "user" and src["Lh"] != "user"
     assert "From you" in r["answer"]
+
+
+def test_wrong_shaped_answers_never_crash_the_request(monkeypatch):
+    """14 Nov, live: complex requests ended in HTTP 500 'chat failed' and 502. An AI answer with a list sent as an
+    object, or code sent as a list of lines, raised inside validate() and nothing caught it."""
+    import copy
+    base = json.loads(json.dumps(GOOD))
+    shapes = [("variants", {"Sturdy": {"params": {}}}), ("variants", 7), ("params", {"L": {"label": "Length", "value": 40}}),
+              ("missing", {}), ("holes", True), ("expect", {"a": 1}), ("code", ["const { L } = P;", "return { body };"]),
+              ("code", 3.5), ("title", ["x"]), ("material", {"a": 1}), ("kind", []), ("note", {"x": 1}),
+              ("requirements", {"loads": {"force_N": [0, 0, -5]}, "supports": 4})]
+    for k, v in shapes:
+        raw = copy.deepcopy(base)
+        raw[k] = v
+        cad, errs, warns = cg.validate(raw, MSG)                      # must return, whatever the verdict
+        assert cad is not None or errs
+    raw = copy.deepcopy(base)
+    raw["variants"] = {"Sturdy": {"params": {}}, "Slim": {"params": {}}}
+    cad, errs, warns = cg.validate(raw, MSG)
+    assert not errs and any("wrong shape" in w for w in warns)
+
+
+def test_an_unreadable_answer_is_a_rejected_answer_not_a_crash(monkeypatch):
+    _fake(monkeypatch, [GOOD, GOOD])
+    real = cg.validate
+    state = {"n": 0}
+
+    def boom(raw, message=""):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise TypeError("'float' object is not subscriptable")
+        return real(raw, message)
+    monkeypatch.setattr(cg, "validate", boom)
+    r = cg.generate(MSG)
+    assert r["ok"] and "could not read the answer (TypeError" in r["attempts"][0]["error"]
+
+
+def test_faults_are_reported_not_hidden():
+    import os
+    src = open(os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8").read()
+    assert src.count('"detail": _fault(e)') >= 2                      # /chat and /cad/try say what failed and where
+    assert '"error": "cad/try failed"' in src
