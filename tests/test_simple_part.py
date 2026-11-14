@@ -72,3 +72,17 @@ def test_pillow_block_is_a_design_request_not_a_block():
     assert not lp("engine block 300 mm") and not lp("ball bearing holder 40 mm") and not lp("pipe clamp 30 mm")
     for plain in ("kubus 50 mm", "block 100 × 60 × 20 mm", "tabung d40 lubang 20 tinggi 60", "plate 100x50x5 with 4 holes"):
         assert lp(plain), plain
+
+
+def test_long_design_briefs_are_never_primitives():
+    """14 Nov, live: a welded table frame 'from 40 x 40 x 2 mm square tube' was read as a tube and IDRIS asked for a diameter."""
+    from physics.simple_part import looks_like_part_request as lp
+    assert not lp("Design a welded steel table frame 1200 × 600 mm, height 750 mm, from 40 × 40 × 2 mm square tube, "
+                  "with a lower shelf frame 150 mm above the floor and levelling feet M10")
+    assert not lp("Design a modular fixture plate 250 × 250 × 20 mm, M6 threaded holes on a 25 mm grid, two 8 mm dowel "
+                  "holes in opposite corners, aluminium 6061")
+    assert not lp("a plate that carries the motor and the two bearings and the belt tensioner and also the sensor and "
+                  "the cable chain and the cover and the label")
+    for plain in ("kubus 50 mm", "block 100 × 60 × 20 mm", "tabung d40 lubang 20 tinggi 60", "plate 100x50x5 with 4 holes",
+                  "pipa diameter luar 60 diameter dalam 50 panjang 200 baja"):
+        assert lp(plain), plain
