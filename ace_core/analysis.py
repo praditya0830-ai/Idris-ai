@@ -83,7 +83,23 @@ def _part_result(env):
             "mesh_convergence": o.get("mesh_convergence"), **_common(env, o)}
 
 
+def _weldment_result(env):
+    o = env["outputs"]
+    return {"surface": o["surface"], "yield_mpa": o["yield_mpa"], "mesh": o["mesh"], "material": o["steel"],
+            "solve_time_s": o["solve_time_s"], "applied_loads": o["applied_loads"], "reaction_n": o["reaction_N"],
+            "supports": o["supports"], "dimensions_mm": o["dimensions_mm"],
+            "summary": {"max_von_mises_mpa": o["max_von_mises_MPa"], "von_mises_p99_mpa": o["von_mises_p99_MPa"],
+                        "max_von_mises_sheet_mpa": o["max_von_mises_sheet_MPa"],
+                        "max_von_mises_ribs_mpa": o["max_von_mises_ribs_MPa"],
+                        "max_displacement_mm": o["max_displacement_mm"], "min_safety_factor": o["min_safety_factor"],
+                        "safety_factor_p99": o["safety_factor_p99"], "margin_of_safety": o["margin_of_safety"],
+                        "factor_of_safety": o["design_factor"], "mass_kg": o["mass_kg"]},
+            "equilibrium_error": o["equilibrium_error"], "mesh_convergence": o.get("mesh_convergence"),
+            **_common(env, o)}
+
+
 ANALYSES = {
+    "/weldment-check": {"solver": "fea_plow_blade", "adapt": _weldment_result},
     "/part-check": {"solver": "fea_part_3d", "adapt": _part_result},
     "/fea": {"solver": "fea_housing_3d", "adapt": _fea_result},
     "/modal": {"solver": "modal_housing_3d", "adapt": _modal_result},
