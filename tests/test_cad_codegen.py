@@ -382,3 +382,36 @@ def test_faults_are_reported_not_hidden():
     src = open(os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8").read()
     assert src.count('"detail": _fault(e)') >= 2                      # /chat and /cad/try say what failed and where
     assert '"error": "cad/try failed"' in src
+
+
+def test_unlisted_material_is_named_not_silently_replaced():
+    """14 Nov, live: a cast iron brake disc got steel density (7.85) without a word: mass about 9 % too high."""
+    raw = json.loads(json.dumps(GOOD))
+    raw["material"] = "steel"
+    cad, errs, warns = cg.validate(raw, MSG + ", cast iron")
+    assert not errs and any("Cast iron is not in the IDRIS material list" in w and "steel" in w for w in warns)
+    cad, errs, warns = cg.validate(json.loads(json.dumps(GOOD)), MSG)
+    assert not any("material list" in w for w in warns)
+
+
+def test_concepts_are_written_in_parallel_and_keep_the_user_sizes(monkeypatch):
+    import threading
+    seen, lock = [], threading.Lock()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("IDRIS_CAD_ORDER", "claude")
+
+    def fake(prov, system, user, max_tokens=500, timeout=None):
+        with lock:
+            seen.append(user)
+        if "THIS concept: Broken" in user:
+            return "not json at all", "m"
+        return json.dumps(GOOD), "m"
+    monkeypatch.setattr(llm, "call_provider", fake)
+    r = cg.generate_concepts(MSG, [{"name": "Gusset", "idea": "a"}, {"name": "Channel", "idea": "b"},
+                                   {"name": "Broken", "idea": "c"}])
+    assert r["ok"] and [c["ok"] for c in r["concepts"]] == [True, True, False]
+    assert r["concepts"][0]["cad"]["title"] == "Gusset" and r["concepts"][1]["cad"]["concept"]["name"] == "Channel"
+    assert "IDRIS designed 2 concepts" in r["answer"] and "Not built: Broken" in r["answer"]
+    assert sum("THIS concept: Gusset" in u for u in seen) == 1
+    for c in r["concepts"][:2]:
+        assert [p["source"] for p in c["cad"]["params"]] == [p["source"] for p in cg.validate(GOOD, MSG)[0]["params"]]

@@ -33,7 +33,7 @@ def test_the_three_sentences_that_failed_on_14_nov_go_to_the_designer(monkeypatc
         seen = _ai(monkeypatch, {"route": "free_design", "library_id": None, "query": {}, "reason": "custom part"})
         r = rt.route(s)
         assert r["route"] == "free_design" and r["read_by"] == "claude (claude-haiku-5-5)"
-        assert s[:40] in seen["user"] and seen["max_tokens"] <= 300 and seen["timeout"] <= 15      # a short, cheap call
+        assert s[:40] in seen["user"] and seen["max_tokens"] <= 500 and seen["timeout"] <= 15      # a short, cheap call
         assert "spur_gear" in seen["system"] and "W = Working width" in seen["system"]
 
 
@@ -75,3 +75,13 @@ def test_main_uses_the_router_before_the_keyword_rules():
     chat = src[src.index('if base == "/chat":'):]
     assert chat.index("cad_router.route(") < chat.index("plib.match_sentence(msg)") < chat.index("self._chat_cad(msg, ctx")
     assert "if not (gear_ctx or cad_ctx):" in chat                            # follow-ups and repairs skip the router
+
+
+def test_free_design_brings_three_concepts_without_numbers(monkeypatch):
+    _ai(monkeypatch, {"route": "free_design", "concepts": [
+        {"name": "L-bracket with gusset", "idea": "bent plate with a 45 deg gusset"},
+        {"name": "U-channel", "idea": "channel section, 3 mm walls"},
+        {"name": "Ribbed plate 2", "idea": "flat plate with ribs"}, {"name": "u-channel", "idea": "dup"}, "junk"]})
+    r = rt.route("Design a shelf bracket 150 x 100 mm, 3 mm steel, two M6 holes")
+    assert [c["name"] for c in r["concepts"]] == ["L-bracket with gusset", "U-channel", "Ribbed plate"]
+    assert not any(ch.isdigit() for c in r["concepts"] for ch in c["idea"])    # no size can travel from the AI's idea
