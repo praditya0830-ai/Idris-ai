@@ -114,6 +114,34 @@ const edge = draw([b[0] - t / 2, -drop]).lineTo([b[0] - t / 2 + ce_t, -drop]).li
   .lineTo([b[0] - t / 2, ce_h - drop]).close().sketchOnPlane('XZ', 0).extrude(W);
 body = body.fuse(edge);
 return { body };""",
+    "spur_gear": """const { m, z, alpha, b, bore, kw, kt, hub_d, hub_l } = P;
+// Involute spur gear, ISO 53 basic rack (addendum 1 m, dedendum 1.25 m). Flanks are true involutes drawn as
+// short straight segments. Gear axis = Z, tooth 0 centred on +X, gear face on z = 0, hub on top.
+const a = alpha * Math.PI / 180;
+const rp = m * z / 2, rb = rp * Math.cos(a), ra = rp + m, rf = rp - 1.25 * m;
+const inv = (x) => Math.tan(x) - x;
+const half = Math.PI / (2 * z) + inv(a);
+const r0 = Math.max(rb, rf), n = 6;
+const flank = [];
+if (rf < rb) flank.push([rf, half]);
+for (let i = 0; i <= n; i++) {
+  const r = r0 + (ra - r0) * i / n;
+  flank.push([r, half - inv(Math.acos(Math.min(1, rb / r)))]);
+}
+const back = flank.slice().reverse();
+const pts = [];
+for (let k = 0; k < z; k++) {
+  const c = 2 * Math.PI * k / z;
+  for (const f of flank) pts.push([f[0] * Math.cos(c - f[1]), f[0] * Math.sin(c - f[1])]);
+  for (const f of back) pts.push([f[0] * Math.cos(c + f[1]), f[0] * Math.sin(c + f[1])]);
+}
+let pen = draw(pts[0]);
+for (let i = 1; i < pts.length; i++) pen = pen.lineTo(pts[i]);
+let body = pen.close().sketchOnPlane('XY').extrude(b);
+if (hub_l > 0) body = body.fuse(makeCylinder(hub_d / 2, hub_l, [0, 0, b]));
+if (bore > 0) body = body.cut(makeCylinder(bore / 2, b + hub_l + 2, [0, 0, -1]));
+if (kw > 0) body = body.cut(makeBox([-kw / 2, 0, -1], [kw / 2, bore / 2 + kt, b + hub_l + 1]));
+return { body };""",
     "spacer": """const { OD, ID, L } = P;
 let body = makeCylinder(OD / 2, L, [0, 0, 0], [0, 0, 1]);
 if (ID > 0) body = body.cut(makeCylinder(ID / 2, L + 2, [0, 0, -1], [0, 0, 1]));
@@ -151,11 +179,129 @@ TEMPLATES = {
     "plow_blade": {"name": "Snow plow blade (welded)", "name_id": "Bilah bajak salju (las)", "standard": None,
                    "category": "weldments", "words": ("snow plow", "snowplow", "snow plough", "plow blade", "plough blade",
                                                      "bajak salju", "schneepflug", "pług")},
+    "spur_gear": {"name": "Spur gear (involute)", "name_id": "Roda gigi lurus (involut)", "standard": "ISO 53 / ISO 54",
+                  "category": "gears", "words": ("spur gear", "involute gear", "roda gigi lurus", "stirnrad")},
     "o_ring": {"name": "O-ring", "name_id": "O-ring", "standard": "ISO 3601-1", "category": "seals",
                "words": ("o-ring", "oring", "o ring", "seal ring")},
     "spacer": {"name": "Spacer / sleeve", "name_id": "Spacer / bus", "standard": None, "category": "general",
                "words": ("spacer", "sleeve", "bushing", "bus ", "standoff")},
 }
+
+
+# Involute spur gear. ISO 54 gives the preferred modules; ISO 53 the basic rack (alpha 20 deg, ha = m, hf = 1.25 m).
+ISO54_MODULES = (0.5, 0.6, 0.8, 1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10)
+GEAR_INPUTS = {   # k: (label, min, max, default)
+    "m": ("Module (mm)", 0.5, 10, None),
+    "z": ("Number of teeth", 9, 150, None),
+    "alpha": ("Pressure angle (deg)", 14.5, 25, 20),
+    "b": ("Face width (mm)", 1, 200, None),
+    "bore": ("Bore diameter (mm), 0 = solid", 0, 150, 0),
+    "hub_d": ("Hub diameter (mm)", 0, 300, 0),
+    "hub_l": ("Hub length beyond the face (mm), 0 = no hub", 0, 200, 0),
+}
+
+
+def gear_geometry(m: float, z: int, alpha_deg: float) -> dict:
+    """Exact involute gear geometry (no profile shift)."""
+    a = math.radians(alpha_deg)
+    d, db = m * z, m * z * math.cos(a)
+    da, df = d + 2 * m, d - 2.5 * m
+    inv = lambda x: math.tan(x) - x
+    half = math.pi / (2 * z) + inv(a)
+    tip_half = half - inv(math.acos(db / da))
+    return {"pitch_d": d, "base_d": db, "tip_d": da, "root_d": df, "circular_pitch": math.pi * m,
+            "tooth_thickness_pitch": math.pi * m / 2, "tip_thickness": da * tip_half,
+            "z_min_no_undercut": 2 / math.sin(a) ** 2, "tip_half_angle": tip_half}
+
+
+def _resolve_gear(q: dict) -> dict:
+    errs, vals, given, missing = [], {}, set(), []
+    for k, (lab, lo, hi, dv) in GEAR_INPUTS.items():
+        raw = q.get(k)
+        if raw in (None, ""):
+            vals[k] = dv
+            if dv is None:
+                missing.append({"k": k, "question": f"{lab.split(' (')[0]}?" + (
+                    " Preferred (ISO 54): " + ", ".join(f"{x:g}" for x in ISO54_MODULES) if k == "m" else "")})
+            continue
+        try:
+            x = float(str(raw).replace(",", "."))
+        except ValueError:
+            errs.append(f"{lab}: {raw!r} is not a number")
+            continue
+        if not lo <= x <= hi:
+            errs.append(f"{lab.split(' (')[0]} must be between {lo:g} and {hi:g} (got {x:g})")
+        vals[k] = x
+        given.add(k)
+    if errs:
+        return {"ok": False, "missing": [], "errors": errs}
+    if missing:
+        return {"ok": False, "errors": [], "missing": missing}
+    if vals["z"] != int(vals["z"]):
+        return {"ok": False, "missing": [], "errors": ["the number of teeth must be a whole number"]}
+    m, z, al, b, bore, hub_d, hub_l = (vals[k] for k in ("m", "z", "alpha", "b", "bore", "hub_d", "hub_l"))
+    z = int(z)
+    g = gear_geometry(m, z, al)
+    kw = kt = 0.0
+    key_txt = None
+    want_key = str(q.get("keyway") or "").lower() in ("1", "true", "yes", "on") or q.get("keyway") is True
+    if want_key:
+        if bore <= 0:
+            errs.append("a keyway needs a bore")
+        else:
+            row = next((r for r in KEY_DIN6885 if bore <= r[0]), None)
+            if not row or bore <= 6:
+                errs.append(f"DIN 6885 has no key for a bore of {bore:g} mm (table covers over 6 up to {KEY_DIN6885[-1][0]:g} mm)")
+            else:
+                kw, kt = float(row[1]), float(row[4])
+                key_txt = f"keyway {kw:g} wide, {kt:g} deep in the hub (DIN 6885-1 for a shaft of {bore:g} mm)"
+                asked = q.get("key_width")
+                if asked not in (None, "") and abs(float(asked) - kw) > 1e-6:
+                    errs.append(f"DIN 6885 gives a {kw:g} mm key for a {bore:g} mm shaft, not {float(asked):g} mm")
+    if g["tip_thickness"] <= 0.2 * m:
+        errs.append(f"with {z} teeth at {al:g} deg the tooth tip is pointed ({g['tip_thickness']:.2f} mm): use more teeth")
+    if bore > 0 and bore / 2 + kt + m > g["root_d"] / 2:
+        errs.append(f"bore {bore:g} mm{' with its keyway' if kt else ''} leaves less than one module of rim under the "
+                    f"teeth (root diameter {g['root_d']:.2f} mm)")
+    if hub_l > 0 and hub_d <= bore + 2 * kt + 2:
+        errs.append(f"hub diameter {hub_d:g} mm is too small for the bore{' and keyway' if kt else ''}: needs more than "
+                    f"{bore + 2 * kt + 2:g} mm")
+    if hub_l > 0 and hub_d <= 0:
+        errs.append("a hub length needs a hub diameter")
+    if errs:
+        return {"ok": False, "missing": [], "errors": errs}
+    notes = []
+    if abs(min(ISO54_MODULES, key=lambda x: abs(x - m)) - m) > 1e-9:
+        notes.append(f"module {m:g} is not an ISO 54 preferred module ({', '.join(f'{x:g}' for x in ISO54_MODULES)}): "
+                     "cutters may be hard to find")
+    if z < g["z_min_no_undercut"]:
+        notes.append(f"{z} teeth is below {g['z_min_no_undercut']:.0f}, the limit for undercut at {al:g} deg without "
+                     "profile shift: a cut gear would have undercut roots, which this model does not show")
+    full = {"m": m, "z": z, "alpha": al, "b": b, "bore": bore, "kw": kw, "kt": kt, "hub_d": hub_d if hub_l > 0 else 0.0,
+            "hub_l": hub_l}
+    lab = {"m": "Module", "z": "Teeth", "alpha": "Pressure angle", "b": "Face width", "bore": "Bore", "kw": "Keyway width",
+           "kt": "Keyway depth in hub", "hub_d": "Hub diameter", "hub_l": "Hub length"}
+    params = [{"k": k, "label": lab[k], "label_id": lab[k], "unit": "deg" if k == "alpha" else ("" if k == "z" else "mm"),
+               "value": round(float(v), 4), "min": round(float(v), 4), "max": round(float(v), 4),
+               "source": "table" if k in ("kw", "kt") and kw else ("user" if k in given else "default")}
+              for k, v in full.items()]
+    expect = [{"label": "Total length (face + hub)", "axis": "z", "value": round(b + hub_l, 3), "tol": 0.05}]
+    if z % 2 == 0:
+        expect.append({"label": "Tip diameter", "axis": "x", "value": round(g["tip_d"] * math.cos(g["tip_half_angle"]), 3), "tol": 0.05})
+    cad = {"title": f"Spur gear m{m:g} z{z}", "kind": "functional", "process": "cnc", "material": "steel",
+           "params": params, "code": CODE["spur_gear"], "expect": expect, "missing": [], "variants": [], "holes": [],
+           "read_by": "IDRIS library (ISO 53 involute)",
+           "library": {"id": "spur_gear", "standard": "ISO 53:1998 basic rack, ISO 54:1996 modules" + (", DIN 6885-1 keyway" if kw else ""),
+                       "sources": {"geometry": "d = m z, da = d + 2 m, df = d - 2.5 m, db = d cos(alpha); involute flanks",
+                                   **({"keyway": SOURCES["din6885"]} if kw else {})},
+                       "pitch_d": round(g["pitch_d"], 4), "tip_d": round(g["tip_d"], 4), "root_d": round(g["root_d"], 4),
+                       "base_d": round(g["base_d"], 4), "circular_pitch": round(g["circular_pitch"], 4),
+                       "tooth_thickness_pitch": round(g["tooth_thickness_pitch"], 4),
+                       "tip_thickness": round(g["tip_thickness"], 3), "keyway": key_txt, "notes": notes},
+           "note": ("Geometry only: no profile shift, no tip relief, no root fillet (the root is a sharp corner here; a "
+                    "cut gear has a fillet). Tooth strength is NOT checked for a single gear: IDRIS rates a gear PAIR "
+                    "to ISO 6336 in the gearbox workflow. Flanks are involutes drawn with 6 straight segments each.")}
+    return {"ok": True, "cad": cad}
 
 
 # Welded snow plow blade: one parametric family. W (working width) is the only input IDRIS must be given.
@@ -244,8 +390,12 @@ def _resolve_plow(q: dict) -> dict:
                        "ribs": g["ribs"], "rib_pitch": round(g["rib_pitch"], 1), "radius": round(g["R"], 1),
                        "developed_length": round(g["developed_length"], 1), "mass_kg": round(g["mass_kg"], 1),
                        "cut_list": g["cut_list"]},
-           "note": ("Strength is NOT checked: a welded sheet structure needs shell FEA with the real plowing load, "
-                    "which IDRIS does not have yet. Mounting frame, trip springs and weld sizes are not modelled.")}
+           "note": ("Strength is NOT checked yet: run the weldment check (shell FEA) with your own loads, a pressure "
+                    "on the blade and/or a force on the cutting edge. IDRIS does not guess snow loads. Mounting frame, "
+                    "trip springs and weld sizes are not modelled.")}
+    cad["library"]["check"] = {"endpoint": "POST /weldment-check", "loads": ["pressure_kPa", "edge_force_N", "edge_zone_mm"],
+                               "options": ["steel (S235 | S355)", "mount_ribs", "mount_z_mm", "design_factor",
+                                           "max_deflection_mm", "element_size_mm", "convergence_study"]}
     return {"ok": True, "cad": cad}
 
 
@@ -278,6 +428,10 @@ def inputs_for(tid: str) -> list:
         return [{"k": "code", "label": "ISO 3601 size code", "type": "choice", "options": list(O_RINGS)[:400]},
                 {"k": "id", "label": "or: inner diameter (mm) - nearest size", "type": "number", "min": 0.5, "max": 700},
                 {"k": "w", "label": "cross-section (mm), optional", "type": "number", "min": 0.5, "max": 10}]
+    if tid == "spur_gear":
+        return [{"k": k, "label": lab, "type": "number", "min": lo, "max": hi, **({"default": dv} if dv is not None else {})}
+                for k, (lab, lo, hi, dv) in GEAR_INPUTS.items()] + [
+            {"k": "keyway", "label": "Keyway to DIN 6885 (needs a bore)", "type": "boolean", "default": False}]
     if tid == "plow_blade":
         return [{"k": k, "label": lab, "type": "number", "min": lo, "max": hi, **({"default": dv} if dv is not None else {})}
                 for k, (lab, lo, hi, dv) in PLOW_INPUTS.items()]
@@ -297,6 +451,8 @@ def resolve(tid: str, q: dict) -> dict:
         return {"ok": False, "errors": [f"unknown part {tid!r}; see GET /library"]}
     if tid == "plow_blade":
         return _resolve_plow(q)
+    if tid == "spur_gear":
+        return _resolve_gear(q)
     t = TEMPLATES[tid]
     errs, missing, params, expect, holes, extra = [], [], [], [], [], {}
     src = {}
@@ -451,6 +607,10 @@ def match_sentence(msg: str):
     m = " " + (msg or "").lower().replace("×", "x") + " "
     if any(w in m for w in TEMPLATES["plow_blade"]["words"]):
         return "plow_blade", _plow_query(m)
+    if (any(w in m for w in TEMPLATES["spur_gear"]["words"]) or (re.search(r"\bgear\b|roda gigi", m) and re.search(
+            r"\bmodul", m) and re.search(r"teeth|tooth|gigi\b|z\s*=", m))) and not re.search(
+            r"gearbox|reducer|reduksi|ratio|rasio|stage|planet|worm|bevel|helical|rack\b|pump", m):
+        return "spur_gear", _gear_query(m)
     # a part designed AROUND a standard part ("bushing for bearing 608", "holder for M6 nut") is not a library part
     if re.search(r"(?<![a-z])(holder|dudukan|bracket|braket|housing|cover|tutup|adapter|adaptor|mount|bushing|standoff|"
                  r"klem|clamp|enclosure|kotak|untuk|for|für|dla)(?![a-z])", m):
@@ -529,8 +689,53 @@ def _plow_query(m: str) -> dict:
     return q
 
 
+def _gear_query(m: str) -> dict:
+    """'spur gear, module 2, 32 teeth, 20 degree pressure angle, face width 15 mm, bore 12 mm with a 4 mm keyway and
+    a hub 30 mm diameter, 10 mm long' -> the query for _resolve_gear. Only what the sentence says."""
+    n = r"(\d+(?:[.,]\d+)?)"
+    q = {}
+
+    def grab(k, *pats, text=m):
+        for pat in pats:
+            hit = re.search(pat, text)
+            if hit:
+                q[k] = next(g for g in hit.groups() if g).replace(",", ".")
+                return True
+        return False
+    grab("m", r"modul\w*\s*(?:of\s*|=\s*)?" + n, r"\bm\s*=?\s*" + n + r"\b(?!\s*m)")
+    grab("z", r"(\d+)\s*(?:teeth|tooth|gigi\b|zähne)", r"\bz\s*=?\s*(\d+)")
+    grab("alpha", n + r"\s*(?:°|deg\w*|derajat)", r"pressure angle\s*(?:of\s*)?" + n)
+    grab("b", r"(?:face ?width|lebar gigi|lebar muka|zahnbreite|thickness|tebal)\s*(?:of\s*|=\s*)?" + n,
+         n + r"\s*mm\s*(?:face ?width|thick|wide)")
+    grab("bore", r"(?:bore|lubang poros|lubang|bohrung)\s*(?:of\s*|ø\s*|diameter\s*|=\s*)?" + n, n + r"\s*mm\s*bore")
+    hub = re.search(r"\bhub\b|naf|nabe", m)
+    if hub:
+        tail = m[hub.start():]
+        grab("hub_d", n + r"\s*mm\s*(?:diameter|dia\b|ø)", r"(?:diameter|dia|ø)\s*" + n, text=tail)
+        grab("hub_l", n + r"\s*mm\s*(?:long|length|panjang)", r"(?:long|length|panjang)\s*" + n, text=tail)
+    if re.search(r"key ?way|keyseat|alur pasak|passfedernut", m):
+        q["keyway"] = "true"
+        kw = re.search(n + r"\s*mm\s*(?:key ?way|keyseat)|(?:key ?way|alur pasak)\s*(?:of\s*)?" + n, m)
+        if kw:
+            q["key_width"] = next(g for g in kw.groups() if g).replace(",", ".")
+    return q
+
+
 def chat_answer(tid: str, r: dict) -> str:
     t = TEMPLATES[tid]
+    if tid == "spur_gear" and r.get("ok"):
+        c = r["cad"]
+        lib = c["library"]
+        dflt = [p for p in c["params"] if p["source"] == "default" and p["value"]]
+        lines = [f"{c['title']} from the IDRIS library: involute geometry to ISO 53, built by the browser's CAD kernel.",
+                 "From you: " + ", ".join(f"{p['label']} {p['value']:g}{(' ' + p['unit']) if p['unit'] else ''}"
+                                          for p in c["params"] if p["source"] == "user"),
+                 ("IDRIS defaults: " + ", ".join(f"{p['label']} {p['value']:g} {p['unit']}" for p in dflt)) if dflt else "",
+                 f"Gear data: pitch diameter {lib['pitch_d']:g} mm, tip {lib['tip_d']:g}, root {lib['root_d']:g}, base "
+                 f"{lib['base_d']:g}; tooth thickness at the pitch circle {lib['tooth_thickness_pitch']:g} mm.",
+                 ("Standard table: " + lib["keyway"] + ".") if lib["keyway"] else "",
+                 ("Note: " + "; ".join(lib["notes"]) + ".") if lib["notes"] else "", c["note"]]
+        return "\n".join(x for x in lines if x)
     if tid == "plow_blade" and r.get("ok"):
         c = r["cad"]
         lib = c["library"]
