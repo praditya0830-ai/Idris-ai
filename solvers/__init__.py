@@ -15,3 +15,11 @@ from . import bearing_life    # noqa: F401
 from . import mesh_convergence  # noqa: F401
 from . import gear_pair_iso   # noqa: F401
 from . import part_fea        # noqa: F401
+
+try:                                    # new in v0.33; a fault here must not take the other solvers down
+    from . import shell_plate   # noqa: F401
+    SHELL_IMPORT_ERROR = None
+except Exception as _e:                 # pragma: no cover
+    import traceback
+    traceback.print_exc()
+    SHELL_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
