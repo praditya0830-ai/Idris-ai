@@ -280,12 +280,14 @@ GEAR_WORDS = ("gear", "gearbox", "roda gigi", "reducer", "rasio", "ratio", "kw",
 NOT_PRIMITIVE = re.compile(
     r"pillow|plummer|engine block|terminal block|block bearing|bearing|bantalan|laher|housing|rumah|bracket|braket|"
     r"holder|dudukan|clamp|klem|mount|slot|flange|flens|\brib|rusuk|fillet|chamfer|thread|ulir|hinge|engsel|"
-    r"cent(?:re|er) height|\bfor an? \b|\buntuk\b")
+    r"cent(?:re|er) height|\bfor an? \b|\buntuk\b|frame|rangka|table|meja|weld|\blas\b|shelf|\brak\b|feet|\bkaki\b|"
+    r"\bjaw|chuck|fixture|\bgrid\b|dowel|square tube|hollow section|profil|stepped|bertingkat")
+MAX_PRIMITIVE_WORDS = 14          # "plate 100x50x5 with 4 holes" is short; a real design brief is a long sentence
 
 
 def looks_like_part_request(msg: str) -> bool:
     m = (msg or "").lower()
-    if NOT_PRIMITIVE.search(m):
+    if NOT_PRIMITIVE.search(m) or len(re.findall(r"[^\W\d_]{2,}", m)) > MAX_PRIMITIVE_WORDS:
         return False
     return any(re.search(rf"\b{w}\b", m) for w in PART_WORDS) and not any(w in m for w in GEAR_WORDS)
 
