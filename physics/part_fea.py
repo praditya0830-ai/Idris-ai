@@ -40,6 +40,12 @@ MATERIAL_NOTE = ("Typical handbook values for screening; printed plastics depend
                  "direction and temperature (FDM parts are weaker across layers). Use certified data for sign-off.")
 
 
+def material_catalog():
+    """The one material table for the UI selector and the engineering report."""
+    return {"materials": [{"id": key, **row} for key, row in MATERIALS.items()], "note": MATERIAL_NOTE}
+
+
+
 # ------------------------------------------------------------------ geometry input
 def triangles_from_stl(data: bytes) -> np.ndarray:
     if len(data) >= 84:
