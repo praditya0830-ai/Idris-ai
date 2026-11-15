@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime output: STL parts, STEP files, BOM CSVs, drawings
+generated/
+
+# Local secrets (LLM keys are read from the environment, never committed)
+.env
+.env.*
+!.env.example
