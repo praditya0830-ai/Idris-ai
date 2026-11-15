@@ -67,7 +67,10 @@ def test_verify_page_is_non_blocking():
     code, body = handle_get("/verify?refresh=1")
     assert code == 200 and body["status"] in ("running", "done")
     assert time.time() - t0 < 1.0
-    for _ in range(300):
+    # /verify runs every solver benchmark; on a slow 2-vCPU box that is over a minute.
+    # The contract under test is "the first call does not block" (asserted above), so allow
+    # the background run a generous budget instead of a machine-speed-dependent 30 s.
+    for _ in range(1800):
         code, body = handle_get("/verify")
         if body["status"] == "done":
             break
