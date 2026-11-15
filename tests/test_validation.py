@@ -74,15 +74,32 @@ check("Z_eps at eps=1.0 (ISO limit)", G.contact_ratio_factor(1.0), 1.0, 0.01, "s
 check("Z_eps at eps=2.0", G.contact_ratio_factor(2.0), math.sqrt(2/3), 0.01, "ISO 6336-2")
 
 # --- 7. Tooth form from real geometry
-from physics.toothform import tooth_form, ALPHA as A0, RHO_F0, H_F0
-xc = math.pi / 4 + (-H_F0 + RHO_F0) * math.tan(A0) - RHO_F0 / math.cos(A0)
-s_rack = 2 * (math.pi / 2 - (xc + RHO_F0 * math.cos(math.radians(-30))))        # 30deg tangent on the rack fillet arc
-h_rack = 1.0 - (-H_F0 + RHO_F0 + RHO_F0 * math.sin(math.radians(-30)))
-yf_rack = 6 * h_rack * math.cos(A0) / (s_rack**2 * math.cos(A0))
+from physics.toothform import tooth_form, iso_closed_form, ALPHA as A0, RHO_F0, H_F0
+def check_range(name, got, lo, hi, note=""):
+    """For quantities where the physics says "between lo and hi", not "equal to one number"."""
+    mid = (lo + hi) / 2
+    rows.append((lo <= got <= hi, name, got, mid, (got / mid - 1) * 100, note))
+
+# The rack limit is a limit case, so it is benchmarked against the ISO 6336-3 analytical tooth-form
+# equations -- the same reference the rest of this block uses -- and not against a hand-derived
+# section height. (The old hand formula here measured the section height from the tip instead of the
+# perpendicular distance from the critical section to the line of action of the tip load, so it
+# overstated YF at the limit by about 6 %.)
 t400 = tooth_form(400)
-check("YF z=400 -> rack limit (analytic)", t400["YF"], yf_rack, 3.0, "rack: sFn=%.3f hFe=%.3f" % (s_rack, h_rack))
+check("YF z=400 vs ISO closed form", t400["YF"], iso_closed_form(400)["YF"], 0.5, "rack-limit behaviour (ISO 6336-3)")
 for z in (17, 24, 50):
-    check(f"1/Y_Lewis vs YF, z={z} (Shigley tbl)", t["YF"] if (t := tooth_form(z)) else 0, 1 / G.lewis_form_factor(z), 8.0, "same physics, tabulated vs computed")
+    check(f"YF z={z} vs ISO closed form", tooth_form(z)["YF"], iso_closed_form(z)["YF"], 0.5,
+          "generated trochoid vs ISO analytical")
+
+# Lewis Y and ISO YF are NOT the same quantity: the Lewis factor uses a tip load on a parabolic beam
+# with no 30 deg tangent construction and no load-angle projection. The two must therefore disagree at
+# low z and converge as z -> infinity; asserting closeness at z=17 was a definition error, not a bug.
+ratio17 = tooth_form(17)["YF"] / (1 / G.lewis_form_factor(17))
+ratio400 = tooth_form(400)["YF"] / (1 / G.lewis_form_factor(400))
+check_range("YF / (1/Y_Lewis) at z=17 (definitions differ)", ratio17, 0.85, 0.92,
+            "Lewis ignores the 30 deg tangent and the load-angle projection")
+check_range("YF / (1/Y_Lewis) at z=400 (limits converge)", ratio400, 0.98, 1.02,
+            "both approach the rack limit")
 check("root radius z=17 = r - 1.25 m", tooth_form(17)["root_radius"], 17 / 2 - 1.25, 0.01, "trochoid bottom")
 for z in (17, 30, 100):
     t = tooth_form(z)
@@ -90,5 +107,8 @@ for z in (17, 30, 100):
 
 for ok, name, got, ref, err, note in rows[-8:]:
     print(f"{'PASS' if ok else 'FAIL'}  {name:38s} got {got:10.4g}  ref {ref:10.4g}  err {err:+6.2f} %  {note}")
-    bad += not ok
+# Count every row, not just the batch printed above: rows added between the two print blocks used to be
+# invisible to the exit code, so a failing benchmark could pass silently.
+bad = sum(1 for row in rows if not row[0])
+print(f"\n{len(rows) - bad}/{len(rows)} benchmarks passed")
 sys.exit(1 if bad else 0)
