@@ -1,1 +1,55 @@
-.github/workflows/tests.yml
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fast:
+    name: Fast solver + API tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      # cadquery-ocp is optional: the OCCT tests exercise the documented fallback path.
+      - run: pip install numpy scipy pytest
+      - name: pytest (fast subset)
+        run: |
+          pytest -q \
+            tests/test_iso6336.py \
+            tests/test_routes.py \
+            tests/test_references.py \
+            tests/test_reference_additions.py \
+            tests/test_bearing_life.py \
+            tests/test_gear_report.py \
+            tests/test_design_methods.py \
+            tests/test_variants_mvp.py \
+            tests/test_edit_variant.py \
+            tests/test_catalog.py \
+            tests/test_power_loss.py \
+            tests/test_llm_nvidia.py \
+            tests/test_llm_salvage.py \
+            tests/test_report.py
+
+  full:
+    name: Full suite (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest
+
