@@ -75,6 +75,8 @@ Ini yang sebenarnya menutup daftar "fitur wajib" di analisis fitur — bukan kod
 | `GET /chat/providers`, `/chat/ping?provider=`, `/chat/selftest` | provider AI mana yang aktif + diagnostik | panel setelan AI |
 | `GET /part-view`, `GET /cad/try` | halaman uji part; QA satu kalimat | QA internal |
 | `POST /cad/rank` | peringkat CAD | pelengkap explore |
+| `GET /materials` | tabel material simulator (`E`, `nu`, `Sy`, `rho`) — satu sumber untuk UI dan laporan | dropdown material di tab Simulate |
+| `POST /report` | paket rekayasa HTML siap cetak: requirements, varian, cek, analisis, review, BOM, bukti solver → print to PDF | tombol **Export PDF** |
 
 ## 4. Pemetaan rekomendasi → endpoint yang sudah ada
 
