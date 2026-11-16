@@ -119,24 +119,57 @@ def _selftest():
                           "no CAD kernel on this server (cadquery-ocp / OCP not installed): "
                           "solid build, STEP read/write and round-trip were NOT exercised"))
     else:
-        try:
-            shape = kernel.box(40, 20, 3)
-            s = kernel.measure(shape)
-            solid = INV.solid_checks({**s, "degenerate_faces": 0})
-            results.append(_r("kernel.solid_invariants", INV.all_ok(solid), INV.failures(solid) or s))
-            pos, ind = kernel.tessellate(shape)
-            tess = INV.mesh_checks(pos, ind)
-            results.append(_r("kernel.tessellation_closed", INV.all_ok(tess), INV.failures(tess) or len(pos)))
+        # One check per call: a kernel that fails on one operation must not hide the others, and the
+        # detail says which call failed (this is how the Bnd_Box bug was found on the live server).
+        state = {}
+
+        def _run(check_id, fn):
+            try:
+                ok, detail = fn()
+            except Exception as exc:
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            results.append(_r(check_id, ok, detail))
+
+        def shape_fn():
+            if "shape" not in state:
+                state["shape"] = kernel.box(40.0, 20.0, 3.0)
+            return state["shape"]
+
+        def build():
+            s = kernel.measure(shape_fn())
+            state["summary"] = s
+            good = (abs(s["volume_mm3"] - 2400.0) < 24.0
+                    and all(abs(a - b) < 0.01 for a, b in zip(s["bbox_mm"], [40.0, 20.0, 3.0])))
+            return good, s
+
+        def invariants():
+            s = state.get("summary") or kernel.measure(shape_fn())
+            checks = INV.solid_checks({**s, "degenerate_faces": 0})
+            return INV.all_ok(checks), INV.failures(checks) or checks
+
+        def tessellation():
+            pos, ind = kernel.tessellate(shape_fn())
+            checks = INV.mesh_checks(pos, ind)
+            return INV.all_ok(checks), INV.failures(checks) or {"vertices": len(pos),
+                                                               "triangles": len(ind) // 3}
+
+        def step_gate():
             with tempfile.TemporaryDirectory(prefix="idris-st-") as tmp:
-                rt = roundtrip.step_roundtrip(shape, workdir=tmp)
-            results.append(_r("exchange.step_roundtrip", rt["status"] == "ok", rt["diffs"] or rt["before_hash"][:16]))
-            cut = kernel.boolean("cut", shape, kernel.cylinder(4, 10))
+                rt = roundtrip.step_roundtrip(shape_fn(), workdir=tmp)
+            return rt["status"] == "ok", rt["diffs"] or rt["before_hash"][:16]
+
+        def recognition():
+            cut = kernel.boolean("cut", shape_fn(), kernel.cylinder(4.0, 10.0))
             rec = exch_step.candidates_from_counts(exch_step.face_kinds(cut))
-            results.append(_r("exchange.face_recognition", bool(rec["candidates"]),
-                              {"recognised": rec["recognised"], "dumb_solid": rec["dumb_solid"],
-                               "candidates": rec["candidates"]}))
-        except Exception as exc:                        # a kernel that fails is a result too
-            results.append(_r("kernel.available", False, f"{type(exc).__name__}: {exc}"))
+            return bool(rec["candidates"]), {"recognised": rec["recognised"],
+                                             "dumb_solid": rec["dumb_solid"],
+                                             "candidates": rec["candidates"]}
+
+        _run("kernel.build_and_measure", build)
+        _run("kernel.solid_invariants", invariants)
+        _run("kernel.tessellation_closed", tessellation)
+        _run("exchange.step_roundtrip", step_gate)
+        _run("exchange.face_recognition", recognition)
 
     return 200, {"success": True, "pass": all(c["ok"] for c in results), "checks": results,
                  "kernel": kernel.available()}

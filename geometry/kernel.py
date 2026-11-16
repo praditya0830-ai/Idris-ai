@@ -47,9 +47,8 @@ def measure(solid, mass_kg: float | None = None) -> dict:
     BRepGProp.SurfaceProperties_s(solid, area)
     box = Bnd_Box()
     BRepBndLib.Add_s(solid, box)
-    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
     summary = {"volume_mm3": volume, "area_mm2": abs(area.Mass()),
-               "bbox_mm": [xmax - xmin, ymax - ymin, zmax - zmin],
+               "bbox_mm": _extents(box),
                "solids": len(_solids(solid)), "watertight": _is_closed(solid)}
     out = dict(summary)
     if mass_kg is not None:
@@ -67,24 +66,31 @@ def _solids(shape) -> list:
     return out
 
 
-def _is_closed(shape) -> bool:
-    """A solid with no free boundary edges is closed. Free edges == the shell has a hole."""
-    from OCP.TopAbs import TopAbs_EDGE
-    from OCP.TopExp import TopExp_Explorer
-    from OCP.TopoDS import TopoDS
-    from OCP.BRep import BRep_Tool
-    from OCP.TopAbs import TopAbs_FREE
+def _extents(box) -> list:
+    """Bounding box extents. Bnd_Box.Get() returns a struct that OCP cannot convert to a Python tuple
+    (found on the live server), so the corners are used instead."""
+    from OCP.Bnd import Bnd_Box  # noqa: F401  (type only)
+    if box.IsVoid():
+        return [0.0, 0.0, 0.0]
+    lo, hi = box.CornerMin(), box.CornerMax()
+    return [abs(hi.X() - lo.X()), abs(hi.Y() - lo.Y()), abs(hi.Z() - lo.Z())]
 
-    exp = TopExp_Explorer(shape, TopAbs_EDGE)
-    while exp.More():
-        edge = TopoDS.Edge_s(exp.Current())
-        if edge.IsNull():
-            exp.Next()
-            continue
-        BRep_Tool  # noqa: B018  (kept imported for symmetry with other OCP helpers)
-        if exp.Current().Orientation() == TopAbs_FREE:
+
+def _is_closed(shape) -> bool:
+    """Closed == every edge borders exactly two faces. Counted through edge->face ancestry, which is
+    the topological definition; comparing an orientation enum would not answer this question."""
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+
+    ancestors = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, ancestors)
+    n = ancestors.Extent()
+    if n == 0:
+        return False
+    for i in range(1, n + 1):
+        if ancestors.FindFromIndex(i).Extent() < 2:
             return False
-        exp.Next()
     return True
 
 
