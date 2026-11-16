@@ -123,12 +123,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_html(self, status: int, html: str, extra: dict | None = None) -> None:
+    def _send_html(self, status: int, html: str) -> None:
         body = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self._cors_headers()
         self.end_headers()
@@ -183,8 +181,6 @@ class Handler(BaseHTTPRequestHandler):
                     "POST /cad/review": "AI 'eyes': {request, cad, images:[{view, png(base64)}], measurements, round} -> verdict ok | revise (+ improved cad), max 2 rounds",
                     "GET /catalog, /catalog/fastener?size=M6, /catalog/bearings?d_min=8, /catalog/hole?d=5.5": "standard parts (ISO 273 clearance, ISO 261/2306, ISO 4762, ISO 4032, ISO 7089, bearings) with sources",
                     "POST /part-check": "static FEA of any part: {positions, indices | stl_base64, material, supports:[{where}], loads:[{force_N, where}], convergence_study} -> job (poll GET /part-check/<job_id>): von Mises contour, displacement, safety factor",
-                    "GET /materials": "material table for the simulator and reports: id, name, E [MPa], nu, yield [MPa], density [kg/m3]",
-                    "POST /report": "engineering package as print-ready HTML (print to PDF): requirements, variant, checks, analyses, review, BOM, solver evidence",
                     "GET /library, /library/part?id=hex_bolt&size=M6&length=20": "mechanical parts library (ISO 4762/4017/4032/7089, bearings, DIN 6885 keys, ISO 3601 O-rings, spacers): table sizes -> `cad` (replicad code) the browser builds",
                     "POST /catalog/bolt-check": "bolt <-> hole check for Auto Assembly: clearance/tap size, bolt length, thread engagement",
                     "GET /cad/try?q=...": "QA: same `cad` JSON as /chat for one sentence",
@@ -216,11 +212,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, selftest())
             except Exception as e:
                 self._send_json(200, {"pass": False, "error": f"{type(e).__name__}: {e}"})
-            return
-
-        if self.path.split("?")[0] == "/materials":
-            from physics.part_fea import material_catalog
-            self._send_json(200, {"success": True, **material_catalog()})
             return
 
         if self._ace_unavailable(self.path):
@@ -645,7 +636,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
-                       "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank", "/report")
+                       "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank")
         base = self.path.split("?")[0]
         is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
         # every route handled below must be listed here (tests/test_routes.py checks it)
@@ -672,17 +663,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"success": False, "error": "unknown endpoint"})
             else:
                 self._send_ace(*res)
-            return
-
-        if base == "/report":
-            import report
-            try:
-                page = report.render(params)
-            except ValueError as e:
-                self._send_json(400, {"success": False, "error": str(e)})
-                return
-            self._send_html(200, page, {"Cache-Control": "no-store",
-                                        "Content-Disposition": 'inline; filename="idris-engineering-report.html"'})
             return
 
         if base == "/chat":
@@ -770,12 +750,12 @@ class Handler(BaseHTTPRequestHandler):
                 res = llm.interpret(params.get("provider"), params.get("message"), params.get("current"),
                                     params.get("variants"), params.get("selected"),
                                     params.get("context") if isinstance(params.get("context"), dict) else None, rl)
-                # an object in a language the word list does not know: the gearbox reader finds nothing to set
-                if (not gear_ctx and not has_gearbox and res.get("intent") == "other" and not res.get("params")
-                        and not cad_codegen.re.search(r"\b(gearbox|getriebe|przek|roda gigi|reducer)", msg.lower())
-                        and cad_codegen.cad_order()):
-                    self._send_json(200, self._chat_cad(msg, ctx, params.get("provider"), rl))
-                    return
+                # v0.34: an object in a language the keyword list does not know is already caught above -- by the
+                # AI router (cad_router.route) and by looks_like_object_request / looks_like_part_request. This used
+                # to be a second chance for such sentences: anything the gearbox reader could not read went to the
+                # CAD designer, so a greeting or a plain question with no gearbox loaded came back as "IDRIS could
+                # not get valid CAD code" instead of an answer. Only a positive signal may start a design now; when
+                # the AI returns nothing usable, the sanitized reply is the honest answer.
                 self._send_json(200, {"success": True, **res})
             except llm.LLMError as e:
                 self._send_json(e.status, {"success": False, "error": str(e), "attempts": e.attempts, "fallback": True})
