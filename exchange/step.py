@@ -60,14 +60,13 @@ def face_kinds(shape) -> dict:
                              GeomAbs_Torus)
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopExp import TopExp_Explorer
-    from OCP.TopoDS import TopoDS
 
     names = {GeomAbs_Plane: "plane", GeomAbs_Cylinder: "cylinder", GeomAbs_Cone: "cone",
              GeomAbs_Sphere: "sphere", GeomAbs_Torus: "torus"}
     counts = {}
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
-        face = TopoDS.Face_s(exp.Current())
+        face = kernel.as_face(exp.Current())
         kind = names.get(BRepAdaptor_Surface(face, True).GetType(), "other")
         counts[kind] = counts.get(kind, 0) + 1
         exp.Next()

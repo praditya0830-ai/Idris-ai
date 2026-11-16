@@ -76,14 +76,40 @@ def _extents(box) -> list:
     return [abs(hi.X() - lo.X()), abs(hi.Y() - lo.Y()), abs(hi.Z() - lo.Z())]
 
 
+def _typed(kind: str, shape):
+    """Downcast a TopoDS_Shape. OCP names differ between builds: TopoDS.Face_s on some,
+    TopoDS.Face on others (the live server has the latter). Guessing one name breaks the whole call."""
+    from OCP.TopoDS import TopoDS
+    for name in (kind, f"{kind}_s"):
+        fn = getattr(TopoDS, name, None)
+        if callable(fn):
+            return fn(shape)
+    raise KernelUnavailable(f"this OCP build exposes neither TopoDS.{kind} nor TopoDS.{kind}_s")
+
+
+def as_face(shape):
+    return _typed("Face", shape)
+
+
 def _is_closed(shape) -> bool:
-    """Closed == every edge borders exactly two faces. Counted through edge->face ancestry, which is
-    the topological definition; comparing an orientation enum would not answer this question."""
+    """Closed means no free boundary: BRep_Tool.IsClosed answers it for a solid. If this build does not
+    expose it, fall back to edge->face ancestry, and if even that is unavailable say "not closed"
+    rather than claim a watertight solid we could not check."""
+    from OCP.BRep import BRep_Tool
+    for name in ("IsClosed_s", "IsClosed"):
+        fn = getattr(BRep_Tool, name, None)
+        if callable(fn):
+            try:
+                return bool(fn(shape))
+            except Exception:
+                break
+    try:
+        from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape as _Map
+    except Exception:
+        return False
     from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
     from OCP.TopExp import TopExp
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
-
-    ancestors = TopTools_IndexedDataMapOfShapeListOfShape()
+    ancestors = _Map()
     TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, ancestors)
     n = ancestors.Extent()
     if n == 0:
@@ -147,13 +173,12 @@ def tessellate(shape, deflection: float = 0.1, angle: float = 0.5):
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopLoc import TopLoc_Location
-    from OCP.TopoDS import TopoDS
 
     BRepMesh_IncrementalMesh(shape, float(deflection), False, float(angle), True)
     positions, indices = [], []
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
-        face = TopoDS.Face_s(exp.Current())
+        face = as_face(exp.Current())
         loc = TopLoc_Location()
         tri = BRep_Tool.Triangulation_s(face, loc)
         if tri is not None:
