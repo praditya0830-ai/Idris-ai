@@ -112,7 +112,49 @@ Sebab drawer kosong saat ini: `/cad/explore` dipanggil tanpa parameter, sehingga
    untuk rumus per-kasus panggil `POST /solve/<name>` dan tampilkan `checks[]` + `inputs` + `elapsed_ms`.
 3. BOM: `GET /download/<bom csv>` dari `/generate-assembly`; report PDF menyusul (kerja baru).
 
-## 6. Yang belum diverifikasi di dokumen ini
+## 6. Skema `cad` dan `sources[]` (hasil riset)
+
+`POST /chat` mengembalikan `cad` hanya bila AI menulis kode yang lolos pemeriksaan server.
+Kunci yang ada: `title`, `kind` (`styling|interface|functional`), `process`, `material`,
+`params[]`, `code`, `expect[]`, `missing[]`, `variants[]`, `holes[]`, `note`, `read_by`.
+
+`missing[]` adalah kanal tanya: `[{"k":"T","question":"Berapa tebal HP?"}]`. Selama `missing`
+tidak kosong, `code` bernilai `null` — IDRIS tidak mengirim kode setengah jadi.
+
+### `sources[]` — hanya bila sebuah ukuran dicari dari sumber publik
+
+Lapisan riset (`research/`) mati secara default: tanpa `BRAVE_SEARCH_API_KEY` atau
+`TAVILY_API_KEY`, `missing[]` berisi pertanyaan seperti biasa dan `sources` tidak ada.
+Bila aktif, satu ukuran hanya masuk desain bila kutipannya benar-benar ada di halaman,
+satuannya dikenali, dan nilainya masuk akal.
+
+```json
+"cad": {
+  "params": [{"k":"T","value":8.0,"unit":"mm","label":"Tebal","source":"research",
+              "source_url":"https://example.com/spec"}],
+  "missing": [],
+  "sources": [{"k":"T","value_mm":8.0,"unit_in_source":"mm",
+               "url":"https://example.com/spec","title":"Phone case spec",
+               "quote":"thickness 8 mm"}]
+}
+```
+
+- `params[].source`: `user` (dari kalimat engineer), `default` (tabel standar IDRIS), atau
+  `research` (dari `sources[]`, selalu disertai `source_url`).
+- Satu angka tidak pernah masuk tanpa `url` + `quote`; tidak ada sumber → pertanyaan tetap
+  muncul di `missing[]`, persis seperti sebelum lapisan ini ada.
+- `answer` menyebut sumbernya di baris terakhir: `Sources: T 8 mm (https://…)`.
+
+### Variabel lingkungan yang baru
+
+| Variabel | Arti |
+|---|---|
+| `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (Qwen), `MOONSHOT_API_KEY` (Kimi) | provider AI tambahan; ketiganya lewat adapter OpenAI-compatible yang sama |
+| `IDRIS_LLM_ORDER` | urutan provider untuk percakapan; default `claude,gemini,openai,nvidia,deepseek,qwen,kimi` |
+| `IDRIS_CAD_ORDER` | urutan provider penulis kode CAD; default sama dengan di atas |
+| `BRAVE_SEARCH_API_KEY` / `TAVILY_API_KEY` | mengaktifkan lapisan riset (`research/`) |
+
+## 7. Yang belum diverifikasi di dokumen ini
 
 - Kebenaran fisika tiap solver (baru kontrak dan katalognya yang diperiksa, bukan hasil angkanya).
 - `GET /verify` dan `GET /selfcheck` tidak dijalankan (keduanya memicu benchmark berat di server produksi).
