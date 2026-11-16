@@ -49,17 +49,26 @@ def measure(solid, mass_kg: float | None = None) -> dict:
     BRepBndLib.Add_s(solid, box)
     summary = {"volume_mm3": volume, "area_mm2": abs(area.Mass()),
                "bbox_mm": _extents(box),
-               "solids": len(_solids(solid)), "watertight": _is_closed(solid)}
+               "solids": len(shapes_of(solid, "solid")),
+               "faces": len(shapes_of(solid, "face")),
+               "edges": len(shapes_of(solid, "edge")),
+               "vertices": len(shapes_of(solid, "vertex")),
+               "watertight": _is_closed(solid)}
     out = dict(summary)
     if mass_kg is not None:
         out["mass_kg"] = mass_kg
     return out
 
 
-def _solids(shape) -> list:
-    from OCP.TopAbs import TopAbs_SOLID
+_TOPABS = {"solid": "TopAbs_SOLID", "shell": "TopAbs_SHELL", "face": "TopAbs_FACE",
+           "edge": "TopAbs_EDGE", "vertex": "TopAbs_VERTEX"}
+
+
+def shapes_of(shape, kind: str) -> list:
+    """All sub-shapes of one kind (solid, shell, face, edge, vertex)."""
+    import OCP.TopAbs as TA
     from OCP.TopExp import TopExp_Explorer
-    out, exp = [], TopExp_Explorer(shape, TopAbs_SOLID)
+    out, exp = [], TopExp_Explorer(shape, getattr(TA, _TOPABS[kind]))
     while exp.More():
         out.append(exp.Current())
         exp.Next()
@@ -92,17 +101,25 @@ def as_face(shape):
 
 
 def _is_closed(shape) -> bool:
-    """Closed means no free boundary: BRep_Tool.IsClosed answers it for a solid. If this build does not
-    expose it, fall back to edge->face ancestry, and if even that is unavailable say "not closed"
-    rather than claim a watertight solid we could not check."""
+    """Closed means no free boundary. BRep_Tool.IsClosed answers it per shell (asking a solid directly
+    returned False on the live server for a closed box), so the shells are asked first, then the solid,
+    then edge->face ancestry. If none of that is available the answer is "not closed": we never claim a
+    watertight solid we could not check."""
     from OCP.BRep import BRep_Tool
-    for name in ("IsClosed_s", "IsClosed"):
-        fn = getattr(BRep_Tool, name, None)
-        if callable(fn):
+    closed = getattr(BRep_Tool, "IsClosed_s", None) or getattr(BRep_Tool, "IsClosed", None)
+    if callable(closed):
+        shells = shapes_of(shape, "shell")
+        if shells:
             try:
-                return bool(fn(shape))
+                if all(bool(closed(s)) for s in shells):
+                    return True
             except Exception:
-                break
+                pass
+        try:
+            if bool(closed(shape)):
+                return True
+        except Exception:
+            pass
     try:
         from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape as _Map
     except Exception:
@@ -176,19 +193,30 @@ def tessellate(shape, deflection: float = 0.1, angle: float = 0.5):
 
     BRepMesh_IncrementalMesh(shape, float(deflection), False, float(angle), True)
     positions, indices = [], []
+    lookup = {}                      # welded by position: each face meshes on its own, so without
+                                     # welding every shared edge looks like a boundary (24 of them
+                                     # on a closed box, found on the live server)
+
+    def vid(p) -> int:
+        key = (round(p.X(), 6), round(p.Y(), 6), round(p.Z(), 6))
+        i = lookup.get(key)
+        if i is None:
+            i = len(positions)
+            lookup[key] = i
+            positions.append([p.X(), p.Y(), p.Z()])
+        return i
+
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
         face = as_face(exp.Current())
         loc = TopLoc_Location()
         tri = BRep_Tool.Triangulation_s(face, loc)
         if tri is not None:
-            base = len(positions)
-            for i in range(1, tri.NbNodes() + 1):
-                p = tri.Node(i).Transformed(loc.Transformation())
-                positions.append([p.X(), p.Y(), p.Z()])
+            trsf = loc.Transformation()
+            local = [vid(tri.Node(i).Transformed(trsf)) for i in range(1, tri.NbNodes() + 1)]
             for i in range(1, tri.NbTriangles() + 1):
                 a, b, c = tri.Triangle(i).Get()
-                indices += [base + a - 1, base + b - 1, base + c - 1]
+                indices += [local[a - 1], local[b - 1], local[c - 1]]
         exp.Next()
     return positions, indices
 
