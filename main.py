@@ -214,6 +214,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"pass": False, "error": f"{type(e).__name__}: {e}"})
             return
 
+        if self.path.split("?")[0].startswith("/geometry/"):
+            import engine_routes          # geometry contract, kernel status, engine selftest
+            res = engine_routes.handle_get(self.path)
+            if res is not None:
+                self._send_json(*res)
+                return
+
         if self._ace_unavailable(self.path):
             return
         if ace_get is not None:
@@ -636,7 +643,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
-                       "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank")
+                       "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank",
+                       "/model/validate", "/assembly/manifest", "/exchange/step")
         base = self.path.split("?")[0]
         is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
         # every route handled below must be listed here (tests/test_routes.py checks it)
@@ -663,6 +671,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"success": False, "error": "unknown endpoint"})
             else:
                 self._send_ace(*res)
+            return
+
+        if base.startswith(("/model/", "/assembly/", "/exchange/")):
+            import engine_routes          # feature graph, assembly manifest, STEP in
+            res = engine_routes.handle_post(base, params)
+            if res is None:
+                self._send_json(404, {"success": False, "error": "unknown endpoint"})
+            else:
+                self._send_json(*res)
             return
 
         if base == "/chat":
