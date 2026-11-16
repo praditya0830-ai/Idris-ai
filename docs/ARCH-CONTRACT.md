@@ -123,3 +123,28 @@ gets the same id. A run is immutable once stored: writing a different body under
 - No claim of evidence level 5 (experimental) or 6 (engineer approval): `physics/evidence.py`
   remains the single source of those levels.
 - No silent fallback from kernel failure to a mesh-only "result".
+
+## 9. HTTP surface (`engine_routes.py`)
+
+Handlers are plain functions returning `(status, payload)`; `main.py` only forwards. This is what
+keeps a 900-line dispatcher from growing logic.
+
+| route | answers | refuses |
+|---|---|---|
+| `GET /geometry/checks` | the invariant ids and what each one means | — |
+| `GET /geometry/kernel` | whether this server has a CAD kernel right now | never reports a kernel it could not import |
+| `GET /geometry/selftest` | runs the engine checks on the serving machine, one result per call | never passes a check it did not run |
+| `POST /model/validate` | graph errors per feature, topological order, resolved dimensions | unknown ops, unknown params, undefined dimensions |
+| `POST /assembly/manifest` | compact manifest + LOD plan + BOM, no geometry | malformed trees, duplicate ids |
+| `POST /exchange/step` | summary, invariants, fingerprint, feature candidates | 503 `kernel_unavailable` when there is no kernel; 422 when the file is not a solid |
+
+Kernel facts settled on the live server (cadquery-ocp 8, Python 3.14), so nobody rediscovers them:
+
+- `Bnd_Box.Get()` returns a struct that OCP cannot convert to a Python tuple: use `CornerMin()` /
+  `CornerMax()`.
+- `BRep_Tool.IsClosed` answers per **shell**; asking a solid directly returned False for a closed box.
+- `TopoDS.Face_s` does not exist in that build (`TopoDS.Face` does) and
+  `TopTools_IndexedDataMapOfShapeListOfShape` is not exported from `OCP.TopTools`: every downcast goes
+  through `kernel.as_face`, and closure falls back to edge→face ancestry.
+- Tessellation meshes each face separately, so vertices must be welded by position or a closed cube
+  reports 24 boundary edges.
