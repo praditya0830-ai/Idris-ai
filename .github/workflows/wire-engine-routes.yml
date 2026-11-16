@@ -1,0 +1,33 @@
+name: wire engine routes
+
+# One-shot migration: applies tools/wire_engine_routes.py to main.py and commits the result.
+# Triggered by the push that adds the script; it does not listen on main.py, so the commit it
+# creates cannot start a loop. Remove this workflow once main.py is wired.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/wire_engine_routes.py"
+      - ".github/workflows/wire-engine-routes.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply the patch
+        run: python3 tools/wire_engine_routes.py
+      - name: Commit if main.py changed
+        run: |
+          git config user.name "idris-bot"
+          git config user.email "idris-bot@users.noreply.github.com"
+          git add main.py
+          if git diff --cached --quiet; then
+            echo "main.py already wired; nothing to commit"
+          else
+            git commit -m "chore(api): forward engine routes from the dispatcher"
+            git push
+          fi
