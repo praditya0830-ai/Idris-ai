@@ -1,0 +1,185 @@
+"""The only module that touches OpenCascade (Fase 1, pilar A).
+
+The server has cadquery-ocp (OCP); a developer machine or CI without it must not silently pretend a
+solid was built. So every entry point raises KernelUnavailable with a plain message, and callers
+report that instead of a fake success.
+
+Kept deliberately small: build, boolean, fillet, measure, STEP read/write, tessellate. Anything else
+belongs in a caller. This replaces the scattered OCP imports in physics/occt_export.py and
+physics/simple_part.py over time; nothing here duplicates their file formats.
+"""
+from __future__ import annotations
+
+import os
+
+
+class KernelUnavailable(RuntimeError):
+    """No CAD kernel on this machine. The caller must say so, not fall back to a wrong answer."""
+
+
+def available() -> bool:
+    try:
+        import OCP.BRepPrimAPI  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def require() -> None:
+    if not available():
+        raise KernelUnavailable(
+            "no CAD kernel on this server (cadquery-ocp / OCP is not installed); "
+            "geometry cannot be built, measured or converted here")
+
+
+def measure(solid, mass_kg: float | None = None) -> dict:
+    """-> summary used by geometry.fingerprint and geometry.invariants."""
+    require()
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(solid, props)
+    volume = abs(props.Mass())
+    area = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(solid, area)
+    box = Bnd_Box()
+    BRepBndLib.Add_s(solid, box)
+    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    summary = {"volume_mm3": volume, "area_mm2": abs(area.Mass()),
+               "bbox_mm": [xmax - xmin, ymax - ymin, zmax - zmin],
+               "solids": len(_solids(solid)), "watertight": _is_closed(solid)}
+    out = dict(summary)
+    if mass_kg is not None:
+        out["mass_kg"] = mass_kg
+    return out
+
+
+def _solids(shape) -> list:
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+    out, exp = [], TopExp_Explorer(shape, TopAbs_SOLID)
+    while exp.More():
+        out.append(exp.Current())
+        exp.Next()
+    return out
+
+
+def _is_closed(shape) -> bool:
+    """A solid with no free boundary edges is closed. Free edges == the shell has a hole."""
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_FREE
+
+    exp = TopExp_Explorer(shape, TopAbs_EDGE)
+    while exp.More():
+        edge = TopoDS.Edge_s(exp.Current())
+        if edge.IsNull():
+            exp.Next()
+            continue
+        BRep_Tool  # noqa: B018  (kept imported for symmetry with other OCP helpers)
+        if exp.Current().Orientation() == TopAbs_FREE:
+            return False
+        exp.Next()
+    return True
+
+
+def box(dx: float, dy: float, dz: float):
+    require()
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    return BRepPrimAPI_MakeBox(float(dx), float(dy), float(dz)).Shape()
+
+
+def cylinder(radius: float, height: float):
+    require()
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    return BRepPrimAPI_MakeCylinder(float(radius), float(height)).Shape()
+
+
+def boolean(op: str, a, b):
+    """op ∈ {fuse, cut, common}; raises ValueError for anything else (an AI must not invent ops)."""
+    require()
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Common, BRepAlgoAPI_Fuse
+    maker = {"fuse": BRepAlgoAPI_Fuse, "cut": BRepAlgoAPI_Cut, "common": BRepAlgoAPI_Common}.get(op)
+    if maker is None:
+        raise ValueError(f"unknown boolean op {op!r}; use fuse, cut or common")
+    m = maker(a, b)
+    m.Build()
+    if not m.IsDone():
+        raise RuntimeError(f"boolean {op} failed in the kernel")
+    return m.Shape()
+
+
+def fillet(shape, radius: float, edges=None):
+    require()
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp_Explorer
+    maker = BRepFilletAPI_MakeFillet(shape)
+    exp = TopExp_Explorer(shape, TopAbs_EDGE)
+    n = 0
+    while exp.More():
+        if edges is None or n in edges:
+            maker.Add(float(radius), exp.Current())
+        n += 1
+        exp.Next()
+    maker.Build()
+    if not maker.IsDone():
+        raise RuntimeError("fillet failed in the kernel (radius too large for the geometry)")
+    return maker.Shape()
+
+
+def tessellate(shape, deflection: float = 0.1, angle: float = 0.5):
+    """-> (positions, indices) triangles for the browser and for mesh_checks()."""
+    require()
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+
+    BRepMesh_IncrementalMesh(shape, float(deflection), False, float(angle), True)
+    positions, indices = [], []
+    exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while exp.More():
+        face = TopoDS.Face_s(exp.Current())
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        if tri is not None:
+            base = len(positions)
+            for i in range(1, tri.NbNodes() + 1):
+                p = tri.Node(i).Transformed(loc.Transformation())
+                positions.append([p.X(), p.Y(), p.Z()])
+            for i in range(1, tri.NbTriangles() + 1):
+                a, b, c = tri.Triangle(i).Get()
+                indices += [base + a - 1, base + b - 1, base + c - 1]
+        exp.Next()
+    return positions, indices
+
+
+def write_step(shape, path: str) -> str:
+    require()
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
+    writer = STEPControl_Writer()
+    writer.Transfer(shape, STEPControl_AsIs)
+    if writer.Write(os.fspath(path)) != IFSelect_RetDone:
+        raise RuntimeError(f"STEP write failed for {path}")
+    return os.fspath(path)
+
+
+def read_step(path: str):
+    """STEP in -> one shape. Feature recognition is NOT done here (see exchange/step.py)."""
+    require()
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.STEPControl import STEPControl_Reader
+    reader = STEPControl_Reader()
+    if reader.ReadFile(os.fspath(path)) != IFSelect_RetDone:
+        raise RuntimeError(f"STEP read failed for {path}")
+    reader.TransferRoots()
+    return reader.OneShape()
