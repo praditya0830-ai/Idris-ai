@@ -251,7 +251,8 @@ def handle_post(base: str, params: dict):
         except (TypeError, ValueError) as exc:
             return 400, {"success": False, "error": f"invalid assembly: {exc}"}
         return 200, {"success": True, **manifest,
-                     "note": "structure only: fetch a node's geometry through /assembly/node"}
+                     "note": "structure only: no vertex data here; geometry per part is still served by "
+                             "the existing /generate-assembly path", "geometry_included": False}
 
     if base == "/exchange/step":
         raw = params.get("step_base64") or params.get("iges_base64")
