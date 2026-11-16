@@ -64,11 +64,11 @@ try:
     REPLY["text"] = "I cannot help"
     s, r = chat({"provider": "claude", "message": "x"}); check("non-JSON answer -> fallback flag", s == 502 and r["fallback"])
     REPLY["text"] = json.dumps({"intent": "hack", "select": "Z", "compare": ["A"], "answer": 5})
-    # A gearbox is loaded on purpose: with no gearbox and intent "other", main.py hands the sentence to the CAD
-    # designer (the "object in a language the word list does not know" block), so the sanitized reply would never
-    # reach the client. This check is about sanitizing, not about routing.
-    s, r = chat({"provider": "claude", "message": "x", "current": {"power_kw": 11.2, "gear_ratio": 8}})
-    check("bad intent/select/compare sanitized", r["intent"] == "other" and r["select"] is None and r["compare"] is None and r["answer"] == "")
+    # No gearbox loaded on purpose: a sentence the answer reader cannot use must come back as the sanitized reply,
+    # not as a CAD attempt. v0.33 sent every such sentence to the CAD designer and answered a greeting with
+    # "IDRIS could not get valid CAD code"; the "cad" absence below is what keeps that from coming back.
+    s, r = chat({"provider": "claude", "message": "x"})
+    check("bad intent/select/compare sanitized", r["intent"] == "other" and r["select"] is None and r["compare"] is None and r["answer"] == "" and "cad" not in r)
     s, r = chat({"provider": "nope", "message": "x"}); check("unknown provider -> 400", s == 400)
     # transient overload: first call 503, retry succeeds
     REPLY["text"] = good; REPLY["fail503"] = 1; SEEN.clear()
