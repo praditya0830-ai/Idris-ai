@@ -4,13 +4,14 @@ Contract: ui/perintah-solver-ai-menulis-kode-cad-v55.md and ui/pesan-arya-untuk-
 
 What the server does:
   * builds the prompt (replicad API summary, look rules, process rules, standard interface tables, examples);
-  * asks the strongest configured AI (order IDRIS_CAD_ORDER, default claude,openai,gemini,nvidia);
+  * asks the strongest configured AI (order IDRIS_CAD_ORDER, default claude,openai,gemini,nvidia,
+    deepseek,qwen,kimi; only providers that have a key are used);
   * validates the answer: forbidden words, `return { body }`, params in range, `source: user` only for numbers
     that really are in the user's sentence, `expect` only for sizes the user gave; sizes from the user's world
     that were not given -> `missing` (no code is sent then);
   * one automatic retry when the static check fails; repair loop with context.cad_error (max 2 per design).
 What the server does NOT do: run the code. Geometry, volume and checks come from the kernel in the browser.
-No strength number is produced here: kind/labels say "not checked" until FEA (Mark 1 #7) runs.
+No strength number is produced here: kind/labels say \"not checked\" until FEA (Mark 1 #7) runs.
 """
 from __future__ import annotations
 
@@ -201,9 +202,39 @@ def looks_like_object_request(message: str, has_gearbox: bool = False) -> bool:
 
 
 def cad_order() -> list:
-    raw = os.environ.get("IDRIS_CAD_ORDER", "claude,openai,gemini,nvidia")
+    raw = os.environ.get("IDRIS_CAD_ORDER", "claude,openai,gemini,nvidia,deepseek,qwen,kimi")
     order = [p.strip() for p in raw.split(",") if p.strip() in llm.PROVIDERS]
     return [p for p in order if os.environ.get(llm.KEY_ENV[p])]
+
+
+def _research_note(missing: list, request: str, provider: str | None) -> tuple:
+    """Sizes the reader could not find, looked up in published sources: -> (note, sources).
+    Off unless a search key is configured, and a failing lookup must never cost the engineer a design."""
+    try:
+        import research
+        return research.notes_for(missing, request, provider)
+    except Exception:                       # noqa: BLE001
+        return "", []
+
+
+def _research_enrich(cad: dict, srcs: list) -> dict:
+    """Attach url + quote to every size that came from a lookup (cad["sources"])."""
+    try:
+        import research
+        return research.enrich(cad, srcs)
+    except Exception:                       # noqa: BLE001
+        return cad
+
+
+def _sources_text(cad: dict, idn: bool = False) -> str:
+    """One line naming where a looked-up size came from; empty when every size came from the engineer."""
+    srcs = [s for s in (cad.get("sources") or []) if isinstance(s, dict) and s.get("url")]
+    parts = []
+    for s in srcs[:3]:
+        v = _num(s.get("value_mm"))
+        if v is not None:
+            parts.append(f'{s.get("k") or "size"} {v:g} mm ({s["url"]})')
+    return (("Sumber" if idn else "Sources") + ": " + "; ".join(parts)) if parts else ""
 
 
 # ------------------------------------------------------------------ validation
@@ -564,7 +595,7 @@ def generate(message: str, context: dict | None = None, provider: str | None = N
     slots = [(p, m) for p in cands for m in llm.cad_models_for(p)]
     busy = []                                 # models that answered "overloaded" (HTTP 429/503): asked once more at the end
 
-    def ask(prov, model, slots_after):
+    def ask(prov, model, slots_after, extra: str = ""):
         """One model: a call, plus one retry when the static check rejects the answer. -> result dict or None."""
         retry_note = ""
         for round_ in (0, 1):
@@ -576,7 +607,8 @@ def generate(message: str, context: dict | None = None, provider: str | None = N
             cap = min(left - 2, per_call) if not slots_after else min(left - 2, per_call, max(25.0, 0.6 * left))
             t0 = time.time()
             try:
-                text, used = llm.call_provider(f"{prov}:{model}", system, user + retry_note, max_tokens, timeout=cap)
+                text, used = llm.call_provider(f"{prov}:{model}", system, user + retry_note + extra, max_tokens,
+                                              timeout=cap)
             except llm.LLMError as e:
                 attempts.append({"provider": prov, "model": model, "error": str(e), "http": e.http,
                                  "seconds": round(time.time() - t0, 1)})
@@ -613,17 +645,33 @@ def generate(message: str, context: dict | None = None, provider: str | None = N
                              "variant code), a short note." if cut else ""))
         return None
 
+    def research_round(got, prov, model, slots_after):
+        """The design is complete except for sizes nobody stated: look them up once, each with a source.
+        With no search key there is no note, so the engineer is asked exactly as before."""
+        cad = got.get("cad") or {}
+        if not cad.get("missing"):
+            return got
+        note, srcs = _research_note(cad["missing"], full_msg, prov)
+        if not note:
+            return got
+        again = ask(prov, model, slots_after, extra=note)
+        if again and len((again.get("cad") or {}).get("missing") or []) < len(cad["missing"]):
+            got = again
+        got["cad"] = _research_enrich(got.get("cad") or {}, srcs)
+        got["answer"] = answer_text(got["cad"], repaired=bool(err), lang=lang, message=full_msg)
+        return got
+
     for i, (prov, model) in enumerate(slots):
         got = ask(prov, model, len(slots) - i - 1)
         if got:
-            return got
+            return research_round(got, prov, model, len(slots) - i - 1)
     for i, (prov, model) in enumerate(list(busy)):       # second chance for overloaded models, while time is left
         if deadline - time.time() < 15:
             break
         time.sleep(float(os.environ.get("IDRIS_LLM_RETRY_SLEEP", "1.5")))
         got = ask(prov, model, 0)
         if got:
-            return got
+            return research_round(got, prov, model, 0)
     return {"ok": False, "attempts": attempts, "read_by": None, "seconds": round(time.time() - t_start, 1),
             "answer": failure_text(attempts)}
 
@@ -725,6 +773,9 @@ def answer_text(cad: dict, repaired: bool = False, lang: str = "en", message: st
             lines.append("Varian: " + ", ".join(v["name"] for v in cad["variants"]))
         if cad.get("warnings"):
             lines.append("Catatan: " + "; ".join(cad["warnings"]))
+        src = _sources_text(cad, idn=True)
+        if src:
+            lines.append(src)
         return "\n".join(lines)
     label = {"styling": "Concept (shape, not an analysis result)", "interface": "Interface part: strength not checked",
              "functional": "Strength not checked"}[cad["kind"]]
@@ -738,6 +789,9 @@ def answer_text(cad: dict, repaired: bool = False, lang: str = "en", message: st
     lines.append(requirements_text(cad))
     if cad.get("warnings"):
         lines.append("Note: " + "; ".join(cad["warnings"]))
+    src = _sources_text(cad)
+    if src:
+        lines.append(src)
     return "\n".join(x for x in lines if x)
 
 
