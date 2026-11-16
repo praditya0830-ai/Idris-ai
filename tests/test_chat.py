@@ -93,6 +93,8 @@ finally:
     env2 = dict(env, ANTHROPIC_API_KEY="", GEMINI_API_KEY="", OPENAI_API_KEY="", PORT="8011")
     p2 = subprocess.Popen([sys.executable, "main.py"], cwd=ROOT, env=env2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(1.5)
     s, r = chat({"provider": "claude", "message": "x"}, 8011); check("no key -> 503 + fallback", s == 503 and r["fallback"])
-    d = json.load(urllib.request.urlopen("http://127.0.0.1:8011/chat/providers")); check("providers endpoint reports none configured, no keys leaked", d["providers"] == {"claude": False, "gemini": False, "openai": False, "nvidia": False} and "k-" not in json.dumps(d))
+    import llm as _L
+    # no fuzzy "k-" match: the model list now contains "deepseek-flash", which is not a leaked key
+    d = json.load(urllib.request.urlopen("http://127.0.0.1:8011/chat/providers")); check("providers endpoint reports none configured, no keys leaked", d["providers"] == {p: False for p in _L.PROVIDERS} and not any(k in json.dumps(d) for k in ("k-claude", "k-gem", "k-oai")))
     p2.terminate()
 print("ALL PASS" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)
