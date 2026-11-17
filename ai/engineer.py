@@ -378,6 +378,8 @@ def solve(text: str, given: dict | None = None) -> dict:
         return {"topic": None, "claims": [], "missing": [], "notes": ["empty request"]}
 
     topic = _topic(low, g)
+    if topic == "fea":
+        return _solve_fea(g, msg, low)
     try:
         if topic == "beam":
             claims, missing = _solve_beam(g, low)
@@ -405,6 +407,10 @@ def solve(text: str, given: dict | None = None) -> dict:
 def _topic(low: str, g: dict) -> str | None:
     if g.get("topic"):
         return str(g["topic"]).lower()
+    # a closed mesh in `given` is the signal that the question is about this part, not about an analogy
+    if isinstance(g.get("geometry"), dict) or re.search(
+            r"\b(fea|von mises|simulasi|part-check|hekuatan|kuat|strength|strong|aman tidak)\b", low):
+        return "fea"
     if re.search(r"\b(baut|bolt|preload|torque|torsi)\b", low):
         return "bolt"
     if re.search(r"\b(tekuk|buckling|kolom|column|strut)\b", low):
@@ -592,6 +598,38 @@ def _solve_chem(g, msg) -> tuple[list, list]:
     return [], [{"input": "formula", "unit": "-", "why": "a formula (H2O), a concentration, or n/T/p/V"}]
 
 
+def _solve_fea(g, msg, low) -> dict:
+    """Hand the question to the real part solver (ai/fea.py) and keep its checks and advice.
+
+    Nothing is computed when the mesh is missing: a strength question without geometry has no answer.
+    """
+    out = {"topic": "fea", "claims": [], "missing": [], "notes": [], "request": msg,
+           "advice": [], "checks": []}
+    geometry = g.get("geometry") if isinstance(g.get("geometry"), dict) else None
+    if not geometry:
+        out["missing"].append({"input": "geometry", "unit": "positions+indices or stl_base64",
+                               "why": "the solver needs the closed mesh of the part (the studio kernel sends it)"})
+        return out
+    force = g.get("force_n")
+    if force is None and not g.get("force_vector"):
+        out["missing"].append({"input": "force_n", "unit": "N",
+                               "why": "the load is the input, not a guess; say the force and its direction"})
+        return out
+    try:
+        from ai import fea as FEA
+        r = FEA.analyze(geometry, material=str(g.get("material_name") or "steel"),
+                        case=str(g.get("case") or "cantilever_tip"), force_n=force,
+                        force_vector=g.get("force_vector"), element_size_mm=g.get("element_size_mm"),
+                        target_elements=int(g.get("target_elements") or 20000))
+    except (ValueError, KeyError, ImportError) as exc:
+        out["notes"].append(f"not computed: {exc}")
+        return out
+    out.update({"claims": r["claims"], "checks": r["checks"], "advice": r["advice"],
+                "cross_check": r["cross_check"], "mesh": r["mesh"], "volume": r["volume"],
+                "material": r["material"], "case": r["case_label"], "solve_time_s": r["solve_time_s"]})
+    return out
+
+
 def _solve_math(g, msg) -> tuple[list, list]:
     expr = g.get("expr")
     if not expr:
@@ -623,8 +661,11 @@ def verify(answer: str, eng: dict | None, allowed=()) -> dict:
             known.append(abs(float(c["value"])))
         except (TypeError, ValueError, KeyError):
             continue
-    # an answer may also quote what the engineer stated (M10, class 8.8, span 500) and the claim inputs
-    for src in [(eng or {}).get("request") or ""] + [c.get("inputs") for c in (eng or {}).get("claims", [])]:
+    # an answer may also quote what the engineer stated (M10, class 8.8, span 500), the claim inputs,
+    # and the computed advice/check text (those numbers were produced by the bench as well)
+    extra = [c.get("detail") for c in (eng or {}).get("checks", [])] + list((eng or {}).get("advice", []))
+    for src in [(eng or {}).get("request") or ""] + extra \
+            + [c.get("inputs") for c in (eng or {}).get("claims", [])]:
         for m in _NUM.finditer(src if isinstance(src, str) else str(src)):
             try:
                 known.append(abs(float(m.group(0).replace("−", "-").replace(",", "."))))
@@ -669,6 +710,12 @@ def chat_block(eng: dict | None) -> str:
             lines.append(f"- {m['input']} ({m['unit']}): {m['why']}")
     for n in eng.get("notes", []):
         lines.append(f"NOTE: {n}")
+    for c in eng.get("checks", []):
+        lines.append(f"CHECK {c['id']}: {'pass' if c['ok'] else 'FAIL'} — {c['detail']}")
+    if eng.get("advice"):
+        lines.append("ENGINEER'S READ (from the numbers above; quote it, do not soften it):")
+        for a in eng["advice"]:
+            lines.append(f"- {a}")
     lines.append("State a number only if it appears above. If the engineer needs one that is not there, "
                  "say it was not computed and ask for the missing input.")
     return "\n".join(lines)
