@@ -53,3 +53,16 @@ def test_the_chat_response_carries_the_review_the_model_saw():
     for key in ('"advice": eng.get("advice")', '"review": eng.get("review")',
                 '"review_summary": eng.get("review_summary")'):
         assert key in src
+
+
+def test_a_bolt_answer_quoting_the_preload_fraction_is_not_flagged():
+    """Found live: a correct answer saying "75 % of proof load" was listed as unverified.
+
+    75 % is an input of the bench (Shigley 8-11), so the gate has to know it.
+    """
+    from ai import engineer as ENG
+    out = ENG.solve("berapa torsi baut M10 kelas 8.8")
+    answer = ("Preload 26095.3 N at 75 % of proof load (600 MPa), torque 52.1905 N·m, "
+              "stress area 57.9895 mm², d 10 mm, K 0.2")
+    v = ENG.verify(answer, out)
+    assert v["ok"] is True, v
