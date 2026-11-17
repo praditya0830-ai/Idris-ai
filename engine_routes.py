@@ -9,7 +9,9 @@ an HTTP server.
     GET  /geometry/kernel     is a CAD kernel present on this server right now
     GET  /geometry/selftest   run the engine checks here and say which ones passed
     POST /model/validate      {"model": {...}} -> graph errors, topological order, resolved dims
+    POST /model/build         the same model, built with the CAD kernel (+ RunRecord)
     POST /assembly/manifest   an assembly tree -> compact manifest + LOD plan (no geometry)
+    POST /assembly/node       one node's geometry, in the LOD the viewer asked for (+ RunRecord)
     POST /exchange/step       {"step_base64": "..."} -> summary, invariants, feature candidates
 """
 from __future__ import annotations
@@ -18,16 +20,95 @@ import base64
 import os
 import tempfile
 
+from assembly import lod as LOD
 from assembly.resolver import Resolver
 from assembly.tree import Assembly, AssemblyError
+from audit import run as RUN
 from exchange import roundtrip, step as exch_step
 from geometry import fingerprint as FP
 from geometry import invariants as INV
 from geometry import kernel
+from model import builder as MODEL
 from model.graph import Graph, GraphError, regenerate
 
 GET_PATHS = ("/geometry/checks", "/geometry/kernel", "/geometry/selftest")
-POST_PATHS = ("/model/validate", "/assembly/manifest", "/exchange/step")
+POST_PATHS = ("/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
+              "/exchange/step")
+
+KERNEL = kernel          # the kernel these endpoints use; tests swap in a stand-in
+_BUILDS: dict = {}       # model_id -> {"parts": {fid: Part}, "keys": {fid: params_key}}
+_MAX_BUILDS = 32
+
+
+def _solver_version() -> str:
+    try:
+        import ace_core
+        return str(getattr(ace_core, "SOLVER_VERSION", "unknown") or "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _record(kind, inputs, summary=None, checks=(), status="ok", extra=None):
+    """One RunRecord per answer. If the record itself fails, say so instead of dropping provenance."""
+    try:
+        return RUN.make(inputs=inputs, solver_version=_solver_version(), geometry_summary=summary,
+                        kernel={"name": "occt" if KERNEL.available() else None,
+                                "version": KERNEL.version()},
+                        checks=list(checks or ()), status=status, kind=kind, extra=extra)
+    except Exception as exc:
+        return {"error": f"record not produced: {type(exc).__name__}: {exc}"}
+
+
+def _summary_of(payload):
+    """Pull a kernel summary out of whatever shape a helper returned, or None if there is none."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("summary", "geometry", "measure", "solid"):
+        val = payload.get(key)
+        if isinstance(val, dict) and "volume_mm3" in val:
+            return val
+    return payload if "volume_mm3" in payload else None
+
+
+def _box_mesh(extents):
+    """A closed 12-triangle proxy for the LOD 'bbox' level: a box, nothing else."""
+    x, y, z = [float(c) for c in (list(extents) + [1.0, 1.0, 1.0])[:3]]
+    u, v, w = max(x, 1e-6), max(y, 1e-6), max(z, 1e-6)
+    p = [[0, 0, 0], [u, 0, 0], [u, v, 0], [0, v, 0], [0, 0, w], [u, 0, w], [u, v, w], [0, v, w]]
+    quads = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+    idx = []
+    for a, b, c, d in quads:
+        idx += [a, b, c, a, c, d]
+    return p, idx
+
+
+def _decode_part(spec) -> bytes:
+    """Client-supplied part geometry: base64 STEP/IGES, or the file as text."""
+    if isinstance(spec, str):
+        return base64.b64decode(spec)
+    if not isinstance(spec, dict):
+        raise ValueError("expected an object with step_base64 (or step as text)")
+    raw = spec.get("step_base64") or spec.get("iges_base64")
+    if raw:
+        return base64.b64decode(raw)
+    text = spec.get("step") or spec.get("iges")
+    if text:
+        return str(text).encode("utf-8")
+    raise ValueError("expected step_base64 (or step as text)")
+
+
+def _audit_status(out: dict) -> str:
+    if out.get("quarantined"):
+        return "quarantined"
+    if out.get("blocked"):
+        return "blocked"
+    return "ok"
+
+
+def _trim_builds():
+    while len(_BUILDS) > _MAX_BUILDS:
+        _BUILDS.pop(next(iter(_BUILDS)))
+
 
 CHECKS = [
     {"id": "mesh.nonempty", "applies_to": "mesh", "means": "there is at least one triangle"},
@@ -250,9 +331,22 @@ def handle_post(base: str, params: dict):
             manifest = resolver.manifest(float(distance) if distance is not None else None)
         except (TypeError, ValueError) as exc:
             return 400, {"success": False, "error": f"invalid assembly: {exc}"}
+        checks = [
+            {"id": "assembly.mass_matches_bom",
+             "ok": abs(asm.mass_kg() - round(sum(b["mass_total"] for b in manifest["bom"]), 6)) < 1e-6,
+             "detail": f"{asm.mass_kg()} kg over {asm.instance_count()} instances"},
+            {"id": "assembly.under_triangle_budget",
+             "ok": not manifest["lod"]["over_budget"],
+             "detail": f"{manifest['lod']['triangles_total']} of {manifest['lod']['budget']} triangles"},
+        ]
+        record = _record("assembly", {"assembly": asm.to_dict(), "distance_mm": distance, "budget": budget},
+                         checks=checks, status="ok" if all(c["ok"] for c in checks) else "quarantined",
+                         extra={"instances": asm.instance_count(), "revision": resolver.revision})
         return 200, {"success": True, **manifest,
-                     "note": "structure only: no vertex data here; geometry per part is still served by "
-                             "the existing /generate-assembly path", "geometry_included": False}
+                     "checks": checks, "run": record,
+                     "note": "structure only: no vertex data here; geometry per node is served by "
+                             "/assembly/node with the part's STEP, or by the existing /generate-assembly path",
+                     "geometry_included": False}
 
     if base == "/exchange/step":
         raw = params.get("step_base64") or params.get("iges_base64")
@@ -278,7 +372,117 @@ def handle_post(base: str, params: dict):
                 rt = roundtrip.check_shape(shape)
             except exch_step.ImportFailed as exc:
                 return 422, {"success": False, "error": str(exc)}
-        return 200, {"success": True, "bytes": len(blob), **rec,
+        summary = _summary_of(rec)
+        checks = [{"id": c.get("id"), "ok": bool(c.get("ok")), "detail": c.get("detail", "")}
+                  for c in (rt.get("checks") or [])]
+        record = _record("exchange_step", {"filename": name, "bytes": len(blob)}, summary=summary,
+                         checks=checks, status="ok" if rt.get("all_ok") else "quarantined")
+        return 200, {"success": True, "bytes": len(blob), **rec, "run": record,
                      "roundtrip_self_check": {"all_ok": rt["all_ok"], "checks": rt["checks"]}}
+
+    if base == "/model/build":
+        model = _model_body(params)
+        if model is None:
+            return 400, {"success": False, "error": "expected a model object with a 'features' list"}
+        try:
+            g = Graph.from_dict(model)
+        except GraphError as exc:
+            return 400, {"success": False, "error": str(exc)}
+        if not KERNEL.available():
+            return 503, {"success": False, "error": "kernel_unavailable",
+                         "detail": "this server has no cadquery-ocp, so no solid can be built; "
+                                   "nothing is simulated or approximated instead"}
+        entry = _BUILDS.setdefault(g.model_id, {"parts": {}, "keys": {}})
+        cache, keys = {}, {}
+        for fid in g.topo():
+            keys[fid] = MODEL.params_key(g.get(fid))
+            if fid in entry["parts"] and entry["keys"].get(fid) == keys[fid]:
+                cache[fid] = entry["parts"][fid]
+        state: dict = {}
+        try:
+            out = MODEL.build(g, changed=params.get("changed"), cache=cache, keys=entry["keys"],
+                              k=KERNEL, parts_dir=str(params.get("parts_dir") or "."), collect=state)
+        except GraphError as exc:
+            return 400, {"success": False, "error": str(exc)}
+        except Exception as exc:
+            return 500, {"success": False, "error": "build failed",
+                         "detail": f"{type(exc).__name__}: {exc}"}
+        entry["parts"] = {fid: p for fid, p in state.items() if getattr(p, "shape", None) is not None}
+        entry["keys"] = out["keys"]
+        _trim_builds()
+        final = out.get("final") or {}
+        record = _record("model", {"model": model, "changed": params.get("changed")},
+                         summary=final.get("summary"), checks=final.get("checks") or [],
+                         status=_audit_status(out),
+                         extra={"model_id": g.model_id, "regenerated": out["regenerated"],
+                                "reused": out["reused"]})
+        return 200, {"success": True, **out, "run": record, "solver_version": _solver_version()}
+
+    if base == "/assembly/node":
+        spec = params.get("assembly") if isinstance(params.get("assembly"), dict) else params
+        try:
+            asm = Assembly.from_dict(spec)
+        except AssemblyError as exc:
+            return 400, {"success": False, "error": f"invalid assembly: {exc}"}
+        node_id = params.get("node") or params.get("node_id")
+        if not node_id:
+            return 400, {"success": False, "error": "send node: the id of the node to resolve"}
+        if not KERNEL.available():
+            return 503, {"success": False, "error": "kernel_unavailable",
+                         "detail": "this server has no cadquery-ocp, so a part's STEP cannot be read; "
+                                   "no substitute geometry is produced"}
+        parts = params.get("parts") if isinstance(params.get("parts"), dict) else {}
+        budget = int(params.get("budget_triangles") or LOD.DEFAULT_BUDGET)
+        distance = params.get("distance_mm")
+
+        def load_part(part_id, level):
+            part_spec = parts.get(part_id)
+            if part_spec is None:
+                raise LookupError(f"no geometry for part {part_id!r}: send parts[{part_id!r}] = "
+                                  '{"step_base64": "..."}')
+            try:
+                blob = _decode_part(part_spec)
+            except Exception as exc:
+                raise ValueError(f"parts[{part_id!r}]: {exc}") from None
+            with tempfile.TemporaryDirectory(prefix="idris-node-") as tmp:
+                name = str((part_spec or {}).get("filename") if isinstance(part_spec, dict) else "")
+                path = os.path.join(tmp, os.path.basename(name or f"{part_id}.step"))
+                with open(path, "wb") as fh:
+                    fh.write(blob)
+                shape = exch_step.import_shape(path, k=KERNEL)   # raises ImportFailed with a reason
+            return {"shape": shape, "summary": KERNEL.measure(shape)}
+
+        try:
+            resolver = Resolver(asm, load_part=load_part,
+                                revision=int(params.get("revision") or asm.revision), budget=budget)
+            node = resolver.node(str(node_id), float(distance) if distance is not None else None)
+        except AssemblyError as exc:
+            return 400, {"success": False, "error": str(exc)}
+        except (LookupError, ValueError, exch_step.ImportFailed) as exc:
+            return 400, {"success": False, "error": str(exc)}
+
+        meta = asm.find(str(node_id))
+        level = node["level"]
+        geometry = node.get("geometry") or {}
+        summary = geometry.get("summary")
+        note = None
+        if level == "bbox":
+            positions, indices = _box_mesh((summary or {}).get("bbox_mm") or [1, 1, 1])
+            note = "bbox proxy: a box stands in for the part at this distance"
+        else:
+            positions, indices = KERNEL.tessellate(geometry["shape"])
+            if level == "decimated":
+                note = "no mesh decimator on this server: the full mesh is sent and the level says so"
+        checks = INV.mesh_checks(positions, indices)
+        record = _record("assembly_node", {"node": node_id, "distance_mm": distance, "part": meta.part},
+                         summary=summary, checks=checks,
+                         status="ok" if INV.all_ok(checks) else "quarantined",
+                         extra={"level": level, "cached": node["cached"], "budget": budget})
+        return 200, {"success": True, "id": meta.id, "kind": meta.kind, "part": meta.part,
+                     "level": level, "cached": node["cached"], "transform": meta.transform,
+                     "positions": positions, "indices": indices,
+                     "vertices": len(positions), "triangles": len(indices) // 3,
+                     "summary": summary, "checks": checks,
+                     "geometry_included": True, "note": note, "run": record}
 
     return None
