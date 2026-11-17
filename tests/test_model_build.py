@@ -52,7 +52,7 @@ class FakeKernel:
             raise ValueError(f"unknown sketch plane {plane!r}") from None
 
     @staticmethod
-    def sketch_face(plane, profile, w, h=None):
+    def sketch_face(plane, profile, w, h=None, n=6, thickness=None):
         FakeKernel.calls.append(("sketch_face", plane, profile, w, h))
         return {"kind": "face", "plane": plane, "profile": profile, "w": float(w),
                 "h": float(w if h is None else h)}

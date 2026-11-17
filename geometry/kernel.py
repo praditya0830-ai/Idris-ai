@@ -102,6 +102,12 @@ def as_face(shape):
     return _typed("Face", shape)
 
 
+def as_edge(shape):
+    """Downcast to an edge. BRepFilletAPI_MakeFillet.Add wants a TopoDS_Edge, not a TopoDS_Shape:
+    passing the shape raised "Add(): incompatible function arguments" on the live server."""
+    return _typed("Edge", shape)
+
+
 def _is_closed(shape) -> bool:
     """Closed means no free boundary. BRep_Tool.IsClosed answers it per shell (asking a solid directly
     returned False on the live server for a closed box), so the shells are asked first, then the solid,
@@ -175,7 +181,7 @@ def fillet(shape, radius: float, edges=None):
     n = 0
     while exp.More():
         if edges is None or n in edges:
-            maker.Add(float(radius), exp.Current())
+            maker.Add(float(radius), as_edge(exp.Current()))
         n += 1
         exp.Next()
     maker.Build()
@@ -273,30 +279,55 @@ def _world(plane: str, u: float, v: float):
     return gp_Pnt(u * e1[0] + v * e2[0], u * e1[1] + v * e2[1], u * e1[2] + v * e2[2])
 
 
-def sketch_face(plane: str, profile: str, w: float, h: float | None = None):
-    """-> planar face on `plane`. rectangle: (0,0)..(w,h); circle: centre origin, d = w;
-    polygon: regular hexagon of inscribed radius w/2 centred on the origin."""
+def sketch_wire(plane: str, profile: str, w: float, h: float | None = None, n: int = 6,
+                thickness: float | None = None):
+    """-> closed planar wire on `plane`.
+
+    Conventions, so a caller can predict where the material lands:
+      rectangle  (0,0)..(w,h);  lshape   an L inside that same box, leg thickness `thickness`;
+      circle     centred on the origin, diameter w;
+      polygon    `n`-gon, circumscribed radius w/2, centred on the origin;
+      triangle   polygon with n = 3, flat side down.
+    """
     require()
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
     from OCP.gp import gp_Ax2, gp_Circ, gp_Dir, gp_Pnt
     w = float(w)
     if w <= 0:
         raise ValueError(f"sketch: w must be > 0, got {w}")
     if profile == "circle":
-        e1, _, n = plane_axes(plane)
-        circ = gp_Circ(gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(*n), gp_Dir(*e1)), w / 2.0)
-        wire = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circ).Edge()).Wire()
-    elif profile == "rectangle":
+        e1, _, normal = plane_axes(plane)
+        circ = gp_Circ(gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(*normal), gp_Dir(*e1)), w / 2.0)
+        return BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circ).Edge()).Wire()
+    if profile == "rectangle":
         hh = w if h is None else float(h)
-        pts = [(0.0, 0.0), (w, 0.0), (w, hh), (0.0, hh)]
-        wire = _wire_through(plane, pts)
-    elif profile == "polygon":
+        return _wire_through(plane, [(0.0, 0.0), (w, 0.0), (w, hh), (0.0, hh)])
+    if profile == "lshape":
+        if h is None:
+            raise ValueError("sketch: an lshape needs h")
+        hh = float(h)
+        t = float(thickness) if thickness else min(w, hh) / 3.0
+        if not (0.0 < t < min(w, hh)):
+            raise ValueError(f"sketch: lshape thickness must be inside (0, {min(w, hh)}), got {t}")
+        return _wire_through(plane, [(0.0, 0.0), (w, 0.0), (w, t), (t, t), (t, hh), (0.0, hh)])
+    if profile in ("polygon", "triangle"):
+        sides = 3 if profile == "triangle" else int(n)
+        if not (3 <= sides <= 64):
+            raise ValueError(f"sketch: polygon needs 3..64 sides, got {sides}")
         r = w / 2.0
-        pts = [(r * math.cos(math.radians(60.0 * k)), r * math.sin(math.radians(60.0 * k))) for k in range(6)]
-        wire = _wire_through(plane, pts)
-    else:
-        raise ValueError(f"unknown sketch profile {profile!r}; use rectangle, circle or polygon")
-    return BRepBuilderAPI_MakeFace(wire).Face()
+        phase = -90.0 if profile == "triangle" else 0.0
+        pts = [(r * math.cos(math.radians(phase + 360.0 * k / sides)),
+                r * math.sin(math.radians(phase + 360.0 * k / sides))) for k in range(sides)]
+        return _wire_through(plane, pts)
+    raise ValueError(f"unknown sketch profile {profile!r}; use rectangle, circle, polygon, triangle or lshape")
+
+
+def sketch_face(plane: str, profile: str, w: float, h: float | None = None, n: int = 6,
+                thickness: float | None = None):
+    """-> planar face: the wire above, filled."""
+    require()
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    return BRepBuilderAPI_MakeFace(sketch_wire(plane, profile, w, h, n, thickness)).Face()
 
 
 def _wire_through(plane: str, pts):
@@ -356,21 +387,18 @@ def revolve(face, axis: str, angle_deg: float):
     return mk.Shape()
 
 
-def _outer_wire(face):
-    from OCP.BRepTools import BRepTools
-    fn = getattr(BRepTools, "OuterWire_s", None) or getattr(BRepTools, "OuterWire", None)
-    if not callable(fn):
-        raise KernelUnavailable("this OCP build does not expose BRepTools.OuterWire")
-    return fn(face)
-
-
 def loft(bottom, top):
-    """Solid between two planar faces (draft: the top profile is the offset one)."""
+    """Solid between two planar WIRES (draft: the top profile is the offset one).
+
+    Wires, not faces: BRepTools.OuterWire has a different signature than expected on this OCP build
+    ("OuterWire_s(): incompatible function arguments" on the live server), so nothing here has to
+    extract a wire out of a face.
+    """
     require()
     from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
     mk = BRepOffsetAPI_ThruSections(True, True)
-    for face in (bottom, top):
-        mk.AddWire(_outer_wire(face))
+    for wire in (bottom, top):
+        mk.AddWire(wire)
     mk.Build()
     if not mk.IsDone():
         raise RuntimeError("loft failed in the kernel (draft angle too large for the profile?)")

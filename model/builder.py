@@ -42,6 +42,8 @@ class Part:
     profile: str | None = None
     size: tuple = ()
     summary: dict | None = None      # kernel summary once the node is a solid
+    args: dict = None               # the sketch parameters, so a later op can rebuild the profile
+    checks: tuple = ()              # the invariant checks this shape passed (pattern allows several bodies)
 
     @property
     def is_solid(self) -> bool:
@@ -90,15 +92,46 @@ def _solid(parent: Part, op: str) -> Part:
     return parent
 
 
-def _verify(k, shape, op: str) -> dict:
-    """Measure, then gate on the invariants. A failing solid never leaves the builder."""
+def _verify(k, shape, op: str, allow_multi: bool = False) -> dict:
+    """Measure, then gate on the invariants. A failing solid never leaves the builder.
+
+    `allow_multi` is for a pattern of copies that do not touch: that is a compound of several bodies,
+    which is a legitimate result, so `solid.single` is replaced by a body-count check instead of being
+    quietly dropped.
+    """
     summary = k.measure(shape)
     checks = INV.solid_checks(summary)
+    if allow_multi:
+        bodies = int(summary.get("solids") or 0)
+        checks = [c for c in checks if c["id"] != "solid.single"]
+        checks.append({"id": "solid.bodies_positive", "ok": bodies >= 1, "detail": f"solids = {bodies}"})
     failed = [c["id"] for c in INV.failures(checks)]
     if failed:
         raise BuildError(f"{op}: the kernel produced a shape that fails {failed} "
                          f"(summary: {json.dumps(summary, sort_keys=True, default=str)})")
-    return summary
+    return summary, checks
+
+
+def _solid_part(k, shape, op: str, parent: Part, allow_multi: bool = False) -> Part:
+    """Wrap a finished body, keeping the checks it passed so the report cannot disagree with the gate."""
+    summary, checks = _verify(k, shape, op, allow_multi)
+    return Part(shape, op, parent.plane, parent.profile, parent.size, summary,
+                getattr(parent, "args", None), tuple(checks))
+
+
+def _wire_for(k, parent: Part, grow: float = 0.0):
+    """Rebuild the parent's sketch wire, optionally grown by `grow` on every side (draft)."""
+    a = getattr(parent, "args", None) or {}
+    if not a:
+        raise BuildError("draft or offset needs the sketch parameters, and this input was not sketched")
+    w = float(a["w"]) + 2.0 * grow
+    h = None if a.get("h") is None else float(a["h"]) + 2.0 * grow
+    wire = k.sketch_wire(a["plane"], a["profile"], w, h, int(a.get("n") or 6), a.get("thickness"))
+    offset = float(a.get("offset") or 0.0)
+    if offset:
+        _, _, normal = k.plane_axes(a["plane"])
+        wire = k.translate(wire, _scale(normal, offset))
+    return wire
 
 
 def _extents(k, shape):
@@ -112,10 +145,22 @@ def _sketch(k, p: dict, op: str) -> Part:
     profile = str(p.get("profile") or "rectangle")
     w = float(p["w"])
     h = float(p["h"]) if p.get("h") is not None else None
-    if profile == "rectangle" and h is None:
-        raise BuildError("sketch: a rectangle needs h")
-    face = k.sketch_face(plane, profile, w, h)
-    return Part(face, op, plane, profile, (w, h if h is not None else w))
+    n = int(p.get("n") or 6)
+    thickness = float(p["thickness"]) if p.get("thickness") is not None else None
+    offset = float(p.get("offset") or 0.0)
+    if profile in ("rectangle", "lshape") and h is None:
+        raise BuildError(f"sketch: a {profile} needs h")
+    if profile == "lshape":
+        leg = thickness if thickness is not None else min(w, h) / 3.0
+        if not (0.0 < leg < min(w, h)):
+            raise BuildError(f"sketch: lshape thickness must be inside (0, {min(w, h)}), got {leg}")
+    face = k.sketch_face(plane, profile, w, h, n, thickness)
+    if offset:
+        _, _, normal = k.plane_axes(plane)
+        face = k.translate(face, _scale(normal, offset))
+    args = {"plane": plane, "profile": profile, "w": w, "h": h, "n": n,
+            "thickness": thickness, "offset": offset}
+    return Part(face, op, plane, profile, (w, h if h is not None else w), None, args)
 
 
 def _extrude(k, parent: Part, p: dict, op: str) -> Part:
@@ -138,22 +183,25 @@ def _extrude(k, parent: Part, p: dict, op: str) -> Part:
     else:
         # A draft is a real offset, not a scale: the top profile is grown by distance*tan(draft).
         grow = abs(distance) * math.tan(math.radians(draft))
-        w, h = parent.size
-        if parent.profile == "rectangle":
-            top_face = k.sketch_face(parent.plane, "rectangle", w + 2 * grow, h + 2 * grow)
-        elif parent.profile == "circle":
-            top_face = k.sketch_face(parent.plane, "circle", w + 2 * grow)
-        else:
-            top_face = k.sketch_face(parent.plane, "polygon", w + 2 * grow)
-        top = k.translate(top_face, vec)
-        shape = k.loft(base, top)
-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
+        bottom = _wire_for(k, parent)
+        top = k.translate(_wire_for(k, parent, grow), vec)
+        if direction == "symmetric":
+            bottom = k.translate(bottom, _scale(vec, -0.5))
+        shape = k.loft(bottom, top)
+    return _solid_part(k, shape, op, parent)
 
 
 def _revolve(k, parent: Part, p: dict, op: str) -> Part:
     angle = float(p.get("angle_deg") or 360.0)
-    shape = k.revolve(parent.shape, str(p.get("axis") or "z"), angle)
-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
+    axis = str(p.get("axis") or "z").lower()
+    perpendicular = {"XY": "z", "XZ": "y", "YZ": "x"}.get(parent.plane)
+    if axis == perpendicular:
+        raise BuildError(
+            f"revolve: axis {axis!r} is perpendicular to the {parent.plane} sketch plane, so the profile "
+            "would only sweep out of its own plane into a flat sheet; use an axis lying in the plane "
+            f"(not {perpendicular!r})")
+    shape = k.revolve(parent.shape, axis, angle)
+    return _solid_part(k, shape, op, parent)
 
 
 def _hole(k, parent: Part, p: dict, op: str) -> Part:
@@ -183,7 +231,7 @@ def _hole(k, parent: Part, p: dict, op: str) -> Part:
         raise BuildError(
             f"{op}: the hole at (x={x}, y={y}) removed no material, so it misses the part "
             f"(volume {before:.3f} -> {after:.3f} mm3)")
-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
+    return _solid_part(k, shape, op, parent)
 
 
 def _fillet(k, parent: Part, p: dict, op: str) -> Part:
@@ -196,7 +244,7 @@ def _fillet(k, parent: Part, p: dict, op: str) -> Part:
         shape = k.fillet(parent.shape, radius, edges)
     except Exception as exc:                     # the kernel's own message is the useful one
         raise BuildError(f"{op}: {exc}") from None
-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
+    return _solid_part(k, shape, op, parent)
 
 
 def _pattern(k, parent: Part, p: dict, op: str) -> Part:
@@ -221,7 +269,8 @@ def _pattern(k, parent: Part, p: dict, op: str) -> Part:
             shape = k.boolean("fuse", shape, k.rotate(parent.shape, axis, angle * i))
     else:
         raise BuildError(f"{op}: unknown pattern mode {mode!r}")
-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
+    # Copies that do not touch stay separate bodies: that is a valid pattern, not a failed solid.
+    return _solid_part(k, shape, op, parent, allow_multi=True)
 
 
 def _import(k, p: dict, op: str, parts_dir: str) -> Part:
@@ -296,7 +345,7 @@ def build(graph, changed=None, cache: dict | None = None, keys: dict | None = No
         if part.is_solid:
             entry["summary"] = part.summary
             entry["fingerprint"] = FP.fingerprint(part.summary)
-            entry["checks"] = INV.solid_checks(part.summary)
+            entry["checks"] = list(part.checks) or INV.solid_checks(part.summary)
             final = {"feature": fid, **entry}
         else:
             entry["kind"] = "face"

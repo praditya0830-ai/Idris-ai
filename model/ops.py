@@ -28,9 +28,15 @@ def _e(required=False, default=None, desc=""):
 SCHEMAS = {
     "sketch": {
         "plane": {"type": "string", "enum": PLANES, "default": "XY", "desc": "sketch plane"},
-        "profile": {"type": "string", "enum": ["rectangle", "circle", "polygon"], "default": "rectangle"},
-        "w": _e(True, desc="width / diameter"),
-        "h": _e(False, desc="height (rectangle/polygon)"),
+        "profile": {"type": "string", "default": "rectangle",
+                    "enum": ["rectangle", "circle", "polygon", "triangle", "lshape"],
+                    "desc": "rectangle/lshape sit in (0,0)..(w,h); circle/polygon/triangle are centred on the origin"},
+        "w": _e(True, desc="width / diameter / circumscribed diameter"),
+        "h": _e(False, desc="height (rectangle/lshape) or width of the leg"),
+        "n": {"type": "integer", "min": 3, "max": 64, "default": 6,
+              "desc": "sides of a polygon (triangle ignores it)"},
+        "thickness": _e(False, desc="leg thickness of an lshape (default min(w,h)/3)"),
+        "offset": _e(False, desc="distance from the plane along its normal: lets a sketch sit inside the model"),
     },
     "extrude": {
         "distance": _e(True),
@@ -107,7 +113,7 @@ def validate_params(op: str, params, dims: dict):
         except E.ExprError as exc:
             errors.append(f"{op}.{name}: {exc}")
             continue
-        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg"):
+        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg", "offset"):
             errors.append(f"{op}.{name}: must be > 0, got {value}")
             continue
         resolved[name] = value
