@@ -38,7 +38,8 @@ jobs:
             tests/test_llm_salvage.py \
             tests/test_report.py \
             tests/test_engineer.py \
-            tests/test_engineer_routes.py
+            tests/test_engineer_routes.py \
+            tests/test_fea_bench.py
 
   full:
     name: Full suite (manual)
