@@ -1,0 +1,35 @@
+name: apply-engine2
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-engine2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apply the dispatch fix
+        run: |
+          base64 -d .github/eng2.b64 > /tmp/eng2.patch
+          git apply --check /tmp/eng2.patch
+          git apply --whitespace=nowarn /tmp/eng2.patch
+          echo "main.py $(git hash-object main.py)"
+          echo "tests   $(git hash-object tests/test_engineer_routes.py)"
+
+      - name: commit and push
+        run: |
+          git config user.name "idris-bot"
+          git config user.email "noreply@github.com"
+          git add -A
+          git commit -m "fix(engine): route /engineer/* to the engine router
+
+          The handlers existed but main.py only forwarded /model/, /assembly/ and /exchange/, so a live
+          POST /engineer/solve fell through to the requirement validator and answered 400 'missing
+          required fields'. The dispatch test now pins both the GET and the POST path."
+          git push
