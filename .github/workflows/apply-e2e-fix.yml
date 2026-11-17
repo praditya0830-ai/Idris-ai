@@ -1,5 +1,6 @@
 name: apply-e2e-fix
 
+# one-shot applier: it exists only until the patch it carries is in main
 on:
   push:
     paths:
