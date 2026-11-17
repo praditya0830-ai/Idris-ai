@@ -31,9 +31,9 @@ from geometry import kernel
 from model import builder as MODEL
 from model.graph import Graph, GraphError, regenerate
 
-GET_PATHS = ("/geometry/checks", "/geometry/kernel", "/geometry/selftest")
+GET_PATHS = ("/geometry/checks", "/geometry/kernel", "/geometry/selftest", "/engineer/materials")
 POST_PATHS = ("/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
-              "/exchange/step")
+              "/exchange/step", "/engineer/solve", "/engineer/verify")
 
 KERNEL = kernel          # the kernel these endpoints use; tests swap in a stand-in
 _BUILDS: dict = {}       # model_id -> {"parts": {fid: Part}, "keys": {fid: params_key}}
@@ -269,6 +269,11 @@ def handle_get(path: str):
                                if ok else "no OCP: solid operations will answer 503, not a fake result"}
     if p == "/geometry/selftest":
         return _selftest()
+    if p == "/engineer/materials":
+        from ai import engineer as ENG
+        return 200, {"success": True, "materials": ENG.MATERIALS,
+                     "note": "typical handbook values; a real part needs the mill certificate or the "
+                             "standard's guaranteed minimum for its grade"}
     return None
 
 
@@ -304,6 +309,17 @@ def handle_post(base: str, params: dict):
     """-> (status, payload) or None when the path is not ours."""
     if not isinstance(params, dict):
         return 400, {"success": False, "error": "body must be a JSON object"}
+
+    if base in ("/engineer/solve", "/engineer/verify"):
+        from ai import engineer as ENG
+        if base == "/engineer/verify":
+            eng = params.get("engineering") if isinstance(params.get("engineering"), dict) else None
+            return 200, {"success": True, **ENG.verify(str(params.get("answer") or ""), eng)}
+        given = params.get("given") if isinstance(params.get("given"), dict) else None
+        eng = ENG.solve(str(params.get("message") or ""), given)
+        if params.get("answer"):
+            eng["verification"] = ENG.verify(str(params["answer"]), eng)
+        return 200, {"success": True, **eng}
 
     if base == "/model/validate":
         model = _model_body(params)

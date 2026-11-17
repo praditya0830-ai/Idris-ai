@@ -512,6 +512,13 @@ EN_RULE = ("\n\nREPLY LANGUAGE: English. The user may write in any language; und
            "\"answer\" in English and set \"language\": \"en\".")
 
 
+def _engineering_block(context) -> str:
+    """Evidence computed by ai/engineer.py. When it is present the answer may only quote its numbers."""
+    if isinstance(context, dict) and isinstance(context.get("engineering"), str) and context["engineering"].strip():
+        return context["engineering"]
+    return ""
+
+
 def want_english(reply_language) -> bool:
     if reply_language in ("en", "auto"):
         return reply_language == "en"
@@ -535,7 +542,9 @@ def interpret(provider, message: str, current=None, variants=None, selected=None
         candidates = [provider]
     else:
         raise LLMError("unknown provider", 400)
-    user = build_user_block(message, current, variants, selected) + (EN_RULE if want_english(reply_language) else "")
+    eng = _engineering_block(context)
+    user = ((eng + "\n\n") if eng else "") + build_user_block(message, current, variants, selected) \
+        + (EN_RULE if want_english(reply_language) else "")
     attempts, statuses = [], []
     for prov in candidates:
         try:
@@ -766,9 +775,10 @@ def build_discuss_block(message, current, variants, selected, context) -> str:
     head = json.dumps(ctx, ensure_ascii=False)[:6000]
     vs = json.dumps([_compact_variant(v) for v in (variants or [])][:5], ensure_ascii=False)
     room = max(0, 8000 - len(head))
-    return ("CONTEXT (data, from the engine):\n" + head +
-            ("\nVARIANTS (data):\n" + vs[:room] if room > 200 and variants else "") +
-            "\n\nUSER MESSAGE (data):\n" + message)
+    eng = _engineering_block(context)
+    return ((eng + "\n\n") if eng else "") + ("CONTEXT (data, from the engine):\n" + head +
+                                               ("\nVARIANTS (data):\n" + vs[:room] if room > 200 and variants else "") +
+                                               "\n\nUSER MESSAGE (data):\n" + message)
 
 
 def _rule_actions(message: str, context: dict) -> list:

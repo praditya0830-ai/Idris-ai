@@ -645,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
                        "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank",
                        "/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
-                       "/exchange/step")
+                       "/exchange/step", "/engineer/solve", "/engineer/verify")
         base = self.path.split("?")[0]
         is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
         # every route handled below must be listed here (tests/test_routes.py checks it)
@@ -691,6 +691,19 @@ class Handler(BaseHTTPRequestHandler):
                 from physics.simple_part import looks_like_part_request
                 import cad_codegen
                 msg = str(params.get("message") or "")[:llm.MAX_MSG]
+                # the bench answers what can be computed; the language layer may only quote those numbers
+                eng, eng_verify = None, None
+                try:
+                    from ai import engineer as _ENG
+                    given = ctx.get("given") if isinstance(ctx, dict) and isinstance(ctx.get("given"), dict) else None
+                    eng = _ENG.solve(msg, given)
+                    eng_verify = _ENG.verify
+                    if eng.get("claims") or eng.get("missing"):
+                        ctx = dict(ctx or {})
+                        ctx["engineering"] = _ENG.chat_block(eng)
+                except Exception:
+                    traceback.print_exc()
+                    eng, eng_verify = None, None
                 gear_ctx = bool(ctx and (ctx.get("advice") or ctx.get("pending_question")))
                 cad_ctx = bool(ctx and (isinstance(ctx.get("cad_error"), dict) or isinstance(ctx.get("pending_cad"), dict)
                                         or isinstance(ctx.get("current_cad"), dict)))
@@ -766,8 +779,11 @@ class Handler(BaseHTTPRequestHandler):
                                           "part": part, "provider": part["read_by"]})
                     return
                 res = llm.interpret(params.get("provider"), params.get("message"), params.get("current"),
-                                    params.get("variants"), params.get("selected"),
-                                    params.get("context") if isinstance(params.get("context"), dict) else None, rl)
+                                    params.get("variants"), params.get("selected"), ctx, rl)
+                if eng and eng_verify:
+                    res["engineering"] = {"topic": eng.get("topic"), "claims": eng.get("claims"),
+                                          "missing": eng.get("missing"), "notes": eng.get("notes")}
+                    res["unverified"] = eng_verify(res.get("answer") or "", eng)
                 # v0.34: an object in a language the keyword list does not know is already caught above -- by the
                 # AI router (cad_router.route) and by looks_like_object_request / looks_like_part_request. This used
                 # to be a second chance for such sentences: anything the gearbox reader could not read went to the
