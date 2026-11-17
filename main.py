@@ -644,7 +644,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
                        "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank",
-                       "/model/validate", "/assembly/manifest", "/exchange/step")
+                       "/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
+                       "/exchange/step")
         base = self.path.split("?")[0]
         is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
         # every route handled below must be listed here (tests/test_routes.py checks it)
