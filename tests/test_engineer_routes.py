@@ -1,4 +1,6 @@
 """The bench must be reachable over HTTP and must never answer a quantitative question without inputs."""
+import os
+
 from engine_routes import GET_PATHS, POST_PATHS, handle_get, handle_post
 
 
@@ -41,6 +43,14 @@ def test_verify_endpoint_flags_a_number_the_bench_did_not_compute():
         "answer": "Tegangan 62 MPa", "engineering": {"claims": [{"id": "beam.sigma", "value": 50.0}]}})
     assert status == 200 and body["ok"] is False
     assert body["unverified"][0]["value"] == 62
+
+
+def test_main_dispatches_engineer_paths_to_the_engine_router():
+    """A handler that exists but is never reached answers 400 'missing required fields' on live."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8").read()
+    assert '"/engineer/"' in src, "main.py must forward /engineer/* to engine_routes"
+    assert '"/engineer/solve"' in src, "main.py must allow /engineer/solve through its route allowlist"
+    assert src.count('"/engineer/"') >= 2, "both the GET and the POST dispatch must name /engineer/"
 
 
 def test_materials_get_is_the_table_the_bench_uses():

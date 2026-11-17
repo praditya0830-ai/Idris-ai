@@ -214,8 +214,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"pass": False, "error": f"{type(e).__name__}: {e}"})
             return
 
-        if self.path.split("?")[0].startswith("/geometry/"):
-            import engine_routes          # geometry contract, kernel status, engine selftest
+        if self.path.split("?")[0].startswith(("/geometry/", "/engineer/")):
+            import engine_routes          # geometry contract, kernel status, engine selftest, materials
             res = engine_routes.handle_get(self.path)
             if res is not None:
                 self._send_json(*res)
@@ -674,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_ace(*res)
             return
 
-        if base.startswith(("/model/", "/assembly/", "/exchange/")):
+        if base.startswith(("/model/", "/assembly/", "/exchange/", "/engineer/")):
             import engine_routes          # feature graph, assembly manifest, STEP in
             res = engine_routes.handle_post(base, params)
             if res is None:
