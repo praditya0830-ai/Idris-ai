@@ -10,6 +10,7 @@ physics/simple_part.py over time; nothing here duplicates their file formats.
 """
 from __future__ import annotations
 
+import math
 import os
 
 
@@ -53,6 +54,7 @@ def measure(solid, mass_kg: float | None = None) -> dict:
                "faces": len(shapes_of(solid, "face")),
                "edges": len(shapes_of(solid, "edge")),
                "vertices": len(shapes_of(solid, "vertex")),
+               "degenerate_faces": _degenerate_faces(solid),
                "watertight": _is_closed(solid)}
     out = dict(summary)
     if mass_kg is not None:
@@ -219,6 +221,216 @@ def tessellate(shape, deflection: float = 0.1, angle: float = 0.5):
                 indices += [local[a - 1], local[b - 1], local[c - 1]]
         exp.Next()
     return positions, indices
+
+
+# --------------------------------------------------------------- modelling primitives
+# The sketch/extrude/hole layer needs a handful of primitives beyond the boolean helpers above. They
+# live here because this is the only module allowed to import OCP; model/builder.py stays kernel-free
+# maths so it can be tested with a stand-in kernel.
+
+PLANE_AXES = {"XY": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+              "XZ": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),
+              "YZ": ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))}
+
+
+def plane_axes(plane: str):
+    """-> (u axis, v axis, normal) in world coordinates. Sketch (u, v) -> world u*e1 + v*e2."""
+    try:
+        return PLANE_AXES[plane]
+    except KeyError:
+        raise ValueError(f"unknown sketch plane {plane!r}; use {sorted(PLANE_AXES)}") from None
+
+
+def version():
+    """The kernel version the record should name, or None when this build does not say."""
+    try:
+        from importlib.metadata import version as _pkg_version
+    except Exception:
+        return None
+    for name in ("cadquery-ocp", "cadquery_ocp", "OCP"):
+        try:
+            return _pkg_version(name)
+        except Exception:
+            continue
+    return None
+
+
+def _degenerate_faces(shape, area_min: float = 1e-9) -> int:
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    bad = 0
+    for face in shapes_of(shape, "face"):
+        props = GProp_GProps()
+        BRepGProp.SurfaceProperties_s(face, props)
+        if abs(props.Mass()) <= area_min:
+            bad += 1
+    return bad
+
+
+def _world(plane: str, u: float, v: float):
+    from OCP.gp import gp_Pnt
+    e1, e2, _ = plane_axes(plane)
+    return gp_Pnt(u * e1[0] + v * e2[0], u * e1[1] + v * e2[1], u * e1[2] + v * e2[2])
+
+
+def sketch_face(plane: str, profile: str, w: float, h: float | None = None):
+    """-> planar face on `plane`. rectangle: (0,0)..(w,h); circle: centre origin, d = w;
+    polygon: regular hexagon of inscribed radius w/2 centred on the origin."""
+    require()
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
+    from OCP.gp import gp_Ax2, gp_Circ, gp_Dir, gp_Pnt
+    w = float(w)
+    if w <= 0:
+        raise ValueError(f"sketch: w must be > 0, got {w}")
+    if profile == "circle":
+        e1, _, n = plane_axes(plane)
+        circ = gp_Circ(gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(*n), gp_Dir(*e1)), w / 2.0)
+        wire = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circ).Edge()).Wire()
+    elif profile == "rectangle":
+        hh = w if h is None else float(h)
+        pts = [(0.0, 0.0), (w, 0.0), (w, hh), (0.0, hh)]
+        wire = _wire_through(plane, pts)
+    elif profile == "polygon":
+        r = w / 2.0
+        pts = [(r * math.cos(math.radians(60.0 * k)), r * math.sin(math.radians(60.0 * k))) for k in range(6)]
+        wire = _wire_through(plane, pts)
+    else:
+        raise ValueError(f"unknown sketch profile {profile!r}; use rectangle, circle or polygon")
+    return BRepBuilderAPI_MakeFace(wire).Face()
+
+
+def _wire_through(plane: str, pts):
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
+    mk = BRepBuilderAPI_MakeWire()
+    for i in range(len(pts)):
+        a, b = pts[i], pts[(i + 1) % len(pts)]
+        mk.Add(BRepBuilderAPI_MakeEdge(_world(plane, *a), _world(plane, *b)).Edge())
+    return mk.Wire()
+
+
+def prism(face, vector):
+    """Extrude a face along a world-space vector."""
+    require()
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+    from OCP.gp import gp_Vec
+    vec = [float(c) for c in vector]
+    if all(abs(c) < 1e-12 for c in vec):
+        raise ValueError("extrude: the distance resolves to zero")
+    return BRepPrimAPI_MakePrism(face, gp_Vec(*vec)).Shape()
+
+
+def translate(shape, vector):
+    require()
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Trsf, gp_Vec
+    trsf = gp_Trsf()
+    trsf.SetTranslation(gp_Vec(*[float(c) for c in vector]))
+    return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+
+
+def rotate(shape, axis: str, angle_deg: float, origin=(0.0, 0.0, 0.0)):
+    require()
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf
+    trsf = gp_Trsf()
+    trsf.SetRotation(gp_Ax1(gp_Pnt(*[float(c) for c in origin]), gp_Dir(*_axis(axis))),
+                     math.radians(float(angle_deg)))
+    return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+
+
+def _axis(axis: str):
+    try:
+        return {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}[str(axis).lower()]
+    except KeyError:
+        raise ValueError(f"unknown axis {axis!r}; use x, y or z") from None
+
+
+def revolve(face, axis: str, angle_deg: float):
+    require()
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt
+    mk = BRepPrimAPI_MakeRevol(face, gp_Ax1(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(*_axis(axis))),
+                               math.radians(float(angle_deg)))
+    if not mk.IsDone():
+        raise RuntimeError("revolve failed in the kernel")
+    return mk.Shape()
+
+
+def _outer_wire(face):
+    from OCP.BRepTools import BRepTools
+    fn = getattr(BRepTools, "OuterWire_s", None) or getattr(BRepTools, "OuterWire", None)
+    if not callable(fn):
+        raise KernelUnavailable("this OCP build does not expose BRepTools.OuterWire")
+    return fn(face)
+
+
+def loft(bottom, top):
+    """Solid between two planar faces (draft: the top profile is the offset one)."""
+    require()
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+    mk = BRepOffsetAPI_ThruSections(True, True)
+    for face in (bottom, top):
+        mk.AddWire(_outer_wire(face))
+    mk.Build()
+    if not mk.IsDone():
+        raise RuntimeError("loft failed in the kernel (draft angle too large for the profile?)")
+    return mk.Shape()
+
+
+def cylinder_along(radius: float, height: float, origin, direction):
+    """A cylinder from `origin` along `direction` (used for holes)."""
+    require()
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    if float(radius) <= 0 or float(height) <= 0:
+        raise ValueError("cylinder_along: radius and height must be > 0")
+    return BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(*[float(c) for c in origin]),
+                                          gp_Dir(*[float(c) for c in direction])),
+                                    float(radius), float(height)).Shape()
+
+
+def bbox_range(shape):
+    """-> (lo, hi) corners in world coordinates."""
+    require()
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    box = Bnd_Box()
+    BRepBndLib.Add_s(shape, box)
+    if box.IsVoid():
+        return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    lo, hi = box.CornerMin(), box.CornerMax()
+    return [lo.X(), lo.Y(), lo.Z()], [hi.X(), hi.Y(), hi.Z()]
+
+
+def edge_filter(shape, selector: str = "all"):
+    """Edge indices for a fillet selector; None means every edge.
+
+    Direction comes from each edge's own bounding box, so no vertex downcast is needed. A closed
+    circular edge has no direction to classify and is only ever chosen by "all".
+    """
+    if selector in (None, "all"):
+        return None
+    if selector not in ("vertical", "horizontal", "top", "bottom"):
+        raise ValueError(f"unknown edge selection {selector!r}; use all, vertical, horizontal, top, bottom")
+    require()
+    lo, hi = bbox_range(shape)
+    out = []
+    for i, edge in enumerate(shapes_of(shape, "edge")):
+        elo, ehi = bbox_range(edge)
+        d = [ehi[k] - elo[k] for k in range(3)]
+        length = math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2)
+        if selector in ("vertical", "horizontal"):
+            if length <= 1e-9:
+                continue
+            dz = abs(d[2]) / length
+            if (selector == "vertical" and dz > 0.9) or (selector == "horizontal" and dz < 0.1):
+                out.append(i)
+        else:
+            want = hi[2] if selector == "top" else lo[2]
+            tol = 1e-6 * max(1.0, abs(hi[2]) + abs(lo[2]))
+            if all(abs(z - want) <= tol for z in (elo[2], ehi[2])):
+                out.append(i)
+    return out
 
 
 def write_step(shape, path: str) -> str:
