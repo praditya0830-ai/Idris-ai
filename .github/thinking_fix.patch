@@ -1,0 +1,157 @@
+--- a/llm.py
++++ b/llm.py
+@@ -34,6 +34,15 @@
+ KEY_ENV = {"claude": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+            "nvidia": "NVIDIA_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "qwen": "DASHSCOPE_API_KEY",
+            "kimi": "MOONSHOT_API_KEY"}
++# Newer DeepSeek/Qwen/Kimi models think before answering and the reasoning counts as output, so a 500-token
++# interpretation comes back empty (same failure NVIDIA had). IDRIS only needs the reading of the sentence, so
++# thinking is switched off where the API allows it; the Kimi K3 line cannot switch it off and gets room instead.
++THINKING_OFF = {"deepseek": {"thinking": {"type": "disabled"}},
++                "qwen": {"enable_thinking": False},
++                "kimi": {"enable_thinking": False}}
++THINKING_ONLY_PREFIX = ("kimi-k3", "kimi-k4")
++THINKING_ONLY_MIN_TOKENS = 2048
++
+ # Providers that speak the OpenAI Chat Completions shape: (base-url env, default base, path, send response_format).
+ # One adapter serves them all; the base already carries the provider's own prefix (/v1 or /compatible-mode/v1).
+ OPENAI_COMPAT = {
+@@ -192,6 +201,23 @@
+     return _post(url, {"x-goog-api-key": key}, body, timeout=timeout)
+ 
+ 
++def _thinking_only(model: str) -> bool:
++    return any(str(model).lower().startswith(p) for p in THINKING_ONLY_PREFIX)
++
++
++def _chat_body(provider: str, model: str, system: str, user: str, max_tokens: int, json_mode: bool) -> dict:
++    """Body for the OpenAI-compatible providers, including the thinking switch (see THINKING_OFF)."""
++    limit = max(max_tokens, THINKING_ONLY_MIN_TOKENS) if _thinking_only(model) else max_tokens
++    body = {"model": model, "temperature": 0, "max_tokens": limit,
++            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
++    if json_mode:
++        body["response_format"] = {"type": "json_object"}
++    extra = THINKING_OFF.get(provider)
++    if extra and not _thinking_only(model):
++        body.update(extra)
++    return body
++
++
+ def _gemini_text(d: dict) -> str:
+     try:
+         cand = d["candidates"][0]
+@@ -314,15 +340,21 @@
+     # OpenAI, DeepSeek, Qwen and Kimi speak the same Chat Completions shape: one code path, different base.
+     env_name, default_base, path, json_mode = OPENAI_COMPAT.get(provider, OPENAI_COMPAT["openai"])
+     base = (os.environ.get(env_name) or default_base).rstrip("/")
+-    body = {"model": model, "temperature": 0, "max_tokens": max_tokens,
+-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+-    if json_mode:
+-        body["response_format"] = {"type": "json_object"}
++    body = _chat_body(provider, model, system, user, max_tokens, json_mode)
+     d = _post_t(base + path, {"Authorization": "Bearer " + key}, body, timeout=t)
+     try:
+-        return d["choices"][0]["message"]["content"] or ""
++        msg = d["choices"][0]["message"]
+     except (KeyError, IndexError):
+         raise LLMError(f"empty answer from {provider}")
++    text = msg.get("content")
++    text = text if isinstance(text, str) else ""
++    if not text.strip():
++        fin = d["choices"][0].get("finish_reason") or "?"
++        why = "the model is thinking-only and used its tokens on reasoning" if _thinking_only(model) \
++            else "reasoning or the token budget left no answer"
++        raise LLMError(f"empty answer from {provider} ({model}, finish_reason={fin}; {why} - "
++                       f"raise IDRIS_MODEL_{provider.upper()} to a non-thinking model or more tokens)")
++    return text
+ 
+ 
+ # ------------------------------------------------------------------ vision (images + text)
+--- a/README.md
++++ b/README.md
+@@ -88,11 +88,29 @@
+ |---|---|
+ | `PORT` | HTTP port (default `8000`; set automatically by Render/Railway) |
+ | `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `NVIDIA_API_KEY` | Enable LLM providers; without keys `/chat` uses the built-in parser |
+-| `IDRIS_LLM_ORDER` | Provider preference, default `claude,gemini,openai,nvidia` |
++| `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (Qwen), `MOONSHOT_API_KEY` (Kimi) | Enable the OpenAI-compatible providers (DeepSeek, Qwen, Kimi) |
++| `IDRIS_LLM_ORDER` | Provider preference, default `claude,gemini,openai,nvidia,deepseek,qwen,kimi` |
+ | `IDRIS_MODEL_<PROVIDER>` | Override the model per provider |
+ | `IDRIS_LLM_PER_MIN`, `IDRIS_LLM_DAILY_CAP` | LLM rate limits (default 12/min, 400/day) |
+ | `IDRIS_REPLY_LANGUAGE` | Reply language (`en` default, `auto` follows the request) |
+ 
++### Menambah provider selain Claude (DeepSeek, Qwen, Kimi)
++
++Ketiganya memakai adapter OpenAI-compatible yang sama, jadi tidak ada kode baru per provider:
++
++1. Isi key di Render → Environment: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (Qwen), `MOONSHOT_API_KEY` (Kimi).
++   Jangan pernah menaruh key di repo atau di berkas `.env` yang ter-commit.
++2. Cek satu per satu: `GET /chat/ping?provider=deepseek` (juga `qwen`, `kimi`). Balasannya menyebut model
++   yang dicoba dan error persisnya, misalnya model yang sudah EOL atau key yang salah region.
++3. Atur urutannya: `IDRIS_LLM_ORDER=claude,deepseek,qwen,kimi` — hanya provider yang punya key yang dipakai,
++   dan provider berikutnya dicoba bila yang di depan gagal. Ganti model dengan `IDRIS_MODEL_DEEPSEEK`
++   (daftar dipisah koma, yang pertama dipilih).
++
++Default model: `deepseek-flash` / `deepseek-v4-pro`, `qwen3.8-max` / `qwen3.7-plus`, `kimi-k3.1-pro`.
++Model seri Kimi K3 hanya bisa berpikir (tidak bisa dimatikan), jadi adapter memberi mereka token lebih;
++model lain dikirimi setelan thinking-off (`thinking: disabled` untuk DeepSeek, `enable_thinking: false`
++untuk Qwen/Kimi) supaya jawaban JSON pendek tidak habis dipakai reasoning.
++
+ Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
+ you need generated files to survive deploys.
+ 
+--- a/tests/test_providers_compat.py
++++ b/tests/test_providers_compat.py
+@@ -81,3 +81,52 @@
+     monkeypatch.setenv("IDRIS_MODEL_DEEPSEEK", "my-model,other-model")
+     assert llm.models_for("deepseek") == ["my-model", "other-model"]
+     assert llm.model_for("deepseek") == "my-model"
++
++
++def test_thinking_is_switched_off_where_the_api_allows_it(monkeypatch):
++    """DeepSeek V4, Qwen3.8 and Kimi answer with reasoning tokens by default; that empties a short answer."""
++    srv, base = _serve()
++    try:
++        monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
++        monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
++        monkeypatch.setenv("MOONSHOT_API_KEY", "k")
++        monkeypatch.setenv("DEEPSEEK_BASE_URL", base)
++        monkeypatch.setenv("DASHSCOPE_BASE_URL", base)
++        monkeypatch.setenv("MOONSHOT_BASE_URL", base)
++        for prov, model in (("deepseek", "deepseek-flash"), ("qwen", "qwen3.8-max"), ("kimi", "kimi-k2.6")):
++            SEEN.clear()
++            llm._call_one(prov, model, "sys", "hi", 500)
++            body = SEEN[0][2]
++            if prov == "deepseek":
++                assert body["thinking"] == {"type": "disabled"}
++            else:
++                assert body["enable_thinking"] is False
++            assert body["max_tokens"] == 500          # a normal model keeps the caller's limit
++    finally:
++        srv.shutdown()
++
++
++def test_a_thinking_only_model_gets_room_and_no_switch(monkeypatch):
++    """kimi-k3.x cannot turn thinking off, so the switch is not sent and the token budget is raised."""
++    srv, base = _serve()
++    try:
++        monkeypatch.setenv("MOONSHOT_API_KEY", "k")
++        monkeypatch.setenv("MOONSHOT_BASE_URL", base)
++        SEEN.clear()
++        llm._call_one("kimi", "kimi-k3.1-pro", "sys", "hi", 300)
++        body = SEEN[0][2]
++        assert "enable_thinking" not in body
++        assert body["max_tokens"] == llm.THINKING_ONLY_MIN_TOKENS
++    finally:
++        srv.shutdown()
++
++
++def test_an_empty_completion_says_which_model_and_why(monkeypatch):
++    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
++    monkeypatch.setattr(llm, "_post_t", lambda *a, **k: {"choices": [{"message": {"content": ""},
++                                                                     "finish_reason": "length"}]})
++    try:
++        llm._call_one("deepseek", "deepseek-v4-pro", "sys", "hi", 500)
++        raise AssertionError("expected LLMError")
++    except llm.LLMError as e:
++        assert "deepseek-v4-pro" in str(e) and "finish_reason=length" in str(e)
