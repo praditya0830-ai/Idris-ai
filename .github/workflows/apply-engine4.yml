@@ -30,8 +30,5 @@ jobs:
           git config user.name "idris-bot"
           git config user.email "noreply@github.com"
           git add -A
-          git commit -m "fix(engine): mark the closed-form cross-check as evidence level 2
-
-          The cross-check is a closed form, not a solver result, and the level is what tells a reader how
-the number was obtained."
+          git commit -m "fix(engine): mark the closed-form cross-check as evidence level 2" -m "The cross-check is a closed form, not a solver result, and the level is what tells a reader how the number was obtained."
           git push
