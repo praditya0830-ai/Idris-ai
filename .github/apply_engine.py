@@ -1,7 +1,8 @@
-"""Apply the engineering-bench wiring to the files that already exist on main.
+"""Apply the engineering-bench wiring to the source files that already exist on main.
 
 Every edit is an exact, unique replacement and the result is checked against the blob hashes of the
-files that passed locally, so a mismatch fails the job before anything is committed.
+files that passed locally, so a mismatch fails the job before anything is committed. Workflow files are
+not touched here: the App token cannot push them.
 """
 import subprocess
 import sys
@@ -10,16 +11,9 @@ EXPECT = {
     "engine_routes.py": "e5dd51129b580085579401775e9db0ba625af680",
     "main.py": "1db1c951ae1863924ff7a2e4c1a5e2523aeae341",
     "llm.py": "811972cab2263967ecf514605f19e61fb6ec3ff1",
-    ".github/workflows/tests.yml": "b8f6007ce879c834b95d8c8be4f25ddda7ae4505",
 }
 
 EDITS = {
-    ".github/workflows/tests.yml": [(
-        "            tests/test_report.py\n",
-        "            tests/test_report.py \\\n"
-        "            tests/test_engineer.py \\\n"
-        "            tests/test_engineer_routes.py\n",
-    )],
     "engine_routes.py": [
         (
             'GET_PATHS = ("/geometry/checks", "/geometry/kernel", "/geometry/selftest")\n'
