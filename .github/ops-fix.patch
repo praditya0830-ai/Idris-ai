@@ -1,0 +1,514 @@
+diff --git a/geometry/kernel.py b/geometry/kernel.py
+index 2f67d76..46901ac 100644
+--- a/geometry/kernel.py
++++ b/geometry/kernel.py
+@@ -102,6 +102,12 @@ def as_face(shape):
+     return _typed("Face", shape)
+ 
+ 
++def as_edge(shape):
++    """Downcast to an edge. BRepFilletAPI_MakeFillet.Add wants a TopoDS_Edge, not a TopoDS_Shape:
++    passing the shape raised "Add(): incompatible function arguments" on the live server."""
++    return _typed("Edge", shape)
++
++
+ def _is_closed(shape) -> bool:
+     """Closed means no free boundary. BRep_Tool.IsClosed answers it per shell (asking a solid directly
+     returned False on the live server for a closed box), so the shells are asked first, then the solid,
+@@ -175,7 +181,7 @@ def fillet(shape, radius: float, edges=None):
+     n = 0
+     while exp.More():
+         if edges is None or n in edges:
+-            maker.Add(float(radius), exp.Current())
++            maker.Add(float(radius), as_edge(exp.Current()))
+         n += 1
+         exp.Next()
+     maker.Build()
+@@ -273,30 +279,55 @@ def _world(plane: str, u: float, v: float):
+     return gp_Pnt(u * e1[0] + v * e2[0], u * e1[1] + v * e2[1], u * e1[2] + v * e2[2])
+ 
+ 
+-def sketch_face(plane: str, profile: str, w: float, h: float | None = None):
+-    """-> planar face on `plane`. rectangle: (0,0)..(w,h); circle: centre origin, d = w;
+-    polygon: regular hexagon of inscribed radius w/2 centred on the origin."""
++def sketch_wire(plane: str, profile: str, w: float, h: float | None = None, n: int = 6,
++                thickness: float | None = None):
++    """-> closed planar wire on `plane`.
++
++    Conventions, so a caller can predict where the material lands:
++      rectangle  (0,0)..(w,h);  lshape   an L inside that same box, leg thickness `thickness`;
++      circle     centred on the origin, diameter w;
++      polygon    `n`-gon, circumscribed radius w/2, centred on the origin;
++      triangle   polygon with n = 3, flat side down.
++    """
+     require()
+-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire
++    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
+     from OCP.gp import gp_Ax2, gp_Circ, gp_Dir, gp_Pnt
+     w = float(w)
+     if w <= 0:
+         raise ValueError(f"sketch: w must be > 0, got {w}")
+     if profile == "circle":
+-        e1, _, n = plane_axes(plane)
+-        circ = gp_Circ(gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(*n), gp_Dir(*e1)), w / 2.0)
+-        wire = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circ).Edge()).Wire()
+-    elif profile == "rectangle":
++        e1, _, normal = plane_axes(plane)
++        circ = gp_Circ(gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(*normal), gp_Dir(*e1)), w / 2.0)
++        return BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circ).Edge()).Wire()
++    if profile == "rectangle":
+         hh = w if h is None else float(h)
+-        pts = [(0.0, 0.0), (w, 0.0), (w, hh), (0.0, hh)]
+-        wire = _wire_through(plane, pts)
+-    elif profile == "polygon":
++        return _wire_through(plane, [(0.0, 0.0), (w, 0.0), (w, hh), (0.0, hh)])
++    if profile == "lshape":
++        if h is None:
++            raise ValueError("sketch: an lshape needs h")
++        hh = float(h)
++        t = float(thickness) if thickness else min(w, hh) / 3.0
++        if not (0.0 < t < min(w, hh)):
++            raise ValueError(f"sketch: lshape thickness must be inside (0, {min(w, hh)}), got {t}")
++        return _wire_through(plane, [(0.0, 0.0), (w, 0.0), (w, t), (t, t), (t, hh), (0.0, hh)])
++    if profile in ("polygon", "triangle"):
++        sides = 3 if profile == "triangle" else int(n)
++        if not (3 <= sides <= 64):
++            raise ValueError(f"sketch: polygon needs 3..64 sides, got {sides}")
+         r = w / 2.0
+-        pts = [(r * math.cos(math.radians(60.0 * k)), r * math.sin(math.radians(60.0 * k))) for k in range(6)]
+-        wire = _wire_through(plane, pts)
+-    else:
+-        raise ValueError(f"unknown sketch profile {profile!r}; use rectangle, circle or polygon")
+-    return BRepBuilderAPI_MakeFace(wire).Face()
++        phase = -90.0 if profile == "triangle" else 0.0
++        pts = [(r * math.cos(math.radians(phase + 360.0 * k / sides)),
++                r * math.sin(math.radians(phase + 360.0 * k / sides))) for k in range(sides)]
++        return _wire_through(plane, pts)
++    raise ValueError(f"unknown sketch profile {profile!r}; use rectangle, circle, polygon, triangle or lshape")
++
++
++def sketch_face(plane: str, profile: str, w: float, h: float | None = None, n: int = 6,
++                thickness: float | None = None):
++    """-> planar face: the wire above, filled."""
++    require()
++    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
++    return BRepBuilderAPI_MakeFace(sketch_wire(plane, profile, w, h, n, thickness)).Face()
+ 
+ 
+ def _wire_through(plane: str, pts):
+@@ -356,21 +387,18 @@ def revolve(face, axis: str, angle_deg: float):
+     return mk.Shape()
+ 
+ 
+-def _outer_wire(face):
+-    from OCP.BRepTools import BRepTools
+-    fn = getattr(BRepTools, "OuterWire_s", None) or getattr(BRepTools, "OuterWire", None)
+-    if not callable(fn):
+-        raise KernelUnavailable("this OCP build does not expose BRepTools.OuterWire")
+-    return fn(face)
+-
+-
+ def loft(bottom, top):
+-    """Solid between two planar faces (draft: the top profile is the offset one)."""
++    """Solid between two planar WIRES (draft: the top profile is the offset one).
++
++    Wires, not faces: BRepTools.OuterWire has a different signature than expected on this OCP build
++    ("OuterWire_s(): incompatible function arguments" on the live server), so nothing here has to
++    extract a wire out of a face.
++    """
+     require()
+     from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+     mk = BRepOffsetAPI_ThruSections(True, True)
+-    for face in (bottom, top):
+-        mk.AddWire(_outer_wire(face))
++    for wire in (bottom, top):
++        mk.AddWire(wire)
+     mk.Build()
+     if not mk.IsDone():
+         raise RuntimeError("loft failed in the kernel (draft angle too large for the profile?)")
+diff --git a/model/builder.py b/model/builder.py
+index 953282f..a8de5f1 100644
+--- a/model/builder.py
++++ b/model/builder.py
+@@ -42,6 +42,8 @@ class Part:
+     profile: str | None = None
+     size: tuple = ()
+     summary: dict | None = None      # kernel summary once the node is a solid
++    args: dict = None               # the sketch parameters, so a later op can rebuild the profile
++    checks: tuple = ()              # the invariant checks this shape passed (pattern allows several bodies)
+ 
+     @property
+     def is_solid(self) -> bool:
+@@ -90,15 +92,46 @@ def _solid(parent: Part, op: str) -> Part:
+     return parent
+ 
+ 
+-def _verify(k, shape, op: str) -> dict:
+-    """Measure, then gate on the invariants. A failing solid never leaves the builder."""
++def _verify(k, shape, op: str, allow_multi: bool = False) -> dict:
++    """Measure, then gate on the invariants. A failing solid never leaves the builder.
++
++    `allow_multi` is for a pattern of copies that do not touch: that is a compound of several bodies,
++    which is a legitimate result, so `solid.single` is replaced by a body-count check instead of being
++    quietly dropped.
++    """
+     summary = k.measure(shape)
+     checks = INV.solid_checks(summary)
++    if allow_multi:
++        bodies = int(summary.get("solids") or 0)
++        checks = [c for c in checks if c["id"] != "solid.single"]
++        checks.append({"id": "solid.bodies_positive", "ok": bodies >= 1, "detail": f"solids = {bodies}"})
+     failed = [c["id"] for c in INV.failures(checks)]
+     if failed:
+         raise BuildError(f"{op}: the kernel produced a shape that fails {failed} "
+                          f"(summary: {json.dumps(summary, sort_keys=True, default=str)})")
+-    return summary
++    return summary, checks
++
++
++def _solid_part(k, shape, op: str, parent: Part, allow_multi: bool = False) -> Part:
++    """Wrap a finished body, keeping the checks it passed so the report cannot disagree with the gate."""
++    summary, checks = _verify(k, shape, op, allow_multi)
++    return Part(shape, op, parent.plane, parent.profile, parent.size, summary,
++                getattr(parent, "args", None), tuple(checks))
++
++
++def _wire_for(k, parent: Part, grow: float = 0.0):
++    """Rebuild the parent's sketch wire, optionally grown by `grow` on every side (draft)."""
++    a = getattr(parent, "args", None) or {}
++    if not a:
++        raise BuildError("draft or offset needs the sketch parameters, and this input was not sketched")
++    w = float(a["w"]) + 2.0 * grow
++    h = None if a.get("h") is None else float(a["h"]) + 2.0 * grow
++    wire = k.sketch_wire(a["plane"], a["profile"], w, h, int(a.get("n") or 6), a.get("thickness"))
++    offset = float(a.get("offset") or 0.0)
++    if offset:
++        _, _, normal = k.plane_axes(a["plane"])
++        wire = k.translate(wire, _scale(normal, offset))
++    return wire
+ 
+ 
+ def _extents(k, shape):
+@@ -112,10 +145,22 @@ def _sketch(k, p: dict, op: str) -> Part:
+     profile = str(p.get("profile") or "rectangle")
+     w = float(p["w"])
+     h = float(p["h"]) if p.get("h") is not None else None
+-    if profile == "rectangle" and h is None:
+-        raise BuildError("sketch: a rectangle needs h")
+-    face = k.sketch_face(plane, profile, w, h)
+-    return Part(face, op, plane, profile, (w, h if h is not None else w))
++    n = int(p.get("n") or 6)
++    thickness = float(p["thickness"]) if p.get("thickness") is not None else None
++    offset = float(p.get("offset") or 0.0)
++    if profile in ("rectangle", "lshape") and h is None:
++        raise BuildError(f"sketch: a {profile} needs h")
++    if profile == "lshape":
++        leg = thickness if thickness is not None else min(w, h) / 3.0
++        if not (0.0 < leg < min(w, h)):
++            raise BuildError(f"sketch: lshape thickness must be inside (0, {min(w, h)}), got {leg}")
++    face = k.sketch_face(plane, profile, w, h, n, thickness)
++    if offset:
++        _, _, normal = k.plane_axes(plane)
++        face = k.translate(face, _scale(normal, offset))
++    args = {"plane": plane, "profile": profile, "w": w, "h": h, "n": n,
++            "thickness": thickness, "offset": offset}
++    return Part(face, op, plane, profile, (w, h if h is not None else w), None, args)
+ 
+ 
+ def _extrude(k, parent: Part, p: dict, op: str) -> Part:
+@@ -138,22 +183,25 @@ def _extrude(k, parent: Part, p: dict, op: str) -> Part:
+     else:
+         # A draft is a real offset, not a scale: the top profile is grown by distance*tan(draft).
+         grow = abs(distance) * math.tan(math.radians(draft))
+-        w, h = parent.size
+-        if parent.profile == "rectangle":
+-            top_face = k.sketch_face(parent.plane, "rectangle", w + 2 * grow, h + 2 * grow)
+-        elif parent.profile == "circle":
+-            top_face = k.sketch_face(parent.plane, "circle", w + 2 * grow)
+-        else:
+-            top_face = k.sketch_face(parent.plane, "polygon", w + 2 * grow)
+-        top = k.translate(top_face, vec)
+-        shape = k.loft(base, top)
+-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
++        bottom = _wire_for(k, parent)
++        top = k.translate(_wire_for(k, parent, grow), vec)
++        if direction == "symmetric":
++            bottom = k.translate(bottom, _scale(vec, -0.5))
++        shape = k.loft(bottom, top)
++    return _solid_part(k, shape, op, parent)
+ 
+ 
+ def _revolve(k, parent: Part, p: dict, op: str) -> Part:
+     angle = float(p.get("angle_deg") or 360.0)
+-    shape = k.revolve(parent.shape, str(p.get("axis") or "z"), angle)
+-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
++    axis = str(p.get("axis") or "z").lower()
++    perpendicular = {"XY": "z", "XZ": "y", "YZ": "x"}.get(parent.plane)
++    if axis == perpendicular:
++        raise BuildError(
++            f"revolve: axis {axis!r} is perpendicular to the {parent.plane} sketch plane, so the profile "
++            "would only sweep out of its own plane into a flat sheet; use an axis lying in the plane "
++            f"(not {perpendicular!r})")
++    shape = k.revolve(parent.shape, axis, angle)
++    return _solid_part(k, shape, op, parent)
+ 
+ 
+ def _hole(k, parent: Part, p: dict, op: str) -> Part:
+@@ -183,7 +231,7 @@ def _hole(k, parent: Part, p: dict, op: str) -> Part:
+         raise BuildError(
+             f"{op}: the hole at (x={x}, y={y}) removed no material, so it misses the part "
+             f"(volume {before:.3f} -> {after:.3f} mm3)")
+-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
++    return _solid_part(k, shape, op, parent)
+ 
+ 
+ def _fillet(k, parent: Part, p: dict, op: str) -> Part:
+@@ -196,7 +244,7 @@ def _fillet(k, parent: Part, p: dict, op: str) -> Part:
+         shape = k.fillet(parent.shape, radius, edges)
+     except Exception as exc:                     # the kernel's own message is the useful one
+         raise BuildError(f"{op}: {exc}") from None
+-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
++    return _solid_part(k, shape, op, parent)
+ 
+ 
+ def _pattern(k, parent: Part, p: dict, op: str) -> Part:
+@@ -221,7 +269,8 @@ def _pattern(k, parent: Part, p: dict, op: str) -> Part:
+             shape = k.boolean("fuse", shape, k.rotate(parent.shape, axis, angle * i))
+     else:
+         raise BuildError(f"{op}: unknown pattern mode {mode!r}")
+-    return Part(shape, op, parent.plane, parent.profile, parent.size, _verify(k, shape, op))
++    # Copies that do not touch stay separate bodies: that is a valid pattern, not a failed solid.
++    return _solid_part(k, shape, op, parent, allow_multi=True)
+ 
+ 
+ def _import(k, p: dict, op: str, parts_dir: str) -> Part:
+@@ -296,7 +345,7 @@ def build(graph, changed=None, cache: dict | None = None, keys: dict | None = No
+         if part.is_solid:
+             entry["summary"] = part.summary
+             entry["fingerprint"] = FP.fingerprint(part.summary)
+-            entry["checks"] = INV.solid_checks(part.summary)
++            entry["checks"] = list(part.checks) or INV.solid_checks(part.summary)
+             final = {"feature": fid, **entry}
+         else:
+             entry["kind"] = "face"
+diff --git a/model/ops.py b/model/ops.py
+index fee7cfe..a95490d 100644
+--- a/model/ops.py
++++ b/model/ops.py
+@@ -28,9 +28,15 @@ def _e(required=False, default=None, desc=""):
+ SCHEMAS = {
+     "sketch": {
+         "plane": {"type": "string", "enum": PLANES, "default": "XY", "desc": "sketch plane"},
+-        "profile": {"type": "string", "enum": ["rectangle", "circle", "polygon"], "default": "rectangle"},
+-        "w": _e(True, desc="width / diameter"),
+-        "h": _e(False, desc="height (rectangle/polygon)"),
++        "profile": {"type": "string", "default": "rectangle",
++                    "enum": ["rectangle", "circle", "polygon", "triangle", "lshape"],
++                    "desc": "rectangle/lshape sit in (0,0)..(w,h); circle/polygon/triangle are centred on the origin"},
++        "w": _e(True, desc="width / diameter / circumscribed diameter"),
++        "h": _e(False, desc="height (rectangle/lshape) or width of the leg"),
++        "n": {"type": "integer", "min": 3, "max": 64, "default": 6,
++              "desc": "sides of a polygon (triangle ignores it)"},
++        "thickness": _e(False, desc="leg thickness of an lshape (default min(w,h)/3)"),
++        "offset": _e(False, desc="distance from the plane along its normal: lets a sketch sit inside the model"),
+     },
+     "extrude": {
+         "distance": _e(True),
+@@ -107,7 +113,7 @@ def validate_params(op: str, params, dims: dict):
+         except E.ExprError as exc:
+             errors.append(f"{op}.{name}: {exc}")
+             continue
+-        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg"):
++        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg", "offset"):
+             errors.append(f"{op}.{name}: must be > 0, got {value}")
+             continue
+         resolved[name] = value
+diff --git a/tests/test_model_build.py b/tests/test_model_build.py
+index a3717aa..39d7a43 100644
+--- a/tests/test_model_build.py
++++ b/tests/test_model_build.py
+@@ -52,7 +52,7 @@ class FakeKernel:
+             raise ValueError(f"unknown sketch plane {plane!r}") from None
+ 
+     @staticmethod
+-    def sketch_face(plane, profile, w, h=None):
++    def sketch_face(plane, profile, w, h=None, n=6, thickness=None):
+         FakeKernel.calls.append(("sketch_face", plane, profile, w, h))
+         return {"kind": "face", "plane": plane, "profile": profile, "w": float(w),
+                 "h": float(w if h is None else h)}
+diff --git a/tests/test_model_ops_matrix.py b/tests/test_model_ops_matrix.py
+new file mode 100644
+index 0000000..0793037
+--- /dev/null
++++ b/tests/test_model_ops_matrix.py
+@@ -0,0 +1,170 @@
++"""Every sketch profile and operation the engine offers, checked feature by feature.
++
++These tests keep the promise that a documented op actually works: the matrix found on the live server
++(draft broken by BRepTools.OuterWire, every fillet broken because the edge was not downcast, a linear
++pattern rejected as "not one solid") is exactly what this file pins down. The fake kernel here is a
++little more faithful than the one in test_model_build: it knows wires, so the draft path (prism vs
++loft) is exercised without OpenCascade.
++"""
++import math
++
++import pytest
++
++from model import builder as B
++from model.graph import Graph
++from test_model_build import BRACKET, PLANES, FakeKernel, _area
++
++CENTRED = ("circle", "polygon", "triangle")
++
++
++class WireKernel(FakeKernel):
++    """FakeKernel plus sketch_wire / wire-loft, so drafts can be built without OCP."""
++
++    @staticmethod
++    def sketch_wire(plane, profile, w, h=None, n=6, thickness=None):
++        if profile in ("rectangle", "lshape") and h is None:
++            raise ValueError(f"sketch: a {profile} needs h")
++        return {"kind": "wire", "plane": plane, "profile": profile, "w": float(w),
++                "h": float(w if h is None else h), "n": int(n), "thickness": thickness}
++
++    @staticmethod
++    def sketch_face(plane, profile, w, h=None, n=6, thickness=None):
++        wire = WireKernel.sketch_wire(plane, profile, w, h, n, thickness)
++        return {"kind": "face", "plane": plane, "profile": profile, "w": float(w),
++                "h": float(w if h is None else h)}
++
++    @staticmethod
++    def translate(shape, vector):
++        return dict(shape, moved=list(vector), bbox=list(shape["bbox"]) if "bbox" in shape else None)
++
++    @staticmethod
++    def loft(bottom, top):
++        grow = top["w"] - bottom["w"]
++        return {"kind": "solid", "volume": _area(bottom) * 10.0 + grow, "bbox": [bottom["w"], bottom["h"], 10.0],
++                "plane": bottom["plane"], "profile": bottom["profile"],
++                "size": [bottom["w"], bottom["h"]]}
++
++
++def model(*features, dims=None):
++    return Graph.from_dict({"model_id": "t", "dims": dims or {}, "features": list(features)})
++
++
++def sketch(**params):
++    return {"id": "f1", "op": "sketch", "deps": [], "params": params}
++
++
++def op(name, deps, **params):
++    return {"id": "f2", "op": name, "deps": [deps], "params": params}
++
++
++def build(*features, dims=None, k=WireKernel):
++    return B.build(model(*features, dims=dims), k=k)
++
++
++# ------------------------------------------------------------------ sketch profiles
++@pytest.mark.parametrize("profile", ["rectangle", "circle", "polygon", "triangle", "lshape"])
++def test_every_documented_profile_builds(profile):
++    params = {"plane": "XY", "profile": profile, "w": 30, "h": 20}
++    out = build(sketch(**params), op("extrude", "f1", distance=4))
++    assert out["status"] == "ok", out["errors"]
++    assert out["features"]["f2"]["summary"]["volume_mm3"] > 0
++
++
++def test_a_polygon_takes_its_side_count():
++    out = build(sketch(plane="XY", profile="polygon", w=30, n=8), op("extrude", "f1", distance=2))
++    assert out["status"] == "ok"
++    assert out["features"]["f2"]["summary"]["volume_mm3"] > 0
++
++
++def test_an_lshape_needs_a_height_and_a_sane_thickness():
++    out = build(sketch(plane="XY", profile="lshape", w=30), op("extrude", "f1", distance=4))
++    assert out["status"] == "quarantined" and "needs h" in out["quarantined"][0]["reason"]
++
++    out = build(sketch(plane="XY", profile="lshape", w=30, h=20, thickness=40),
++                op("extrude", "f1", distance=4))
++    assert out["status"] == "quarantined" and "thickness" in out["quarantined"][0]["reason"]
++
++
++def test_a_sketch_can_sit_away_from_its_plane():
++    """offset is what makes a multi-level part possible: the sketch is not stuck at the plane."""
++    flat = build(sketch(plane="XY", profile="rectangle", w=10, h=10), op("extrude", "f1", distance=2))
++    lifted = build(sketch(plane="XY", profile="rectangle", w=10, h=10, offset=12),
++                   op("extrude", "f1", distance=2))
++    assert flat["status"] == lifted["status"] == "ok"
++    assert WireKernel.sketch_wire("XY", "rectangle", 10, 10)["kind"] == "wire"
++    # the offset travels with the face: the builder asks the kernel to translate it
++    assert "offset" in Graph.from_dict({"model_id": "o", "features": [
++        {"id": "f1", "op": "sketch", "deps": [], "params": {"profile": "rectangle", "w": 1, "h": 1, "offset": 3}}]}
++    ).get("f1").params
++
++
++# ----------------------------------------------------------------------- extrude
++def test_extrude_directions_are_all_accepted():
++    for direction in ("+normal", "-normal", "symmetric"):
++        out = build(sketch(plane="XY", profile="rectangle", w=10, h=10),
++                    op("extrude", "f1", distance=4, direction=direction))
++        assert out["status"] == "ok", (direction, out["errors"])
++
++
++def test_a_draft_uses_a_loft_and_survives_the_kernel():
++    out = build(sketch(plane="XY", profile="rectangle", w=20, h=10),
++                op("extrude", "f1", distance=10, draft_deg=5))
++    assert out["status"] == "ok", out["errors"]
++    assert out["features"]["f2"]["summary"]["volume_mm3"] > 0
++
++
++# ----------------------------------------------------------------------- revolve
++def test_revolve_works_around_an_axis_in_the_sketch_plane():
++    out = build(sketch(plane="XZ", profile="rectangle", w=10, h=20),
++                op("revolve", "f1", axis="z", angle_deg=270))
++    assert out["status"] == "ok", out["errors"]
++
++
++def test_revolve_refuses_an_axis_perpendicular_to_the_sketch_plane():
++    out = build(sketch(plane="XZ", profile="rectangle", w=10, h=20),
++                op("revolve", "f1", axis="y"))
++    assert out["status"] == "quarantined"
++    assert "perpendicular" in out["quarantined"][0]["reason"]
++
++
++# ------------------------------------------------------------------ fillet/pattern
++def test_fillet_reaches_every_selector():
++    for selector in ("all", "vertical", "horizontal", "top", "bottom"):
++        out = build(sketch(plane="XY", profile="rectangle", w=20, h=10),
++                    op("extrude", "f1", distance=4),
++                    {"id": "f3", "op": "fillet", "deps": ["f2"], "params": {"radius": 1, "edges": selector}})
++        assert out["status"] == "ok", (selector, out["errors"])
++
++
++def test_a_linear_pattern_of_separate_copies_is_not_called_a_broken_solid():
++    model = {"model_id": "p", "features": [
++        {"id": "f1", "op": "sketch", "deps": [], "params": {"plane": "XY", "profile": "rectangle", "w": 10, "h": 10}},
++        {"id": "f2", "op": "extrude", "deps": ["f1"], "params": {"distance": 4}},
++        {"id": "f3", "op": "pattern", "deps": ["f2"],
++         "params": {"mode": "linear", "count": 3, "dx": 20}}]}
++    out = B.build(Graph.from_dict(model), k=SeparateBodies)
++    assert out["status"] == "ok", out["errors"]
++    ids = {c["id"] for c in out["features"]["f3"]["checks"]}
++    assert "solid.single" not in ids and "solid.bodies_positive" in ids
++
++
++class SeparateBodies(WireKernel):
++    """A fuse of copies that do not touch: the kernel reports three solids."""
++
++    @staticmethod
++    def boolean(op, a, b):
++        if op == "fuse":
++            return dict(a, volume=a["volume"] + b["volume"], solids=3)
++        return dict(a)
++
++    @staticmethod
++    def measure(shape):
++        out = WireKernel.measure(shape)
++        out["solids"] = int(shape.get("solids") or 1)
++        return out
++
++
++def test_the_bracket_from_the_first_release_still_builds():
++    out = B.build(Graph.from_dict(BRACKET), k=WireKernel)
++    assert out["status"] == "ok", out["errors"]
++    assert out["final"]["feature"] == "f3"
