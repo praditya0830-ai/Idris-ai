@@ -1,4 +1,4 @@
-"/chat has to hand a computable question to the bench, not to the CAD/library reader.
+"""The chat has to hand a computable question to the bench, not to the CAD/library reader.
 
 Found in a live end-to-end test: "berapa torsi baut M10 kelas 8.8?" was answered by the standard-parts
 library (a screw with a length question) and the bench never ran, and a part question whose evidence block
