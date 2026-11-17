@@ -1,3 +1,4 @@
+# One-shot: wires ai/engineer.py into engine_routes/main/llm, then this file and the script are deleted.
 name: apply-engine
 
 on:
