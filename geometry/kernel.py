@@ -108,6 +108,12 @@ def as_edge(shape):
     return _typed("Edge", shape)
 
 
+def as_wire(shape):
+    """Downcast to a wire. Every transform here returns a generic TopoDS_Shape, and
+    BRepOffsetAPI_ThruSections.AddWire refuses that ("AddWire(): incompatible function arguments")."""
+    return _typed("Wire", shape)
+
+
 def _is_closed(shape) -> bool:
     """Closed means no free boundary. BRep_Tool.IsClosed answers it per shell (asking a solid directly
     returned False on the live server for a closed box), so the shells are asked first, then the solid,
@@ -398,7 +404,7 @@ def loft(bottom, top):
     from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
     mk = BRepOffsetAPI_ThruSections(True, True)
     for wire in (bottom, top):
-        mk.AddWire(wire)
+        mk.AddWire(as_wire(wire))
     mk.Build()
     if not mk.IsDone():
         raise RuntimeError("loft failed in the kernel (draft angle too large for the profile?)")
