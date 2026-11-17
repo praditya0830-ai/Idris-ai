@@ -1,0 +1,37 @@
+name: apply-engine3b
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-engine3b.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apply the fix and prove the files still parse
+        run: |
+          git apply --check .github/fix3.patch
+          git apply --whitespace=nowarn .github/fix3.patch
+          python3 - <<'PY'
+          import ast, pathlib
+          for p in ["ai/engineer.py", "ai/fea.py", "tests/test_fea_bench.py"]:
+              ast.parse(pathlib.Path(p).read_text())
+              print(p, "parses")
+          PY
+
+      - name: commit and push
+        run: |
+          git config user.name "idris-bot"
+          git config user.email "noreply@github.com"
+          git add -A
+          git commit -m "fix(engine): correct the topic keyword and the off-axis cross-check
+
+          The fea topic pattern lost a letter on the way in, and the closed-form span was always the x
+          extent. A cantilever along y now gets its own span and depth, with a test that pins it."
+          git push
