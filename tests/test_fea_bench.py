@@ -29,6 +29,14 @@ def test_cantilever_agrees_with_the_closed_form():
     assert sigma_fe == pytest.approx(sigma_cf, rel=0.15)
 
 
+def test_a_cantilever_across_the_other_axis_is_checked_against_its_own_span():
+    # 10 wide in x, 40 long in y: the span is the y extent and the depth is the x extent
+    r = FEA.analyze(box_mesh(L=10.0, W=40.0, H=10.0), material="steel", case="cantilever_tip_x",
+                    force_n=200, target_elements=20000)
+    assert r["cross_check"]["span_mm"] == pytest.approx(40.0, abs=1e-6)
+    assert r["cross_check"]["ratio_sigma"] == pytest.approx(1.0, abs=0.15)
+
+
 def test_the_snapped_element_size_voxelizes_the_box_exactly():
     r = FEA.analyze(box_mesh(), material="steel", case="cantilever_tip", force_n=100, target_elements=20000)
     assert abs(r["volume"]["error_pct"]) <= 1.0, r["volume"]

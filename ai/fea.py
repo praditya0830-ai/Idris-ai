@@ -190,9 +190,14 @@ def _cross_check(kind: str, out: dict, span, applied: float) -> dict:
     (x0, y0, z0), (x1, y1, z1) = _bbox(pos)
     E = float(out["material"]["E"])
     if kind in ("cantilever", "cantilever_x", "beam_center"):
-        length = span
-        b = (y1 - y0)
-        h = (z1 - z0)
+        if kind == "cantilever_x":
+            length = y1 - y0
+            b = z1 - z0
+            h = x1 - x0
+        else:
+            length = span
+            b = y1 - y0
+            h = z1 - z0
         I = b * h ** 3 / 12.0 if b > 0 and h > 0 else 0.0
         if I <= 0:
             return {}

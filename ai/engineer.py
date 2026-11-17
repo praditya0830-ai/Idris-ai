@@ -409,7 +409,7 @@ def _topic(low: str, g: dict) -> str | None:
         return str(g["topic"]).lower()
     # a closed mesh in `given` is the signal that the question is about this part, not about an analogy
     if isinstance(g.get("geometry"), dict) or re.search(
-            r"\b(fea|von mises|simulasi|part-check|hekuatan|kuat|strength|strong|aman tidak)\b", low):
+            r"\b(fea|von mises|simulasi|part-check|kekuatan|kuat|strength|strong|aman tidak)\b", low):
         return "fea"
     if re.search(r"\b(baut|bolt|preload|torque|torsi)\b", low):
         return "bolt"
