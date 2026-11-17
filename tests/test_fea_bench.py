@@ -54,6 +54,8 @@ def test_equilibrium_check_passes_and_sf_is_sy_over_sigma():
 def test_a_load_above_yield_is_reported_as_fail_not_softened():
     r = FEA.analyze(box_mesh(), material="steel", case="cantilever_tip", force_n=4000, target_elements=8000)
     assert any(a.startswith("FAIL") for a in r["advice"]), r["advice"]
+    # stiffness is not "the limit" when the part has already yielded
+    assert not any(a.startswith("FLEXIBLE") for a in r["advice"]), r["advice"]
 
 
 def test_the_solver_refuses_a_case_it_does_not_have():

@@ -229,7 +229,7 @@ def _advice(sf, sigma, sy, delta, span, eq_err, vol_err, cross) -> list:
     if vol_err > 5.0:
         out.append(f"COARSE MESH: voxel volume is off by {vol_err:.1f} %. Refine element_size_mm before "
                    f"quoting a peak stress.")
-    if delta and span and delta > span / 100.0:
+    if sf >= 1.0 and delta and span and delta > span / 100.0:
         out.append(f"FLEXIBLE: {delta:.2f} mm over a {span:.0f} mm span is more than L/100; "
                    f"stiffness, not strength, is the limit here.")
     if cross.get("ratio_sigma"):
