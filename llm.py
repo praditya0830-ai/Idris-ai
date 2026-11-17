@@ -529,7 +529,10 @@ def interpret(provider, message: str, current=None, variants=None, selected=None
               reply_language=None) -> dict:
     """provider=None/'auto' -> try the server's configured order; a specific name forces that provider (testing).
     `context` (UI v19): {advice, envelope_basis, pending_question, variant_warnings} -> discussion mode."""
-    if isinstance(context, dict) and (context.get("advice") or context.get("pending_question")):
+    # engineering evidence is material to discuss, not a requirements sentence: quoting it needs a normal
+    # prose answer, and the structured reader would reject that answer as malformed
+    if isinstance(context, dict) and (context.get("advice") or context.get("pending_question")
+                                      or context.get("engineering")):
         return discuss(provider, message, current, variants, selected, context, reply_language)
     if not isinstance(message, str) or not message.strip():
         raise LLMError("empty message", 400)
