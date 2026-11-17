@@ -380,6 +380,7 @@ def solve(text: str, given: dict | None = None) -> dict:
     topic = _topic(low, g)
     if topic == "fea":
         return _solve_fea(g, msg, low)
+    advice = []
     try:
         if topic == "beam":
             claims, missing = _solve_beam(g, low)
@@ -393,15 +394,20 @@ def solve(text: str, given: dict | None = None) -> dict:
             claims, missing = _solve_chem(g, msg)
         elif topic == "math":
             claims, missing = _solve_math(g, msg)
+        elif topic == "gear":
+            claims, missing, advice = _solve_gear(g)
         else:
             notes.append("no engineering quantity recognised: ask the engineer what is wanted "
-                         "(beam, column, bolt, thermal, chemistry, arithmetic)")
+                         "(part strength, beam, column, bolt, thermal, gear pair, chemistry, arithmetic)")
     except (ValueError, KeyError, ZeroDivisionError) as exc:
         notes.append(f"not computed: {exc}")
         return {"topic": topic, "claims": [], "missing": missing, "notes": notes}
 
-    return {"topic": topic, "claims": claims, "missing": missing, "notes": notes, "request": msg,
-            "material": g.get("material") if isinstance(g.get("material"), dict) else None}
+    out = {"topic": topic, "claims": claims, "missing": missing, "notes": notes, "request": msg,
+           "material": g.get("material") if isinstance(g.get("material"), dict) else None}
+    if advice:
+        out["advice"] = advice
+    return out
 
 
 def _topic(low: str, g: dict) -> str | None:
@@ -419,6 +425,8 @@ def _topic(low: str, g: dict) -> str | None:
         return "thermal"
     if re.search(r"\b(balok|beam|defleksi|deflection|lendut|tegangan|stress|bending)\b", low):
         return "beam"
+    if re.search(r"\b(gigi|gear|roda gigi|iso 6336|pitting|spur|helical)\b", low):
+        return "gear"
     if re.search(r"\b(molar|mol|ph|asam|basa|gas ideal|stoikiometri|senyawa)\b", low):
         return "chem"
     if re.search(r"[-+*/^()]", low) and re.search(r"\d", low):
@@ -611,7 +619,10 @@ def _solve_fea(g, msg, low) -> dict:
                                "why": "the solver needs the closed mesh of the part (the studio kernel sends it)"})
         return out
     force = g.get("force_n")
-    if force is None and not g.get("force_vector"):
+    supports = g.get("supports") if isinstance(g.get("supports"), list) else None
+    loads = g.get("loads") if isinstance(g.get("loads"), list) else None
+    explicit = bool(supports) and bool(loads)
+    if force is None and not g.get("force_vector") and not explicit:
         out["missing"].append({"input": "force_n", "unit": "N",
                                "why": "the load is the input, not a guess; say the force and its direction"})
         return out
@@ -620,14 +631,81 @@ def _solve_fea(g, msg, low) -> dict:
         r = FEA.analyze(geometry, material=str(g.get("material_name") or "steel"),
                         case=str(g.get("case") or "cantilever_tip"), force_n=force,
                         force_vector=g.get("force_vector"), element_size_mm=g.get("element_size_mm"),
-                        target_elements=int(g.get("target_elements") or 20000))
+                        target_elements=int(g.get("target_elements") or 20000),
+                        supports=supports, loads=loads)
     except (ValueError, KeyError, ImportError) as exc:
         out["notes"].append(f"not computed: {exc}")
         return out
     out.update({"claims": r["claims"], "checks": r["checks"], "advice": r["advice"],
-                "cross_check": r["cross_check"], "mesh": r["mesh"], "volume": r["volume"],
+                "cross_check": r["cross_check"], "review": r["review"],
+                "review_summary": r["review_summary"], "mesh": r["mesh"], "volume": r["volume"],
                 "material": r["material"], "case": r["case_label"], "solve_time_s": r["solve_time_s"]})
     return out
+
+
+GEAR_INPUTS = {
+    "mn": ("mm", "normal module"),
+    "z1": ("-", "pinion tooth count"),
+    "z2": ("-", "wheel tooth count"),
+    "b": ("mm", "face width"),
+    "torque_1_nm": ("N·m", "pinion torque"),
+    "n1_rpm": ("1/min", "pinion speed"),
+    "K_Hbeta": ("-", "face load factor (from the shaft/gearbox, not a default)"),
+    "sigma_Hlim1": ("MPa", "contact fatigue limit of the pinion material (ISO 6336-5)"),
+}
+GEAR_OPTIONAL = ("beta_deg", "x1", "x2", "alpha_n_deg", "accuracy_grade", "sigma_Hlim2",
+                 "material_type", "haP", "hfP", "K_A", "a_w")
+
+
+def _solve_gear(g) -> tuple[list, list, list]:
+    """ISO 6336-2 pitting rating of a gear pair, from the solver that is benchmarked against the
+    standard's worked example (0.2 % on every published quantity). No factor is defaulted.
+    """
+    missing, advice = [], []
+    vals = {}
+    for key, (unit, why) in GEAR_INPUTS.items():
+        if g.get(key) is None:
+            missing.append({"input": key, "unit": unit, "why": why})
+        else:
+            vals[key] = float(g[key])
+    if missing:
+        return [], missing, []
+    for key in GEAR_OPTIONAL:
+        if g.get(key) is not None:
+            vals[key] = g[key]
+    from physics.iso6336 import rate_pair
+    o = rate_pair(vals)["outputs"]
+    contact, loads = o["contact"], o["loads"]
+    src = "ISO 6336-2:2019 Method B (verified against the standard's worked example, 0.2 %)"
+    claims = [
+        _claim("gear.sigma_H1", "contact stress, pinion", float(contact["sigma_H1"]), "MPa",
+               "σ_H = Z_H·Z_E·Z_ε·Z_β·sqrt(F_t/(d_1·b)·(u+1)/u)·sqrt(K_A·K_v·K_Hβ·K_Hα)",
+               {"F_t_N": loads["F_t"], "z1": vals["z1"], "z2": vals["z2"], "b_mm": vals["b"]}, src,
+               evidence=2),
+        _claim("gear.sigma_HP1", "permissible contact stress, pinion", float(contact["sigma_HP1"]), "MPa",
+               "σ_HP = σ_Hlim·Z_NT·Z_L·Z_v·Z_R·Z_X·Z_W / S_Hmin",
+               {"sigma_Hlim1_MPa": vals["sigma_Hlim1"]}, src, evidence=2),
+        _claim("gear.S_H1", "contact safety factor, pinion", float(contact["S_H1"]), "-",
+               "S_H = σ_HP / σ_H", {"sigma_HP1_MPa": contact["sigma_HP1"], "sigma_H1_MPa": contact["sigma_H1"]},
+               src, evidence=2),
+        _claim("gear.S_H2", "contact safety factor, wheel", float(contact["S_H2"]), "-",
+               "S_H = σ_HP / σ_H (wheel side)", {}, src, evidence=2),
+        _claim("gear.F_t", "tangential force", float(loads["F_t"]), "N", "F_t = 2000·T_1/d_1",
+               {"torque_1_nm": vals["torque_1_nm"]}, src, evidence=2),
+        _claim("gear.ratio", "gear ratio", float(vals["z2"]) / float(vals["z1"]), "-", "u = z2/z1",
+               {"z1": vals["z1"], "z2": vals["z2"]}, "definition", evidence=2),
+    ]
+    s_min = min(float(contact["S_H1"]), float(contact["S_H2"]))
+    if s_min < 1.0:
+        advice.append(f"FAIL: contact safety factor {s_min:.2f} is below 1: the flank pits. "
+                      f"Widen the face, raise the module, or use a higher σ_Hlim material.")
+    elif s_min < 1.25:
+        advice.append(f"THIN: contact safety factor {s_min:.2f}. One load case just fits; "
+                      f"misalignment or a higher K_Hβ removes the margin.")
+    else:
+        advice.append(f"OK: contact safety factor {s_min:.2f} on pitting (ISO 6336-2).")
+    advice.append("Only pitting is rated here; tooth-root bending of this pair is a separate check.")
+    return claims, [], advice
 
 
 def _solve_math(g, msg) -> tuple[list, list]:
@@ -663,7 +741,9 @@ def verify(answer: str, eng: dict | None, allowed=()) -> dict:
             continue
     # an answer may also quote what the engineer stated (M10, class 8.8, span 500), the claim inputs,
     # and the computed advice/check text (those numbers were produced by the bench as well)
-    extra = [c.get("detail") for c in (eng or {}).get("checks", [])] + list((eng or {}).get("advice", []))
+    extra = ([c.get("detail") for c in (eng or {}).get("checks", [])]
+             + list((eng or {}).get("advice", []))
+             + [f.get("message") for f in (eng or {}).get("review", [])])
     for src in [(eng or {}).get("request") or ""] + extra \
             + [c.get("inputs") for c in (eng or {}).get("claims", [])]:
         for m in _NUM.finditer(src if isinstance(src, str) else str(src)):
@@ -712,6 +792,8 @@ def chat_block(eng: dict | None) -> str:
         lines.append(f"NOTE: {n}")
     for c in eng.get("checks", []):
         lines.append(f"CHECK {c['id']}: {'pass' if c['ok'] else 'FAIL'} — {c['detail']}")
+    for f in eng.get("review", []):
+        lines.append(f"REVIEW {f['code']} ({f['severity']}): {f['message']}")
     if eng.get("advice"):
         lines.append("ENGINEER'S READ (from the numbers above; quote it, do not soften it):")
         for a in eng["advice"]:
@@ -771,6 +853,52 @@ LESSONS = {
             {"do": "Compare peak stress with yield, not with ultimate", "tool": "Mass Properties"},
         ],
         "check": "the reaction sum should equal the applied load; if it does not, the model is not in equilibrium",
+    },
+    "hole": {
+        "title": "A hole is a hole feature, not a circle you cut",
+        "why": "a circle drawn in a sketch and extruded-cut leaves no thread, no countersink and no standard size, "
+               "and it moves when the sketch changes; a hole feature carries the size, the depth and the callout",
+        "steps": [
+            {"do": "Place the hole from the face it is drilled into, not from the sketch that made the face",
+             "tool": "Hole"},
+            {"do": "Pick the standard size (M6, Ø8) and the depth: through-all for a bolt, blind for a thread",
+             "tool": "Hole"},
+            {"do": "Check the edge distance is at least 1.5x the diameter", "tool": "Hole"},
+        ],
+        "check": "the mass should drop by exactly pi/4*d^2*t for each through hole; if it does not, the cut missed",
+    },
+    "wall": {
+        "title": "Wall thickness is a decision, not a leftover",
+        "why": "a wall that is too thin prints with gaps, warps when machined and fails in buckling before it fails "
+               "in stress; a wall that is too thick wastes mass and creates sink marks",
+        "steps": [
+            {"do": "Read the current wall thickness of the shell before changing anything", "tool": "Wall thickness"},
+            {"do": "Keep it at or above 1.5 mm for FDM and 1.0 mm for machined aluminium", "tool": "Wall thickness"},
+            {"do": "If the wall must be thinner, add a rib instead of thinning the plate", "tool": "Draft"},
+        ],
+        "check": "mass / (surface area x density) should be close to the wall you asked for, within 10 %",
+    },
+    "pattern": {
+        "title": "Repeat the feature, do not copy the body",
+        "why": "copied bodies are separate solids: a later change to one does not reach the others, and the "
+               "interference check treats them as different parts",
+        "steps": [
+            {"do": "Model one instance fully (hole, boss, rib)", "tool": "Hole"},
+            {"do": "Repeat it with the count and the pitch, in one feature", "tool": "Repeat"},
+            {"do": "Check the body count stays at one after the pattern", "tool": "Bodies"},
+        ],
+        "check": "changing the pitch should move every instance; a copy that stays put was a duplicated body",
+    },
+    "draft": {
+        "title": "Add the draft before the part is moulded or printed upright",
+        "why": "a vertical wall has zero draft: it drags in the mould and it is the wall that warps first, "
+               "and no amount of filleting fixes a wall that cannot leave the tool",
+        "steps": [
+            {"do": "Pick the parting direction first, then the faces that must release", "tool": "Draft"},
+            {"do": "Apply 1-2 degrees on the walls along that direction", "tool": "Draft"},
+            {"do": "Re-check the wall thickness after the draft, it changes the section", "tool": "Wall thickness"},
+        ],
+        "check": "measure the angle between the drafted face and the parting direction: it should be the draft you set",
     },
 }
 
