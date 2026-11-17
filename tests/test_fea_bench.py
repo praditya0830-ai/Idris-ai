@@ -73,7 +73,9 @@ def test_bench_routes_a_mesh_to_the_solver_and_keeps_the_advice():
     assert out["topic"] == "fea"
     assert {c["id"] for c in out["claims"]} >= {"fea.sigma_max", "fea.delta_max", "fea.sf_yield"}
     assert out["advice"] and out["checks"]
-    assert all(c["evidence"] == 3 for c in out["claims"])          # numerical solver, not an estimate
+    levels = {c["id"]: c["evidence"] for c in out["claims"]}
+    assert levels["fea.sigma_max"] == 3                          # numerical solver, not an estimate
+    assert levels["fea.sigma_closed_form"] == 2                  # the cross-check is closed form
 
 
 def test_bench_asks_for_the_mesh_instead_of_inventing_a_strength():

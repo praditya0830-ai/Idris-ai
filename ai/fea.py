@@ -169,7 +169,7 @@ def analyze(geometry: dict, material: str = "steel", case: str = "cantilever_tip
     if cross.get("ratio_sigma"):
         claims.append(_claim("fea.sigma_closed_form", "closed-form bending stress", cross["sigma_cf"], "MPa",
                              cross["formula_sigma"], {"span_mm": span, "force_N": applied},
-                             "closed form (independent of the solve)"))
+                             "closed form (independent of the solve)", evidence=2))
     return {"case": key, "case_label": spec["label"], "material": out["material"]["name"],
             "claims": claims, "checks": checks, "advice": advice, "cross_check": cross,
             "mesh": out["mesh"], "volume": out["volume"], "solve_time_s": out["solve_time_s"],
