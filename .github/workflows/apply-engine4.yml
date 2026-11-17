@@ -1,0 +1,37 @@
+name: apply-engine4
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-engine4.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: label the cross-check correctly
+        run: |
+          git apply --check .github/fix4.patch
+          git apply --whitespace=nowarn .github/fix4.patch
+          python3 - <<'PY'
+          import ast, pathlib
+          for p in ["ai/fea.py", "tests/test_fea_bench.py"]:
+              ast.parse(pathlib.Path(p).read_text())
+              print(p, "parses")
+          PY
+
+      - name: commit and push
+        run: |
+          git config user.name "idris-bot"
+          git config user.email "noreply@github.com"
+          git add -A
+          git commit -m "fix(engine): mark the closed-form cross-check as evidence level 2
+
+          The cross-check is a closed form, not a solver result, and the level is what tells a reader how
+the number was obtained."
+          git push
