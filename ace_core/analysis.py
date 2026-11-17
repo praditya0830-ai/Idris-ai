@@ -73,7 +73,12 @@ def _review_result(env):
 
 def _part_result(env):
     o = env["outputs"]
+    # the same findings the chat shows, so a number reviewed in the studio and a number quoted in the
+    # chat come from one rule set (ai/review.py)
+    from ai import review as REVIEW
+    findings = REVIEW.review_part(o)
     return {"surface": o["surface"], "yield_mpa": o["yield_mpa"], "mesh": o["mesh"], "material": o["material"],
+            "review": findings, "review_summary": REVIEW.summary(findings),
             "solve_time_s": o["solve_time_s"], "applied_loads": o["applied_loads"], "reaction_n": o["reaction_N"],
             "summary": {"max_von_mises_mpa": o["max_von_mises_MPa"], "von_mises_p995_mpa": o["von_mises_p995_MPa"],
                         "max_displacement_mm": o["max_displacement_mm"], "min_safety_factor": o["min_safety_factor"],
