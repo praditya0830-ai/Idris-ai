@@ -1,0 +1,22 @@
+--- a/ai/fea.py
++++ b/ai/fea.py
+@@ -229,7 +229,7 @@
+     if vol_err > 5.0:
+         out.append(f"COARSE MESH: voxel volume is off by {vol_err:.1f} %. Refine element_size_mm before "
+                    f"quoting a peak stress.")
+-    if delta and span and delta > span / 100.0:
++    if sf >= 1.0 and delta and span and delta > span / 100.0:
+         out.append(f"FLEXIBLE: {delta:.2f} mm over a {span:.0f} mm span is more than L/100; "
+                    f"stiffness, not strength, is the limit here.")
+     if cross.get("ratio_sigma"):
+--- a/tests/test_fea_bench.py
++++ b/tests/test_fea_bench.py
+@@ -54,6 +54,8 @@
+ def test_a_load_above_yield_is_reported_as_fail_not_softened():
+     r = FEA.analyze(box_mesh(), material="steel", case="cantilever_tip", force_n=4000, target_elements=8000)
+     assert any(a.startswith("FAIL") for a in r["advice"]), r["advice"]
++    # stiffness is not "the limit" when the part has already yielded
++    assert not any(a.startswith("FLEXIBLE") for a in r["advice"]), r["advice"]
+ 
+ 
+ def test_the_solver_refuses_a_case_it_does_not_have():
