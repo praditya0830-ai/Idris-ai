@@ -1,0 +1,30 @@
+name: apply-engine
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-engine.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: wire the bench into the routes and the chat
+        run: python3 .github/apply_engine.py
+
+      - name: commit and push
+        run: |
+          git config user.name "idris-bot"
+          git config user.email "noreply@github.com"
+          git add -A
+          git commit -m "feat(engine): wire the engineering bench into the routes and the chat
+
+          /engineer/solve, /engineer/verify and /engineer/materials are now served, and /chat puts the
+          computed claims in front of the language model and reports any number in the reply that the
+          bench did not produce."
+          git push
