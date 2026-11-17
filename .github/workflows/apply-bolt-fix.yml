@@ -1,0 +1,29 @@
+name: apply-bolt-fix
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-bolt-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the preload fraction becomes a claim
+        run: |
+          git apply --check .github/bolt_fix.patch
+          git apply --whitespace=nowarn .github/bolt_fix.patch
+          python3 -c "import ast,pathlib; ast.parse(pathlib.Path('ai/engineer.py').read_text()); print('parses')"
+
+      - name: commit and push
+        run: |
+          git config user.name "idris-bot"
+          git config user.email "noreply@github.com"
+          git add -A
+          git commit -m "fix(engine): claim the preload fraction so the gate accepts it" -m "Live test: a correct answer quoting 75 % of proof load was marked unverified; 75 % is an input of the bolt solver."
+          git push
