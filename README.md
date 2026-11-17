@@ -88,10 +88,28 @@ tests/               pytest suite + standalone QA scripts
 |---|---|
 | `PORT` | HTTP port (default `8000`; set automatically by Render/Railway) |
 | `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `NVIDIA_API_KEY` | Enable LLM providers; without keys `/chat` uses the built-in parser |
-| `IDRIS_LLM_ORDER` | Provider preference, default `claude,gemini,openai,nvidia` |
+| `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (Qwen), `MOONSHOT_API_KEY` (Kimi) | Enable the OpenAI-compatible providers (DeepSeek, Qwen, Kimi) |
+| `IDRIS_LLM_ORDER` | Provider preference, default `claude,gemini,openai,nvidia,deepseek,qwen,kimi` |
 | `IDRIS_MODEL_<PROVIDER>` | Override the model per provider |
 | `IDRIS_LLM_PER_MIN`, `IDRIS_LLM_DAILY_CAP` | LLM rate limits (default 12/min, 400/day) |
 | `IDRIS_REPLY_LANGUAGE` | Reply language (`en` default, `auto` follows the request) |
+
+### Menambah provider selain Claude (DeepSeek, Qwen, Kimi)
+
+Ketiganya memakai adapter OpenAI-compatible yang sama, jadi tidak ada kode baru per provider:
+
+1. Isi key di Render → Environment: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (Qwen), `MOONSHOT_API_KEY` (Kimi).
+   Jangan pernah menaruh key di repo atau di berkas `.env` yang ter-commit.
+2. Cek satu per satu: `GET /chat/ping?provider=deepseek` (juga `qwen`, `kimi`). Balasannya menyebut model
+   yang dicoba dan error persisnya, misalnya model yang sudah EOL atau key yang salah region.
+3. Atur urutannya: `IDRIS_LLM_ORDER=claude,deepseek,qwen,kimi` — hanya provider yang punya key yang dipakai,
+   dan provider berikutnya dicoba bila yang di depan gagal. Ganti model dengan `IDRIS_MODEL_DEEPSEEK`
+   (daftar dipisah koma, yang pertama dipilih).
+
+Default model: `deepseek-flash` / `deepseek-v4-pro`, `qwen3.8-max` / `qwen3.7-plus`, `kimi-k3.1-pro`.
+Model seri Kimi K3 hanya bisa berpikir (tidak bisa dimatikan), jadi adapter memberi mereka token lebih;
+model lain dikirimi setelan thinking-off (`thinking: disabled` untuk DeepSeek, `enable_thinking: false`
+untuk Qwen/Kimi) supaya jawaban JSON pendek tidak habis dipakai reasoning.
 
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.

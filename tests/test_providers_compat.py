@@ -81,3 +81,52 @@ def test_model_override_per_provider(monkeypatch):
     monkeypatch.setenv("IDRIS_MODEL_DEEPSEEK", "my-model,other-model")
     assert llm.models_for("deepseek") == ["my-model", "other-model"]
     assert llm.model_for("deepseek") == "my-model"
+
+
+def test_thinking_is_switched_off_where_the_api_allows_it(monkeypatch):
+    """DeepSeek V4, Qwen3.8 and Kimi answer with reasoning tokens by default; that empties a short answer."""
+    srv, base = _serve()
+    try:
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+        monkeypatch.setenv("MOONSHOT_API_KEY", "k")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", base)
+        monkeypatch.setenv("DASHSCOPE_BASE_URL", base)
+        monkeypatch.setenv("MOONSHOT_BASE_URL", base)
+        for prov, model in (("deepseek", "deepseek-flash"), ("qwen", "qwen3.8-max"), ("kimi", "kimi-k2.6")):
+            SEEN.clear()
+            llm._call_one(prov, model, "sys", "hi", 500)
+            body = SEEN[0][2]
+            if prov == "deepseek":
+                assert body["thinking"] == {"type": "disabled"}
+            else:
+                assert body["enable_thinking"] is False
+            assert body["max_tokens"] == 500          # a normal model keeps the caller's limit
+    finally:
+        srv.shutdown()
+
+
+def test_a_thinking_only_model_gets_room_and_no_switch(monkeypatch):
+    """kimi-k3.x cannot turn thinking off, so the switch is not sent and the token budget is raised."""
+    srv, base = _serve()
+    try:
+        monkeypatch.setenv("MOONSHOT_API_KEY", "k")
+        monkeypatch.setenv("MOONSHOT_BASE_URL", base)
+        SEEN.clear()
+        llm._call_one("kimi", "kimi-k3.1-pro", "sys", "hi", 300)
+        body = SEEN[0][2]
+        assert "enable_thinking" not in body
+        assert body["max_tokens"] == llm.THINKING_ONLY_MIN_TOKENS
+    finally:
+        srv.shutdown()
+
+
+def test_an_empty_completion_says_which_model_and_why(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
+    monkeypatch.setattr(llm, "_post_t", lambda *a, **k: {"choices": [{"message": {"content": ""},
+                                                                     "finish_reason": "length"}]})
+    try:
+        llm._call_one("deepseek", "deepseek-v4-pro", "sys", "hi", 500)
+        raise AssertionError("expected LLMError")
+    except llm.LLMError as e:
+        assert "deepseek-v4-pro" in str(e) and "finish_reason=length" in str(e)

@@ -34,6 +34,15 @@ DEFAULT_MODELS = {"claude": "claude-haiku-5-5", "gemini": "gemini-3.8-flash,gemi
 KEY_ENV = {"claude": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
            "nvidia": "NVIDIA_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "qwen": "DASHSCOPE_API_KEY",
            "kimi": "MOONSHOT_API_KEY"}
+# Newer DeepSeek/Qwen/Kimi models think before answering and the reasoning counts as output, so a 500-token
+# interpretation comes back empty (same failure NVIDIA had). IDRIS only needs the reading of the sentence, so
+# thinking is switched off where the API allows it; the Kimi K3 line cannot switch it off and gets room instead.
+THINKING_OFF = {"deepseek": {"thinking": {"type": "disabled"}},
+                "qwen": {"enable_thinking": False},
+                "kimi": {"enable_thinking": False}}
+THINKING_ONLY_PREFIX = ("kimi-k3", "kimi-k4")
+THINKING_ONLY_MIN_TOKENS = 2048
+
 # Providers that speak the OpenAI Chat Completions shape: (base-url env, default base, path, send response_format).
 # One adapter serves them all; the base already carries the provider's own prefix (/v1 or /compatible-mode/v1).
 OPENAI_COMPAT = {
@@ -192,6 +201,23 @@ def _gemini_post(url: str, key: str, body: dict, timeout: float) -> dict:
     return _post(url, {"x-goog-api-key": key}, body, timeout=timeout)
 
 
+def _thinking_only(model: str) -> bool:
+    return any(str(model).lower().startswith(p) for p in THINKING_ONLY_PREFIX)
+
+
+def _chat_body(provider: str, model: str, system: str, user: str, max_tokens: int, json_mode: bool) -> dict:
+    """Body for the OpenAI-compatible providers, including the thinking switch (see THINKING_OFF)."""
+    limit = max(max_tokens, THINKING_ONLY_MIN_TOKENS) if _thinking_only(model) else max_tokens
+    body = {"model": model, "temperature": 0, "max_tokens": limit,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    extra = THINKING_OFF.get(provider)
+    if extra and not _thinking_only(model):
+        body.update(extra)
+    return body
+
+
 def _gemini_text(d: dict) -> str:
     try:
         cand = d["candidates"][0]
@@ -314,15 +340,21 @@ def _call_one(provider: str, model: str, system: str, user: str, max_tokens: int
     # OpenAI, DeepSeek, Qwen and Kimi speak the same Chat Completions shape: one code path, different base.
     env_name, default_base, path, json_mode = OPENAI_COMPAT.get(provider, OPENAI_COMPAT["openai"])
     base = (os.environ.get(env_name) or default_base).rstrip("/")
-    body = {"model": model, "temperature": 0, "max_tokens": max_tokens,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
+    body = _chat_body(provider, model, system, user, max_tokens, json_mode)
     d = _post_t(base + path, {"Authorization": "Bearer " + key}, body, timeout=t)
     try:
-        return d["choices"][0]["message"]["content"] or ""
+        msg = d["choices"][0]["message"]
     except (KeyError, IndexError):
         raise LLMError(f"empty answer from {provider}")
+    text = msg.get("content")
+    text = text if isinstance(text, str) else ""
+    if not text.strip():
+        fin = d["choices"][0].get("finish_reason") or "?"
+        why = "the model is thinking-only and used its tokens on reasoning" if _thinking_only(model) \
+            else "reasoning or the token budget left no answer"
+        raise LLMError(f"empty answer from {provider} ({model}, finish_reason={fin}; {why} - "
+                       f"raise IDRIS_MODEL_{provider.upper()} to a non-thinking model or more tokens)")
+    return text
 
 
 # ------------------------------------------------------------------ vision (images + text)
