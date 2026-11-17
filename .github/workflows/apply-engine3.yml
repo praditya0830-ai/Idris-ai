@@ -1,0 +1,34 @@
+name: apply-engine3
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-engine3.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: wire the solver into the bench
+        run: |
+          base64 -d .github/eng3.b64 > /tmp/eng3.patch
+          git apply --check /tmp/eng3.patch
+          git apply --whitespace=nowarn /tmp/eng3.patch
+          echo "ai/engineer.py $(git hash-object ai/engineer.py)"
+
+      - name: commit and push
+        run: |
+          git config user.name "idris-bot"
+          git config user.email "noreply@github.com"
+          git add -A
+          git commit -m "feat(engine): the bench answers strength questions with the solver
+
+          ai/fea.py wraps physics/part_fea.py: named load cases, claims at evidence level 3, a closed-form
+          cross-check, and advice that names the number behind it. A missing mesh or force becomes a
+          question, never an assumption."
+          git push
