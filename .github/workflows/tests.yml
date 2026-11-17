@@ -39,7 +39,8 @@ jobs:
             tests/test_report.py \
             tests/test_engineer.py \
             tests/test_engineer_routes.py \
-            tests/test_fea_bench.py
+            tests/test_fea_bench.py \
+            tests/test_review_and_gear.py
 
   full:
     name: Full suite (manual)
