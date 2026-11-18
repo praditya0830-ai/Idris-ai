@@ -59,6 +59,15 @@ try:
 except Exception:  # pragma: no cover
     SOLVER_VERSION = "unknown"
 
+# Calculation references (references/<slug>.json on the reference-db branch): read once at start,
+# refreshed at most every 10 minutes. Without a token, or with GitHub unreachable, the chat answers
+# without the database and says the reference could not be stored.
+try:
+    from research import reference_db as _reference_db
+    _reference_db.warm()
+except Exception:      # never stop the server for a bookkeeping layer
+    traceback.print_exc()
+
 DEFAULT_INPUT_RPM = 6000.0            # assumption when the client does not send input_rpm
 DEFAULT_GEAR_MATERIAL = "AMS6265"     # aerospace gear steel (VTOL actuator use case)
 
@@ -189,6 +198,9 @@ class Handler(BaseHTTPRequestHandler):
                     "POST /edit-variant": "change one parameter of a variant (wall, face width, material) -> new fully re-checked variant + before/after diff + allowed_range",
                     "GET /design-methods": "how the design is shaped: parametric (available), topology optimisation and computational engineering (planned)",
                     "GET /references": "calculation references the engineer can choose (lewis, iso6336) and their status",
+                    "GET /references/db": "calculation-reference database stored on the reference-db branch: slug, topic, title, status, url",
+                    "GET /references/db/<slug>": "one stored reference in full: formula exactly as the source prints it, units, valid range, worked example, status",
+                    "POST /chat (calculation reference)": "solver first (named with its benchmark), then the stored candidates, then the web, stored as a CANDIDATE that may not produce any number",
                     "GET /chat/selftest": "QA: 5 bait questions to the live AI with a real thermal result as context",
                     "GET /download/<filename>": "download a previously generated file (STL, BOM CSV, drawing)",
                     "POST /fea": "3D static FEA of the housing for one variant (job: poll GET /fea/<job_id>)",
@@ -326,6 +338,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"success": True, "default": DEFAULT_METHOD, "methods": DESIGN_METHODS,
                                   "note": "Send \"design_method\" to POST /generate-variants. Only methods with "
                                           "status 'available' generate designs; the others are planned."})
+            return
+
+        if self.path.split("?")[0].rstrip("/") == "/references/db":
+            from research import reference_db as rdb
+            self._send_json(200, {"success": True, **rdb.public_list()})
+            return
+
+        if self.path.split("?")[0].startswith("/references/db/"):
+            from research import reference_db as rdb
+            slug = self.path.split("?")[0][len("/references/db/"):].strip("/")
+            rec = rdb.public_one(slug)
+            if rec is None:
+                self._send_json(404, {"success": False, "error": f"unknown reference '{slug[:80]}' "
+                                                              f"(see GET /references/db)"})
+            else:
+                self._send_json(200, {"success": True, **rec})
             return
 
         if self.path.split("?")[0] == "/references":
@@ -706,6 +734,20 @@ class Handler(BaseHTTPRequestHandler):
                     eng, eng_verify = None, None
                 # the bench already answered part of the question: this is a discussion, not a CAD request
                 eng_ctx = bool(eng and (eng.get("claims") or eng.get("missing")))
+                # v0.36: a calculation reference is settled before the model speaks. The solver registry wins
+                # (no browsing), then the candidates stored on the reference-db branch (not searched again),
+                # then the web (stored as a CANDIDATE). None of it may produce a design number.
+                refs, _ref = None, None
+                try:
+                    from research import reference_flow as _REF
+                    refs = _REF.for_request(msg, eng, params.get("provider"))
+                    _ref = _REF
+                    if refs.get("block"):
+                        ctx = dict(ctx or {})
+                        ctx["references"] = refs["block"]
+                except Exception:
+                    traceback.print_exc()
+                    refs, _ref = None, None
                 gear_ctx = bool(ctx and (ctx.get("advice") or ctx.get("pending_question")))
                 cad_ctx = bool(ctx and (isinstance(ctx.get("cad_error"), dict) or isinstance(ctx.get("pending_cad"), dict)
                                         or isinstance(ctx.get("current_cad"), dict)))
@@ -788,6 +830,13 @@ class Handler(BaseHTTPRequestHandler):
                                           "advice": eng.get("advice"), "review": eng.get("review"),
                                           "review_summary": eng.get("review_summary")}
                     res["unverified"] = eng_verify(res.get("answer") or "", eng)
+                if refs and _ref:
+                    res["references"] = {k: refs.get(k) for k in ("mode", "topic", "solvers", "items", "saved",
+                                                                 "notes", "branch", "error", "searched")}
+                    # the label is shown even when the model forgets it: a candidate is never a result
+                    note = _ref.reply_note(refs)
+                    if note and note not in (res.get("answer") or ""):
+                        res["answer"] = ((res.get("answer") or "").rstrip() + "\n\n" + note)[:2400]
                 # v0.34: an object in a language the keyword list does not know is already caught above -- by the
                 # AI router (cad_router.route) and by looks_like_object_request / looks_like_part_request. This used
                 # to be a second chance for such sentences: anything the gearbox reader could not read went to the

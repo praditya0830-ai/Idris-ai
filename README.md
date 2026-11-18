@@ -6,7 +6,7 @@ thermal analyses. Every solver ships benchmarks with a published source and stat
 limitations; physics is never delegated to an LLM.
 
 - Live: <https://idris-ai-rwd6.onrender.com> (`GET /health` lists every route)
-- Solver version: **0.35.0** · **27** registered solvers · contract **1.0**
+- Solver version: **0.36.0** · **27** registered solvers · contract **1.0**
 - Frontend: [`Idris-studio`](https://github.com/praditya0830-ai/Idris-studio) (separate repo)
 - API contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md)
 
@@ -24,6 +24,7 @@ limitations; physics is never delegated to an LLM.
 | Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`) | `GET /materials` |
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
+| Calculation references (formula + source) stored as candidates | `GET /references/db`, `/references/db/<slug>` |
 | Live solver benchmarks vs published reference values | `GET /verify` |
 | End-to-end check of the three demo scenarios | `GET /selfcheck` |
 
@@ -78,6 +79,8 @@ geometry/            housing geometry kernel
 cad_codegen.py       LLM → replicad CAD code, repair loop, review
 llm.py               provider fallback (Claude, Gemini, OpenAI, NVIDIA) + rate limiting
 assembly3d.py        assembly, closed-solid checks, BOM
+research/            sourced lookups: web search, page fetch, quote-checked extraction,
+                     reference database (candidates on the reference-db branch)
 docs/                API contract and UI integration notes
 tests/               pytest suite + standalone QA scripts
 ```
@@ -93,6 +96,9 @@ tests/               pytest suite + standalone QA scripts
 | `IDRIS_MODEL_<PROVIDER>` | Override the model per provider |
 | `IDRIS_LLM_PER_MIN`, `IDRIS_LLM_DAILY_CAP` | LLM rate limits (default 12/min, 400/day) |
 | `IDRIS_REPLY_LANGUAGE` | Reply language (`en` default, `auto` follows the request) |
+| `GITHUB_TOKEN` | Fine-grained token, **this repo only**, Contents **read/write**: reads and stores calculation references. Without it the chat still answers, without the reference database |
+| `IDRIS_REFERENCE_BRANCH` | Branch that holds `references/*.json` (default `reference-db`; `main` is refused in code) |
+| `IDRIS_GITHUB_REPO` | Repository for the reference database (default `praditya0830-ai/Idris-ai`) |
 
 ### Menambah provider selain Claude (DeepSeek, Qwen, Kimi)
 
@@ -110,6 +116,40 @@ Default model: `deepseek-flash` / `deepseek-v4-pro`, `qwen3.8-max` / `qwen3.7-pl
 Model seri Kimi K3 hanya bisa berpikir (tidak bisa dimatikan), jadi adapter memberi mereka token lebih;
 model lain dikirimi setelan thinking-off (`thinking: disabled` untuk DeepSeek, `enable_thinking: false`
 untuk Qwen/Kimi) supaya jawaban JSON pendek tidak habis dipakai reasoning.
+
+### Database acuan perhitungan (references on their own branch)
+
+Every design request in `/chat` settles its calculation reference in this order, before the model speaks:
+
+1. **Solver registry** (`GET /solvers`, the bench in `ai/engineer.py`). If a solver covers it, that solver is used and
+   named with its benchmark. Nothing is browsed.
+2. **Stored references** (`references/<slug>.json` on the `reference-db` branch). An existing candidate for the topic is
+   shown, not searched again.
+3. **Web** (standard → textbook → datasheet; forums and blogs are never stored). What could be read is stored as a
+   **candidate** and shown with the label
+   `**Unverified formula from <source>: not used for any IDRIS result yet**`.
+
+A candidate is text only. It may not produce a result, a safety factor, a ranking or any CAD/requirements field: the
+number gate in `ai/engineer.py` still treats every one of its numbers as a guess. `status` is never changed by code —
+Arya promotes a reference to `verified` by hand, and only after a worked example from the same source, solver code and a
+passing benchmark in `/verify` exist.
+
+Why a branch: Render deploys automatically from `main`, so a commit there restarts the live server. The database writes
+through the GitHub Contents API only, refuses `main`/`master` in code, never overwrites an existing file, and refreshes
+its in-memory list at most every 10 minutes. With GitHub unreachable, or without a token, the chat keeps answering and
+says the reference could not be stored.
+
+Setup, once:
+
+1. Create the branch: `git push origin main:reference-db` (or **Branches → New branch** on GitHub). The first write
+   needs it to exist; until then a candidate is shown in the chat but reported as not stored.
+2. Render → Environment: `GITHUB_TOKEN` = fine-grained token, **only this repository**, Contents **read/write**.
+   Nothing else is needed; the token never reaches the browser or the repo.
+
+```bash
+curl https://idris-ai-rwd6.onrender.com/references/db
+curl https://idris-ai-rwd6.onrender.com/references/db/<slug>
+```
 
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.
