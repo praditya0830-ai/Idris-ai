@@ -6,7 +6,7 @@ thermal analyses. Every solver ships benchmarks with a published source and stat
 limitations; physics is never delegated to an LLM.
 
 - Live: <https://idris-ai-rwd6.onrender.com> (`GET /health` lists every route)
-- Solver version: **0.36.0** · **27** registered solvers · contract **1.0**
+- Solver version: **0.36.1** · **27** registered solvers · contract **1.0**
 - Frontend: [`Idris-studio`](https://github.com/praditya0830-ai/Idris-studio) (separate repo)
 - API contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md)
 
@@ -133,6 +133,11 @@ A candidate is text only. It may not produce a result, a safety factor, a rankin
 number gate in `ai/engineer.py` still treats every one of its numbers as a guess. `status` is never changed by code —
 Arya promotes a reference to `verified` by hand, and only after a worked example from the same source, solver code and a
 passing benchmark in `/verify` exist.
+
+The lookup only runs for a message that asks for a formula, a standard or a calculation reference. A design request
+(whatever route the router picks), a greeting, and a follow-up or repair on a design already open never look one up,
+and a message with no recognised topic is never searched or stored. When a registered solver covers the topic it is
+named with its benchmark and nothing is browsed, even if the bench did not run on that message.
 
 Why a branch: Render deploys automatically from `main`, so a commit there restarts the live server. The database writes
 through the GitHub Contents API only, refuses `main`/`master` in code, never overwrites an existing file, and refreshes

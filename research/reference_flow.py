@@ -24,6 +24,17 @@ MAX_ITEMS = 2                            # references returned per request
 
 BENCH_TOPICS = ("beam", "column", "bolt", "thermal", "chem", "math", "fea", "gear")
 
+# v0.36.1: a reference lookup only runs for a message that asks for one. A design request, a greeting or a
+# follow-up on a design already open is not a reference question and must not touch the web or the database.
+REFERENCE_ASKS = (
+    r"\brumus(?:nya)?\b", r"\bformula(?:s|nya)?\b", r"\bacuan\b", r"\breferensi\b", r"\breference\b",
+    r"\bstandar(?:nya)?\b", r"\bstandard(?:s)?\b", r"\bpersamaan\b", r"\bequation\b",
+    r"\bhow (?:do i|to|can i|should i) (?:calculate|compute)\b",
+    r"\bcara (?:menghitung|mengitung|hitung|perhitungan)\b",
+    r"\bwhich standard\b", r"\bwhat(?:'s| is) the formula\b",
+)
+DESIGN_ROUTES = ("library", "primitive", "free_design", "gearbox")
+
 # a topic the bench knows is owned by the bench; the others are what this database is for
 TOPIC_WORDS = (
     ("gear", ("gigi", "gear", "roda gigi", "iso 6336", "pitting", "spur")),
@@ -103,12 +114,22 @@ def for_request(message: str, eng: dict | None = None, provider: str | None = No
         db = _db()
     except Exception:                    # pragma: no cover - the database is optional for chat
         db = None
-    if bench:
-        solvers = solvers_for(topic)
-        notes = [f"the bench already computed this ({topic}); the web was not searched"]
-        if not solvers:
-            notes.append("no registered solver name matches this topic; the bench claims carry their own source")
+    if topic == "general":
+        # nothing was recognised: there is no reference to look up, so nothing is searched or stored
+        return _result("none", topic, notes=["no calculation topic was recognised: nothing was searched or stored"],
+                       db=db, searched=False)
+    solvers = solvers_for(topic)
+    if solvers:
+        # a registered solver owns this topic: it is named with its benchmark and the web is not touched,
+        # whether or not the bench happened to run on this particular message
+        notes = [f"a registered solver covers {topic}: the web was not searched"]
+        if not bench:
+            notes.append("the bench did not run on this message, but the solver registry still owns the calculation")
         return _result("solver", topic, solvers=solvers, items=[], saved=[], notes=notes, db=db, searched=False)
+    if bench:
+        notes = [f"the bench already computed this ({topic}); the web was not searched",
+                 "no registered solver name matches this topic; the bench claims carry their own source"]
+        return _result("solver", topic, items=[], saved=[], notes=notes, db=db, searched=False)
 
     stored = db.find(topic) if db else []
     if stored:
@@ -138,6 +159,24 @@ def for_request(message: str, eng: dict | None = None, provider: str | None = No
         err = db.list_all().get("error")
     return _result(mode, topic, solvers=solvers_for(topic), items=items[:MAX_ITEMS], saved=saved, notes=notes,
                    db=db, searched=True, error=err)
+
+
+def wants_reference(message: str) -> bool:
+    """True only when the message asks for a formula, a standard or a calculation reference."""
+    low = (message or "").lower()
+    return any(re.search(p, low) for p in REFERENCE_ASKS)
+
+
+def for_chat(message: str, eng: dict | None = None, provider: str | None = None, route: str | None = None,
+             follow_up: bool = False) -> dict | None:
+    """The reference step for /chat, or None when this message is not asking for one.
+
+    A design request (any route the router sends to the library or the designer), a greeting, and a
+    follow-up or repair on a design already open never reach the solver/database/web lookup.
+    """
+    if follow_up or route in DESIGN_ROUTES or not wants_reference(message):
+        return None
+    return for_request(message, eng, provider)
 
 
 def topic_for(message: str, eng: dict | None = None) -> str:
@@ -322,6 +361,8 @@ def block(result: dict | None) -> str:
     lines.append("A candidate is NOT verified: use NO number from it (no stress, factor, safety factor, mass, "
                  "ranking or CAD parameter). Say it is unverified, quote the formula as text, and say a worked "
                  "example plus a solver benchmark are needed before it can be used.")
+    lines.append("Do not compute any number with a candidate formula; only quote it and say IDRIS has not "
+                 "verified it.")
     return "\n".join(lines)
 
 

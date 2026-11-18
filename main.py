@@ -734,20 +734,6 @@ class Handler(BaseHTTPRequestHandler):
                     eng, eng_verify = None, None
                 # the bench already answered part of the question: this is a discussion, not a CAD request
                 eng_ctx = bool(eng and (eng.get("claims") or eng.get("missing")))
-                # v0.36: a calculation reference is settled before the model speaks. The solver registry wins
-                # (no browsing), then the candidates stored on the reference-db branch (not searched again),
-                # then the web (stored as a CANDIDATE). None of it may produce a design number.
-                refs, _ref = None, None
-                try:
-                    from research import reference_flow as _REF
-                    refs = _REF.for_request(msg, eng, params.get("provider"))
-                    _ref = _REF
-                    if refs.get("block"):
-                        ctx = dict(ctx or {})
-                        ctx["references"] = refs["block"]
-                except Exception:
-                    traceback.print_exc()
-                    refs, _ref = None, None
                 gear_ctx = bool(ctx and (ctx.get("advice") or ctx.get("pending_question")))
                 cad_ctx = bool(ctx and (isinstance(ctx.get("cad_error"), dict) or isinstance(ctx.get("pending_cad"), dict)
                                         or isinstance(ctx.get("current_cad"), dict)))
@@ -765,6 +751,22 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         traceback.print_exc()
                         routed = None
+                # v0.36.1: a calculation reference is settled before the model speaks, but only for a message
+                # that actually asks for a formula/standard/reference: a design request (whatever route the
+                # router picked), a greeting and a follow-up on an open design never look one up. The solver
+                # registry wins (nothing is browsed), then the stored candidates, then the web (a CANDIDATE).
+                refs, _ref = None, None
+                try:
+                    from research import reference_flow as _REF
+                    refs = _REF.for_chat(msg, eng, params.get("provider"), (routed or {}).get("route"),
+                                         follow_up=bool(gear_ctx or cad_ctx))
+                    _ref = _REF if refs is not None else None
+                    if refs and refs.get("block"):
+                        ctx = dict(ctx or {})
+                        ctx["references"] = refs["block"]
+                except Exception:
+                    traceback.print_exc()
+                    refs, _ref = None, None
                 if routed and routed["route"] == "library":
                     hit = (routed["library_id"], routed["query"])
                 elif routed and routed["route"] in ("free_design", "gearbox", "primitive"):
