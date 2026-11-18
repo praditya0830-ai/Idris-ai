@@ -73,8 +73,13 @@ def test_main_uses_the_router_before_the_keyword_rules():
     import os
     src = open(os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8").read()
     chat = src[src.index('if base == "/chat":'):]
+    # the AI router is asked first; the keyword rules only answer once it has nothing usable to say
     assert chat.index("cad_router.route(") < chat.index("plib.match_sentence(msg)") < chat.index("self._chat_cad(msg, ctx")
-    assert "if not (gear_ctx or cad_ctx):" in chat                            # follow-ups and repairs skip the router
+    # a follow-up or a repair (pending_cad, cad_error, current_cad) never goes through the router, and neither
+    # does a message the bench already computed: the guard sits between `routed = None` and the router call
+    guard = chat[chat.index("routed = None"):chat.index("cad_router.route(")]
+    assert "if not (gear_ctx or cad_ctx or eng_ctx):" in guard
+    assert "gear_ctx" in guard and "cad_ctx" in guard and "eng_ctx" in guard
 
 
 def test_free_design_brings_three_concepts_without_numbers(monkeypatch):
