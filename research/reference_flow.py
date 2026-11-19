@@ -15,10 +15,19 @@ Page text is data, never an instruction: the extractor is told to ignore anythin
 from __future__ import annotations
 
 import re
+import time
 from urllib.parse import urlparse
 
 UNREADABLE = "could not read the formula reliably"
 LABEL = "**Unverified formula from {src}: not used for any IDRIS result yet**"
+# v0.36.2: a formula question is never answered in silence. One sentence per cause of an empty lookup.
+NONE_NOTES = {
+    "no_topic": "No calculation topic was recognised in the question, so no reference was looked up.",
+    "search_off": "Web search is not enabled on this server, so no reference was looked up. The answer "
+                  "above is general guidance, not a verified formula.",
+    "db_unreachable": "The reference database could not be reached, so nothing was stored.",
+    "no_formula": "No formula was found in the sources that were read.",
+}
 MAX_PAGES = 3                            # pages read per request (each read is one small AI call)
 MAX_ITEMS = 2                            # references returned per request
 
@@ -117,7 +126,7 @@ def for_request(message: str, eng: dict | None = None, provider: str | None = No
     if topic == "general":
         # nothing was recognised: there is no reference to look up, so nothing is searched or stored
         return _result("none", topic, notes=["no calculation topic was recognised: nothing was searched or stored"],
-                       db=db, searched=False)
+                       db=db, searched=False, reasons=["no_topic"])
     solvers = solvers_for(topic)
     if solvers:
         # a registered solver owns this topic: it is named with its benchmark and the web is not touched,
@@ -137,6 +146,7 @@ def for_request(message: str, eng: dict | None = None, provider: str | None = No
                        notes=[f"{len(stored)} reference(s) already stored for this topic; not searched again"],
                        db=db, searched=False, error=db.list_all().get("error"))
 
+    search_off = not _search_configured()
     found, notes = _search_and_read(message, topic, provider)
     saved, items = [], []
     for rec in found:
@@ -146,6 +156,8 @@ def for_request(message: str, eng: dict | None = None, provider: str | None = No
             if not got.get("saved") and not got.get("existing"):
                 notes.append(f"the reference could not be stored: {got.get('reason')}")
         items.append(rec)
+    db_blocked = db is None or not db.available()
+    err = None
     if db is not None and not db.available():
         notes.append("the reference database is not configured on this server (GITHUB_TOKEN is not set): "
                      "the formula was found but not stored")
@@ -153,12 +165,19 @@ def for_request(message: str, eng: dict | None = None, provider: str | None = No
         err = db.list_all().get("error")
         if err:
             notes.append(f"the reference database could not be read: {err}")
+            db_blocked = True
     mode = "candidate_new" if items else "none"
-    err = None
-    if db is not None and db.available():
-        err = db.list_all().get("error")
+    reasons = []
+    if mode == "none":
+        # v0.36.2: say why nothing was looked up; the same codes go into the JSON /chat reply
+        if search_off:
+            reasons.append("search_off")
+        else:
+            reasons.append("no_formula")
+        if db_blocked:
+            reasons.append("db_unreachable")
     return _result(mode, topic, solvers=solvers_for(topic), items=items[:MAX_ITEMS], saved=saved, notes=notes,
-                   db=db, searched=True, error=err)
+                   db=db, searched=True, error=err, reasons=reasons)
 
 
 def wants_reference(message: str) -> bool:
@@ -168,13 +187,17 @@ def wants_reference(message: str) -> bool:
 
 
 def for_chat(message: str, eng: dict | None = None, provider: str | None = None, route: str | None = None,
-             follow_up: bool = False) -> dict | None:
+             design_change: bool = False) -> dict | None:
     """The reference step for /chat, or None when this message is not asking for one.
 
     A design request (any route the router sends to the library or the designer), a greeting, and a
-    follow-up or repair on a design already open never reach the solver/database/web lookup.
+    message that never asks for a formula never reach the solver/database/web lookup.
+
+    v0.36.2: a formula question asked while a design is open is still a reference question, so having a
+    design open no longer blocks it on its own. What blocks it is `design_change`: a repair
+    (context.cad_error) or an answer to a missing size, which is a change to the design.
     """
-    if follow_up or route in DESIGN_ROUTES or not wants_reference(message):
+    if design_change or route in DESIGN_ROUTES or not wants_reference(message):
         return None
     return for_request(message, eng, provider)
 
@@ -383,6 +406,10 @@ def reply_note(result: dict | None) -> str:
         bench = " / ".join(b["id"] for b in (s.get("benchmarks") or [])[:2])
         return (f"Computed by the IDRIS solver `{s['name']}`"
                 + (f" (benchmark: {bench})" if bench else "") + ", not from the web.")
+    if result.get("mode") == "none":
+        # v0.36.2: never silent about a lookup that found nothing (or could not run)
+        lines = [NONE_NOTES[r] for r in (result.get("reasons") or []) if r in NONE_NOTES]
+        return " ".join(lines or [NONE_NOTES["no_formula"]])
     if not result.get("items"):
         return ""
     lines = []
@@ -406,12 +433,93 @@ def reply_note(result: dict | None) -> str:
 
 # ------------------------------------------------------------------ helpers
 def _result(mode, topic, solvers=None, items=None, saved=None, notes=None, db=None, searched=False,
-            error=None) -> dict:
+            error=None, reasons=None) -> dict:
     res = {"mode": mode, "topic": topic, "solvers": solvers or [], "items": items or [],
            "saved": saved or [], "notes": notes or [], "searched": bool(searched),
-           "branch": db.branch_name() if db is not None else None, "error": error}
+           "branch": db.branch_name() if db is not None else None, "error": error,
+           "reasons": reasons or []}
     res["block"] = block(res)
     return res
+
+
+def _search_configured() -> bool:
+    try:
+        from . import search
+        return bool(search.configured())
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------ one door to check it (v0.36.2)
+def status() -> dict:
+    """GET /references/status: can a lookup run, and how many references are stored.
+
+    Booleans and a provider NAME only: no key, token or secret is ever returned.
+    """
+    configured, prov = False, None
+    try:
+        from . import search
+        configured, prov = bool(search.configured()), search.provider()
+    except Exception:                    # a broken search layer must not break the status page
+        pass
+    try:
+        db = _db()
+    except Exception:
+        db = None
+    branch = db.branch_name() if db is not None else None
+    stored, error, configured_db = 0, None, bool(db is not None and db.available())
+    if db is not None:
+        snap = db.list_all()
+        stored, error = len(snap.get("items") or []), snap.get("error")
+    repo = db.repo() if db is not None else None
+    return {
+        "search": {"configured": configured, "provider": prov},
+        "database": {"configured": configured_db, "branch": branch,
+                     "readable": bool(configured_db and not error), "error": error,
+                     "writable_hint": (f"writes need GITHUB_TOKEN with Contents read/write on {repo}; every "
+                                       f"write goes to branch '{branch}' and never to main")},
+        "stored_count": stored,
+    }
+
+
+DEFAULT_SELFTEST_Q = "what is the formula for fillet weld strength?"
+SELFTEST_MIN_S = 60                      # one selftest a minute: it may spend a search credit
+_last_selftest = {"at": 0.0}
+
+
+def reset_selftest() -> None:
+    """Forget the last selftest time (tests)."""
+    _last_selftest["at"] = 0.0
+
+
+def selftest(q: str | None = None, provider: str | None = None, now: float | None = None) -> dict:
+    """GET /references/selftest: the same lookup /chat runs, without the final AI answer.
+
+    Nothing is invented here: the numbers returned are the length of the item list and how many writes
+    actually succeeded. Rate-limited in memory, so a search quota is never spent twice in a minute.
+    """
+    question = (q or DEFAULT_SELFTEST_Q).strip()[:400] or DEFAULT_SELFTEST_Q
+    t = time.time() if now is None else float(now)
+    if _last_selftest["at"] and t - _last_selftest["at"] < SELFTEST_MIN_S:
+        return {"ok": False, "limited": True, "q": question,
+                "retry_after_s": int(SELFTEST_MIN_S - (t - _last_selftest["at"])) + 1,
+                "note": "one selftest per 60 s, so a search quota is not spent twice"}
+    _last_selftest["at"] = t
+    res = for_chat(question, None, provider)
+    if res is None:
+        return {"ok": True, "q": question, "mode": "skipped", "topic": None, "solvers": [], "notes": [],
+                "reasons": [], "found": 0, "stored": 0, "items": [], "branch": None, "error": None,
+                "note": "this sentence is not a formula/reference question, so /chat would not look one up"}
+    saved = [s for s in (res.get("saved") or []) if s.get("saved")]
+    return {"ok": True, "q": question, "mode": res.get("mode"), "topic": res.get("topic"),
+            "solvers": [s.get("name") for s in (res.get("solvers") or [])],
+            "notes": res.get("notes") or [], "reasons": res.get("reasons") or [],
+            "found": len(res.get("items") or []), "stored": len(saved),
+            "items": [{"slug": r.get("slug"), "title": r.get("title"), "status": r.get("status"),
+                       "source_name": r.get("source_name"), "url": r.get("url"), "label": label_for(r)}
+                      for r in (res.get("items") or [])],
+            "branch": res.get("branch"), "error": res.get("error"),
+            "note": reply_note(res)}
 
 
 def _db():

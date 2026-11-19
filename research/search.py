@@ -16,6 +16,15 @@ def configured() -> bool:
     return bool(os.environ.get("BRAVE_SEARCH_API_KEY") or os.environ.get("TAVILY_API_KEY"))
 
 
+def provider() -> str | None:
+    """Which provider the configured key selects: 'brave', 'tavily' or None. The name only, never the key."""
+    if os.environ.get("BRAVE_SEARCH_API_KEY"):
+        return "brave"
+    if os.environ.get("TAVILY_API_KEY"):
+        return "tavily"
+    return None
+
+
 def search(query: str, count: int = 5, timeout: float = 12.0) -> list[dict]:
     """-> [{title, url, snippet}]. Empty when nothing is configured, or nothing was found, or the call failed."""
     query = (query or "").strip()
