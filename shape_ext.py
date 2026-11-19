@@ -31,7 +31,10 @@ def handle_post(base: str, params: dict):
         text = str(params.get("request") or "").strip()
         if not text:
             return 400, {"success": False, "error": "request is required (one sentence with the goal)"}
-        return 200, {"success": True, **obj.measurable(text)}
+        # review item 5: when the part's parameters come along, a solver outside its range (the flat-plate
+        # correlation on a block) is reported as not_available instead of being applied
+        cad = params.get("cad") if isinstance(params.get("cad"), dict) else None
+        return 200, {"success": True, **obj.measurable(text, cad, params.get("params"))}
 
     if base == "/shape/families":
         text = str(params.get("request") or "").strip()
@@ -45,8 +48,9 @@ def handle_post(base: str, params: dict):
             return 422, {"success": False, "error": "count must be one of 3, 5, 7, 10",
                          "allowed": list(obj.COUNTS)}
         out = obj.families(text, count, provider=params.get("provider"))
+        cad = params.get("cad") if isinstance(params.get("cad"), dict) else None
         return (200 if out["ok"] else 422), {"success": out["ok"], **out,
-                                            "objective_map": obj.measurable(text)}
+                                            "objective_map": obj.measurable(text, cad, params.get("params"))}
 
     if base == "/shape/rank":
         results = params.get("results") if isinstance(params.get("results"), list) else None
@@ -58,7 +62,8 @@ def handle_post(base: str, params: dict):
             if not text:
                 return 400, {"success": False,
                              "error": "send measured (from POST /shape/objectives) or the request sentence"}
-            measured = {q["key"]: q for q in obj.measurable(text)["quantities"]}
+            cad = params.get("cad") if isinstance(params.get("cad"), dict) else None
+            measured = {q["key"]: q for q in obj.measurable(text, cad, params.get("params"))["quantities"]}
         weights = params.get("weights") if isinstance(params.get("weights"), dict) else None
         out = obj.rank(results, weights, measured)
         return 200, {"success": True, **out}

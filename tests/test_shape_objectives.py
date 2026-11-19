@@ -21,9 +21,10 @@ def test_a_quiet_motor_maps_to_its_quantities_with_the_real_solver_status():
     assert by_key["cogging_torque"]["status"] == "not_available", "no cogging solver exists in this build"
     assert by_key["torque_ripple"]["status"] == "not_available"
     assert by_key["fan_blade_tone"]["status"] == "not_available"
-    assert by_key["resonance_gap"]["status"] == "solver", "modal_solid_block is registered and benchmarked"
-    assert by_key["resonance_gap"]["solver"] == "modal_solid_block"
-    assert by_key["resonance_gap"]["benchmark"]
+    # review item 5: there is no modal solver for a free part in this build, and the motor's electromagnetic
+    # excitation frequency is not computed by IDRIS at all, so a "gap" would be a number with one half missing
+    assert by_key["resonance_gap"]["status"] == "not_available"
+    assert by_key["resonance_gap"]["solver"] is None
     assert "Cogging torque" in m["not_checked"]
 
 
@@ -37,7 +38,8 @@ def test_mass_is_measured_by_the_kernel_not_estimated():
 
 def test_no_measurable_goal_says_so_instead_of_scoring():
     m = obj.measurable(QUIET)
-    assert m["scoreable"] == ["resonance_gap"]
+    assert m["scoreable"] == [], "nothing in the quiet-motor goal can be measured in this build"
+    assert m["note"] == obj.NOT_CHECKED_NOTE
     m2 = obj.measurable("kursi yang nyaman")
     assert m2["goals"] == [] and m2["quantities"] == []
     assert "No measurable goal" in m2["note"]
