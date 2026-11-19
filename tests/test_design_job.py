@@ -27,6 +27,17 @@ def _ok(wall=3.0, user_length=40.0):
     return lambda msg, ctx, prov: {"ok": True, "cad": _cad(wall, user_length), "answer": "", "attempts": []}
 
 
+def _cad_bad():
+    """A part the DFM table really fails: 3.7 mm is not in the DIN 338 drill series (a verified source).
+
+    A wall below an unverified guideline warns instead of failing (review item 6), so a test that needs a
+    failed check uses the drill series, which does come from a standard.
+    """
+    cad = _cad()
+    cad["holes"] = [{"x": 20, "y": 10, "z_top": 3, "axis": "z", "d": 3.7}]
+    return cad
+
+
 # ------------------------------------------------------------------ G1: the limits are the loose ones
 def test_the_default_limits_are_the_loose_g_ones():
     assert dj.setting("IDRIS_CAD_CALL_S") == 120
@@ -43,7 +54,7 @@ def test_the_deadline_comes_from_the_env_budget_not_the_old_85_s(monkeypatch):
     def slow(msg, ctx, prov):
         calls.append(1)
         time.sleep(0.12)
-        return {"ok": True, "cad": _cad(wall=0.5)}          # a wall the DFM table rejects: the loop wants round 2
+        return {"ok": True, "cad": _cad_bad()}              # the DFM table fails it: the loop wants round 2
 
     res = dj.run("bracket L 40", cad_fn=slow)
     assert len(calls) == 1, "round 2 must not start a new AI call once the budget is gone"
@@ -67,7 +78,7 @@ def test_the_loop_stops_as_soon_as_every_check_passes():
 
 
 def test_a_repair_may_never_change_a_size_the_engineer_gave():
-    seq = [_cad(wall=0.5, user_length=40.0), _cad(wall=3.0, user_length=50.0)]
+    seq = [_cad_bad(), _cad(wall=3.0, user_length=50.0)]
 
     def cad_fn(msg, ctx, prov):
         return {"ok": True, "cad": seq.pop(0)}
@@ -121,12 +132,15 @@ def test_cad_steps_follow_the_step_markers():
 
 
 # ------------------------------------------------------------------ G2 step 4: DFM with its source
-def test_dfm_rejects_a_half_mm_wall_for_cnc_aluminium_with_the_rule_source():
+def test_dfm_warns_about_a_half_mm_wall_for_cnc_aluminium_because_its_source_is_unverified():
+    """Review item 6: the 0.8 mm machining figure has no table or clause behind it, so it warns, never fails."""
     out = dfm_rules.check({"process": "cnc", "material": "aluminium",
                            "params": [{"k": "t", "value": 0.5, "wall": True, "label": "wall"}]})
-    fail = [c for c in out["checks"] if c["status"] == "fail"]
-    assert fail and fail[0]["id"] == "min_wall" and fail[0]["limit"] == 0.8
-    assert "Machining guideline" in fail[0]["source"]
+    warn = [c for c in out["checks"] if c["status"] == "warn"]
+    assert warn and warn[0]["id"] == "min_wall" and warn[0]["limit"] == 0.8
+    assert warn[0]["source_status"] == dfm_rules.UNVERIFIED
+    assert "not verified" in warn[0]["message"]
+    assert out["ok"] is True, "an unverified guideline may not fail a part"
 
 
 def test_dfm_never_reports_a_pass_for_something_it_cannot_see():
