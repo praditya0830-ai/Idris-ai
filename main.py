@@ -215,6 +215,7 @@ class Handler(BaseHTTPRequestHandler):
                     "GET /solvers": "catalog of ACE solvers: fidelity, input schema, benchmarks, limitations",
                     "GET /selfcheck": "end-to-end check: 3 demo scenarios × generate, assembly, review, FEA, modal, thermal, timed (background; ?refresh=1)",
                     "GET /occt/selftest": "optional OpenCascade kernel: import, exact solids, STEP write/read, volumes, memory (stage 1)",
+                    "GET /ai/usage": "AI spend guard: AI calls and tokens today, estimated cost today and this month, and how much of the daily call cap and the monthly budget is left (no key, no user data)",
                     "GET /verify": "solver benchmarks vs published reference values (runs in background, cached; ?refresh=1)",
                 },
                 "solver_version": SOLVER_VERSION,
@@ -222,6 +223,12 @@ class Handler(BaseHTTPRequestHandler):
                 "occt": _occt_status(),
             })
             return
+        if self.path.split("?")[0].rstrip("/") == "/ai/usage":
+            # Review item 7d: what the AI guard has spent. Counts and money only, never a key or a user.
+            import ai_budget
+            self._send_json(200, {"success": True, **ai_budget.usage(), "solver_version": SOLVER_VERSION})
+            return
+
         if self.path.split("?")[0] == "/occt/selftest":
             try:
                 from physics.occt_export import selftest
@@ -582,7 +589,13 @@ class Handler(BaseHTTPRequestHandler):
         import cad_fallback
         base = {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None}
-        r = cad_fallback.design(msg, ctx, provider, reply_language)
+        try:
+            budget = float(os.environ.get("IDRIS_CAD_BUDGET_S", "85"))
+        except (TypeError, ValueError):
+            budget = 85.0
+        # Review item 1: the ladder shares one budget with the HTTP limit. Without a deadline a full design
+        # (~85 s) plus the simplified one could reach ~170 s and the Studio showed "chat failed".
+        r = cad_fallback.design(msg, ctx, provider, reply_language, deadline=time.time() + budget)
         return {**base, "answer": r["answer"], "cad": r.get("cad"), "provider": r.get("read_by"),
                 "language": "en" if llm.want_english(reply_language) else None,
                 "cad_attempts": r.get("attempts") or [], "fidelity": r.get("fidelity"),
@@ -723,6 +736,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"success": False, "error": f"invalid JSON body: {e}"})
             return
+
+        # Review item 7a: every POST route that can call a paid provider is rate limited per IP before it
+        # starts, exactly like /chat; http_ext / the modules name their own AI routes. The calls themselves are
+        # counted in ai_budget (llm._post), which also covers the calls a background job makes later.
+        if base == "/design/job" or http_ext.calls_ai(base):
+            try:
+                llm.check_rate((self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip())
+            except llm.LLMError as e:
+                self._send_json(429, {"success": False, "error": str(e), "fallback": True})
+                return
 
         res = http_ext.handle_post(base, params)
         if res is not None:
