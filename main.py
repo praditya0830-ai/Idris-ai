@@ -228,6 +228,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"pass": False, "error": f"{type(e).__name__}: {e}"})
             return
 
+        import http_ext                    # Bagian F onward: a route that lives in its own small module
+        res = http_ext.handle_get(self.path)
+        if res is not None:
+            self._send_json(*res)
+            return
+
         if self.path.split("?")[0].startswith(("/geometry/", "/engineer/")):
             import engine_routes          # geometry contract, kernel status, engine selftest, materials
             res = engine_routes.handle_get(self.path)
@@ -558,23 +564,17 @@ class Handler(BaseHTTPRequestHandler):
         return design_from_message(message, OUTPUT_DIR, uuid.uuid4().hex[:8], ai, self._base_url())
 
     def _chat_cad(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
-        """Non-gearbox object -> AI writes replicad code (field `cad`); the browser builds and checks it."""
-        import cad_codegen
+        """Non-gearbox object -> CAD code the browser builds. Bagian F: the ladder full -> simplified ->
+        placeholder, so an answer carries geometry unless the request holds no usable size at all."""
+        import cad_fallback
         base = {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None}
-        try:
-            r = cad_codegen.generate(msg, ctx, provider, reply_language)
-        except llm.LLMError:
-            en = llm.want_english(reply_language) or not llm._looks_indonesian(msg)
-            return {**base, "cad": None, "provider": None, "language": "en" if en else "id",
-                    "answer": ("Free-form design needs an AI, and no AI is active on the server yet. For now IDRIS "
-                               "can build a cube, a block or plate with holes, a cylinder or tube, and a sphere."
-                               if en else
-                               "Desain bentuk bebas butuh AI, dan belum ada AI yang aktif di server. "
-                               "Untuk sekarang IDRIS bisa membuat kubus, balok/plat berlubang, silinder/tabung, dan bola.")}
+        r = cad_fallback.design(msg, ctx, provider, reply_language)
         return {**base, "answer": r["answer"], "cad": r.get("cad"), "provider": r.get("read_by"),
                 "language": "en" if llm.want_english(reply_language) else None,
-                "cad_attempts": r.get("attempts") or []}
+                "cad_attempts": r.get("attempts") or [], "fidelity": r.get("fidelity"),
+                "validated": bool(r.get("validated")), "target_check": r.get("target_check"),
+                "not_checked": r.get("not_checked") or []}
 
     def _chat_concepts(self, msg: str, concepts: list, provider=None, reply_language=None) -> dict:
         """Like the gearbox flow: several design concepts at once, each a full `cad` the browser builds and checks."""
@@ -691,10 +691,12 @@ class Handler(BaseHTTPRequestHandler):
                        "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank",
                        "/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
                        "/exchange/step", "/engineer/solve", "/engineer/verify")
+        import http_ext                     # Bagian F onward: routes owned by a small module of their own
         base = self.path.split("?")[0]
         is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
-        # every route handled below must be listed here (tests/test_routes.py checks it)
-        if base not in POST_ROUTES and not is_ace:
+        # every route handled below must be listed here (tests/test_routes.py checks it); a module registered in
+        # http_ext keeps its own route list, so two sections never have to edit the same tuple
+        if base not in POST_ROUTES and not is_ace and not http_ext.known_post(base):
             self._send_json(404, {"success": False, "error": "unknown endpoint"})
             return
 
@@ -707,6 +709,11 @@ class Handler(BaseHTTPRequestHandler):
             params = json.loads(raw.decode("utf-8") or "{}")
         except Exception as e:
             self._send_json(400, {"success": False, "error": f"invalid JSON body: {e}"})
+            return
+
+        res = http_ext.handle_post(base, params)
+        if res is not None:
+            self._send_json(*res)
             return
 
         if is_ace:
