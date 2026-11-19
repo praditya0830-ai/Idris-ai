@@ -86,7 +86,10 @@ def validate(raw: dict) -> tuple:
         errs.append(f"the plan has {len(parts)} unique parts; the limit is {max_parts()} "
                     f"(IDRIS_ASSEMBLY_MAX_PARTS). Split it into sub-assemblies, for example "
                     f"drivetrain, frame + fork, wheels, and start with one of them")
-    interfaces = []
+    # the plan-level source map is read first: an interface may name its source once, or give one per size
+    sources = {str(k)[:40]: str(v)[:160] for k, v in (raw.get("sources") or {}).items()
+               if isinstance(v, (str, int, float))} if isinstance(raw.get("sources"), dict) else {}
+    interfaces, unsourced = [], []
     for i in raw.get("interfaces") or []:
         if not isinstance(i, dict):
             continue
@@ -99,10 +102,24 @@ def validate(raw: dict) -> tuple:
             errs.append(f"interface {pair} joins a part to itself")
             continue
         kind = str(i.get("kind") or "contact").lower()
-        interfaces.append({"between": pair, "kind": kind if kind in KINDS else "contact",
-                           "params": {str(k)[:40]: v for k, v in (i.get("params") or {}).items()
-                                      if isinstance(v, (int, float, str))},
-                           "source": str(i.get("source") or "")[:120]})
+        # Review of PR #5-#8, item 4: every number needs a source (user / standard: <name> / default: <reason>).
+        # A size without one is not thrown away: it is marked "unsourced", asked back, and the job waits.
+        iface_source = str(i.get("source") or "")[:120]
+        params, param_sources, missing_src = {}, {}, []
+        for k, v in (i.get("params") or {}).items():
+            if not isinstance(v, (int, float, str)):
+                continue
+            kk = str(k)[:40]
+            params[kk] = v
+            src = iface_source or sources.get(kk) or ""
+            param_sources[kk] = src or "unsourced"
+            if not src and isinstance(v, (int, float)) and not isinstance(v, bool):
+                missing_src.append(kk)
+                unsourced.append({"between": list(pair), "param": kk, "value": v,
+                                  "key": f"{pair[0]}-{pair[1]}.{kk}"})
+        interfaces.append({"between": pair, "kind": kind if kind in KINDS else "contact", "params": params,
+                           "source": iface_source, "param_sources": param_sources,
+                           "unsourced": missing_src})
     frames = []
     for f in raw.get("frames") or []:
         if not isinstance(f, dict):
@@ -116,12 +133,39 @@ def validate(raw: dict) -> tuple:
             errs.append(f"frame for '{pid}' needs three numbers for origin_mm and three for axis")
             continue
         frames.append({"part_id": pid, "origin_mm": origin, "axis": axis})
-    sources = {str(k)[:40]: str(v)[:160] for k, v in (raw.get("sources") or {}).items()
-               if isinstance(v, (str, int, float))} if isinstance(raw.get("sources"), dict) else {}
     questions = [str(q)[:200] for q in (raw.get("questions") or [])][:QUESTIONS_MAX]
+    for u in unsourced:                        # one question per size that has no source yet
+        questions.append(_confirm_question(u))
     plan = {"parts": parts, "interfaces": interfaces, "frames": frames, "sources": sources,
-            "questions": questions}
+            "questions": questions, "unsourced": unsourced}
     return plan, errs
+
+
+def _confirm_question(u: dict) -> str:
+    return (f"Confirm {u['param']} = {float(u['value']):g} mm for {u['between'][0]}-{u['between'][1]}? "
+            "It has no source yet (user, standard: <name>, or default: <reason>).")
+
+
+def confirm(plan: dict, keys) -> dict:
+    """The engineer accepted some unsourced sizes: they become theirs and those questions go away.
+
+    `keys` are the ids validate() reported ("frame-fork.steerer_d_mm"), so a plan can be confirmed size by
+    size. The rest stay unsourced, so the job still waits for them.
+    """
+    wanted = {str(k).strip() for k in (keys or [])}
+    left = []
+    for u in (plan or {}).get("unsourced") or []:
+        if u.get("key") in wanted:
+            for i in plan.get("interfaces") or []:
+                if i.get("between") == u.get("between") and u["param"] in (i.get("params") or {}):
+                    i.setdefault("param_sources", {})[u["param"]] = "user (confirmed)"
+                    i["unsourced"] = [k for k in i.get("unsourced") or [] if k != u["param"]]
+            continue
+        left.append(u)
+    plan["unsourced"] = left
+    plan["questions"] = [q for q in plan.get("questions") or [] if not str(q).startswith("Confirm ")]
+    plan["questions"] += [_confirm_question(u) for u in left]
+    return plan
 
 
 def unique_parts(plan: dict) -> tuple:

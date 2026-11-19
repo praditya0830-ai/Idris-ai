@@ -27,10 +27,14 @@ QUANTITIES = {
                        "measured_by": "FEAssembler/fea_part_3d"},
     "min_sf": {"label": "Minimum safety factor", "unit": "-", "better": "high", "solver": "fea_part_3d",
                "measured_by": "fea_part_3d (von Mises vs yield)"},
+    # Review of PR #5-#8, item 5: the plate solver is only valid for a flat plate (see _is_plate), and there is
+    # no modal solver for a free part in this build — modal_solid_block is the solid block of a gearbox housing,
+    # and the motor's electromagnetic excitation frequency is not computed by IDRIS at all, so a "resonance gap"
+    # would be a number with one half missing.
     "max_temperature": {"label": "Maximum temperature", "unit": "C", "better": "low", "solver": "free_convection_plate",
-                        "measured_by": "free_convection_plate"},
+                        "measured_by": "free_convection_plate (flat plate only)"},
     "resonance_gap": {"label": "Resonance gap (natural vs excitation frequency)", "unit": "Hz", "better": "high",
-                      "solver": "modal_solid_block", "measured_by": "modal_solid_block"},
+                      "solver": None, "measured_by": None},
     "cogging_torque": {"label": "Cogging torque", "unit": "Nm", "better": "low", "solver": None,
                        "measured_by": None},
     "torque_ripple": {"label": "Torque ripple", "unit": "%", "better": "low", "solver": None, "measured_by": None},
@@ -75,10 +79,48 @@ def _registry():
         return None
 
 
-def solver_status(name: str | None) -> dict:
+# words that mark the thin dimension of a plate in a part's own parameter list
+_THIN_WORDS = ("thick", "tebal", "wall", "dinding", "plate", "pelat", "plat")
+
+
+def _is_plate(cad: dict | None, params=None) -> bool:
+    """True only for a flat plate: one thin dimension marked as a wall, and two others at least three times it.
+
+    free_convection_plate is a flat-plate correlation, so applying it to a free-form part would be a number from
+    outside the solver's range (review item 5). Without a parameter list, the answer is no.
+    """
+    values = {}
+    items = (list((cad or {}).get("params") or []) if isinstance(cad, dict) else []) + (list(params or [])
+                                                                                        if isinstance(params, list) else [])
+    for p in items:
+        if not isinstance(p, dict):
+            continue
+        try:
+            v = float(p.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        key = str(p.get("k") or p.get("label") or f"p{len(values)}").strip().lower()
+        values[key] = (v, bool(p.get("wall")) or any(w in key for w in _THIN_WORDS))
+    if len(values) < 3:
+        return False
+    thin = [v for v, is_thin in values.values() if is_thin]
+    others = [v for v, is_thin in values.values() if not is_thin]
+    if not thin or len(others) < 2:
+        return False
+    t = min(thin)
+    return all(v >= 3 * t for v in others)
+
+
+def solver_status(name: str | None, cad: dict | None = None, params=None) -> dict:
     """-> {status: solver | kernel | not_available, solver, benchmark}. Benchmarks are the gate for a score."""
     if not name:
         return {"status": "not_available", "solver": None, "benchmark": None}
+    if name == "free_convection_plate" and not _is_plate(cad, params):
+        return {"status": "not_available", "solver": name, "benchmark": None,
+                "reason": "free_convection_plate is a flat-plate correlation; this part is not a plate, so the "
+                          "solver is not applied to it"}
     if name == "kernel_volume":
         return {"status": "kernel", "solver": None, "benchmark": "measured volume x materials table density"}
     reg = _registry()
@@ -102,10 +144,12 @@ def objectives_for(request: str) -> list:
     return out
 
 
-def measurable(request: str) -> dict:
+def measurable(request: str, cad: dict | None = None, params=None) -> dict:
     """H1: the goal sentence -> quantities, each with the solver that measures it and its status.
 
-    -> {goals, quantities: [{key, label, unit, better, status, solver, benchmark, measured_by}],
+    `cad` / `params` are the part's own parameters when they are known: a solver whose range does not cover the
+    shape (the flat-plate correlation on a block) is then reported as not_available with its reason.
+    -> {goals, quantities: [{key, label, unit, better, status, solver, benchmark, measured_by, reason?}],
         scoreable: [keys], not_checked: [labels], note}
     """
     goals = objectives_for(request)
@@ -117,10 +161,13 @@ def measurable(request: str) -> dict:
     quantities = []
     for k in keys:
         spec = QUANTITIES[k]
-        st = solver_status(spec["solver"])
-        quantities.append({"key": k, "label": spec["label"], "unit": spec["unit"], "better": spec["better"],
-                           "status": st["status"], "solver": spec["solver"], "benchmark": st["benchmark"],
-                           "measured_by": spec["measured_by"]})
+        st = solver_status(spec["solver"], cad, params)
+        q = {"key": k, "label": spec["label"], "unit": spec["unit"], "better": spec["better"],
+             "status": st["status"], "solver": spec["solver"], "benchmark": st["benchmark"],
+             "measured_by": spec["measured_by"]}
+        if st.get("reason"):
+            q["reason"] = st["reason"]
+        quantities.append(q)
     scoreable = [q["key"] for q in quantities if q["status"] in ("solver", "kernel")]
     not_checked = [q["label"] for q in quantities if q["status"] == "not_available"]
     return {"request": request, "goals": goals, "quantities": quantities, "scoreable": scoreable,
@@ -236,30 +283,47 @@ def rank(results: list, weights: dict | None = None, measured: dict | None = Non
             continue
         scored.append((r, have, values))
     if not scored:
-        return {"ranking": [], "not_ranked": skipped, "weights": weights,
+        return {"ranking": [], "not_ranked": skipped, "weights": weights, "compared_on": [],
                 "summary": "No variant has a measured objective value yet, so nothing is ranked."}
+    # Review item 5: compare only on the quantities EVERY ranked variant has. Scoring one variant on two
+    # objectives and another on one would rank them on different bases; a variant that lacks a shared quantity
+    # is not compared at all, and says why.
+    common = set(scored[0][1])
+    for _r, have, _v in scored[1:]:
+        common &= set(have)
+    if not common:
+        skipped += [{"name": r["name"], "reason": "no objective value is shared by every variant, so the "
+                                                      "variants cannot be compared on one basis"}
+                    for r, _h, _v in scored]
+        return {"ranking": [], "not_ranked": skipped, "weights": weights, "compared_on": [],
+                "summary": "No objective is measured for every variant, so nothing is ranked."}
     # per-quantity min/max over the variants that have that value
     rng = {}
     for _r, _have, values in scored:
-        for k in _have:
+        for k in common:
             lo, hi = rng.get(k, (values[k], values[k]))
             rng[k] = (min(lo, values[k]), max(hi, values[k]))
     ranking = []
     for r, have, values in scored:
         num = den = 0.0
-        for k in have:
+        for k in sorted(common):
             w = weights.get(k, 1.0)
             lo, hi = rng[k]
             num += w * _norm(float(values[k]), lo, hi, QUANTITIES.get(k, {}).get("better", "low"))
             den += w
         sources = r.get("sources") if isinstance(r.get("sources"), dict) else {}
-        ranking.append({"name": r["name"], "score": round(num / den, 4) if den else 0.0,
-                        "values": {k: values[k] for k in have},
-                        "measured_by": {k: sources.get(k) or QUANTITIES.get(k, {}).get("measured_by") for k in have},
-                        "gates": checks_note(r)})
+        entry = {"name": r["name"], "score": round(num / den, 4) if den else 0.0,
+                 "values": {k: values[k] for k in sorted(common)},
+                 "measured_by": {k: sources.get(k) or QUANTITIES.get(k, {}).get("measured_by") for k in common},
+                 "gates": checks_note(r)}
+        extra = sorted(set(have) - common)
+        if extra:
+            entry["not_compared"] = {k: "not measured for every variant, so it was left out of the score"
+                                     for k in extra}
+        ranking.append(entry)
     ranking.sort(key=lambda x: -x["score"])
     missing = [measured[k]["label"] for k in keys if k not in rng]
-    return {"ranking": ranking, "not_ranked": skipped, "weights": weights,
+    return {"ranking": ranking, "not_ranked": skipped, "weights": weights, "compared_on": sorted(common),
             "summary": ("Ranked " + str(len(ranking)) + " variant(s) on " + str(len(rng)) +
                         " measured objective(s).") +
                        ((" Not measured for any variant: " + ", ".join(missing) + ".") if missing else "")}

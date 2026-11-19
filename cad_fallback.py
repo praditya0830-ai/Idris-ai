@@ -26,6 +26,11 @@ import llm
 
 FIDELITIES = ("full", "simplified", "placeholder")
 
+# F2 verdicts (review of PR #5-#8, item 2): "doubtful" is kept for a target that a law of physics argues
+# against. A quantity IDRIS cannot measure at all is "not_checkable_yet" — a quieter motor is not doubtful just
+# because this build has no acoustic solver.
+VERDICTS = ("plausible", "not_achievable_by_this_part", "not_checkable_yet", "doubtful")
+
 # Digit-free on purpose: it is appended to the request, and a stray number there would be read as a size the
 # engineer gave (cad_codegen collects the user's numbers from the request text).
 SIMPLIFY_NOTE = ("\n\nSimplest valid version, only this once: the main shape only, no fillets, no patterns, "
@@ -99,12 +104,14 @@ def target_check(message: str) -> dict | None:
                   "; and " + _LAWS["fuel"])
         checkable = []
     elif "noise" in kinds:
-        verdict = "doubtful"
-        reason = _LAWS["noise"]
+        verdict = "not_checkable_yet"
+        reason = (_LAWS["noise"] + ". IDRIS has no acoustic solver in this build, so this target is neither "
+                  "achievable nor doubtful here: it is simply not judged")
         checkable = ["mass and stiffness of the shape, from the measured solid"]
     elif "thermal" in kinds:
-        verdict = "doubtful"
-        reason = _LAWS["thermal"]
+        verdict = "not_checkable_yet"
+        reason = (_LAWS["thermal"] + ". IDRIS has no thermal solver for a free part in this build, so this "
+                  "target is not judged here")
         checkable = ["mass and surface area of the shape, from the measured solid"]
     elif "strength" in kinds:
         verdict = "plausible"
