@@ -9,7 +9,10 @@ Keys are read from environment variables (set them in Render -> Environment):
     DEEPSEEK_API_KEY, DASHSCOPE_API_KEY (Qwen), MOONSHOT_API_KEY (Kimi)
 Optional model overrides: IDRIS_MODEL_CLAUDE, IDRIS_MODEL_GEMINI, IDRIS_MODEL_OPENAI
 Optional base-url overrides (testing): ANTHROPIC_BASE_URL, GEMINI_BASE_URL, OPENAI_BASE_URL
-Limits: IDRIS_LLM_PER_MIN (per IP, default 12), IDRIS_LLM_DAILY_CAP (all users, default 400)
+Limits: IDRIS_LLM_PER_MIN (per IP, default 12), IDRIS_LLM_DAILY_CAP (requests per day, all users, default 400)
+Spend guard (ai_budget.py, review of PR #5-#8): every paid call is counted at _post, including calls made
+    by background jobs. IDRIS_AI_CALLS_DAILY_CAP (default 300 calls a day) and IDRIS_AI_MONTHLY_BUDGET_USD
+    (default 20 USD, from the tokens the provider reports). GET /ai/usage shows both.
 """
 from __future__ import annotations
 
@@ -151,16 +154,29 @@ def model_for(provider: str) -> str:
     return models_for(provider)[0]
 
 
+def _http(req, timeout: float) -> dict:
+    """The one network call to a provider. Kept apart so a test can answer without a network."""
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
 def _post(url: str, headers: dict, body: dict, timeout: float = 25.0) -> dict:
+    import ai_budget                         # one counter for every paid call: routes and background jobs
+    why = ai_budget.gate()                   # no provider is called once the day or the month is used up
+    if why:
+        raise LLMError(why, 429)
     req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json", **headers})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+        d = _http(req, timeout)
     except urllib.error.HTTPError as e:
+        ai_budget.record(url, body)          # a call that came back with an error is still a call
         detail = redact(" ".join(e.read().decode(errors="replace").split()))[:220]
         raise LLMError(f"provider returned HTTP {e.code}: {detail}", http=e.code)
     except Exception as e:                      # network, timeout, bad JSON
+        ai_budget.record(url, body)
         raise LLMError(f"could not reach the AI provider ({type(e).__name__})")
+    ai_budget.record(url, body, d)
+    return d
 
 
 _NO_TEMPERATURE = set()                # models that rejected "temperature" (newer Claude / OpenAI models): not sent again
