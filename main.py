@@ -104,6 +104,18 @@ def _requirements_from(params):
     )
 
 
+def _assembly_job(plan: dict, request: str, provider=None) -> dict:
+    """Bagian E3/E4: start the part-by-part job. -> the `assembly` block the chat returns. No number is made up."""
+    import assembly_ext
+    import assembly_plan
+    job_id = assembly_ext.start_job(request, plan, provider)
+    st = assembly_ext.status(job_id) or {}
+    est = assembly_plan.estimate(plan)
+    return {"job_id": job_id, "status": st.get("status") or "queued", "plan": plan, "estimate": est,
+            "poll": f"/assembly/design/{job_id}", "eta_s": st.get("eta_s", est["eta_s"]),
+            "not_checked": [assembly_ext.NOT_CHECKED]}
+
+
 def _fault(e: Exception) -> str:
     """One line a screenshot can carry: what failed and where. No secrets: type, short message, file and line."""
     tb = traceback.extract_tb(e.__traceback__)
@@ -182,6 +194,9 @@ class Handler(BaseHTTPRequestHandler):
                 "endpoints": {
                     "POST /generate-variants": "requirements in -> up to 5 physics-checked, scored gearbox variants",
                     "POST /generate-assembly": "full manufacturable 3D assembly of one variant as separate STL parts + BOM (CSV); body \"export_step\": true or ?step=1 adds a faceted STEP file",
+                    "POST /assembly/plan": "one sentence for a whole product -> a validated plan of parts, interfaces and frames, with an estimate (no job yet)",
+                    "POST /assembly/design": "the same sentence, then the confirmed plan -> a job that designs each part on its own; GET /assembly/design/<job_id> shows each part as it finishes (geometry and per-part checks only)",
+                    "POST /chat (whole product, e.g. 'whole bicycle 170 cm')": "AI reads it as an assembly -> the plan, its estimate and the job, instead of one solid",
                     "POST /generate-housing": "generate a parametric gearbox housing shell",
                     "POST /chat": "free-text message -> structured requirements via Claude/Gemini/OpenAI (validated; falls back to the built-in parser)",
                     "GET /chat/providers": "which AI providers are configured on this server",
@@ -226,6 +241,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, selftest())
             except Exception as e:
                 self._send_json(200, {"pass": False, "error": f"{type(e).__name__}: {e}"})
+            return
+
+        if self.path.split("?")[0].startswith("/assembly/design/"):
+            # Bagian E4b: progress of one assembly job -- each part as it finishes, eta_s, elapsed_s
+            try:
+                import assembly_ext
+                res = assembly_ext.handle_get(self.path)
+            except Exception as e:
+                traceback.print_exc()
+                res = (500, {"success": False, "error": f"assembly route failed: {_fault(e)}"})
+            self._send_json(*res)
             return
 
         if self.path.split("?")[0].startswith(("/geometry/", "/engineer/")):
@@ -557,6 +583,53 @@ class Handler(BaseHTTPRequestHandler):
         ai = (lambda m: llm.parse_part(m, provider)) if llm.provider_order() else None
         return design_from_message(message, OUTPUT_DIR, uuid.uuid4().hex[:8], ai, self._base_url())
 
+    def _chat_assembly(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
+        """Bagian E in /chat: "design whole bicycle" -> a plan of parts, then one job that designs the parts.
+
+        With no plan in context: one AI call writes the plan; estimate and questions come back with it, and the job
+        starts in this same reply when nothing is left to ask. A plan sent back in context.assembly_plan is validated
+        again and starts the job -- that is the engineer confirming or correcting the split.
+        """
+        import assembly_plan
+        base = {"success": True, "intent": "assembly", "actions": [], "params": {}, "rejected": [], "select": None,
+                "compare": None, "provider": provider, "language": None}
+        given = ctx.get("assembly_plan") if isinstance(ctx, dict) else None
+        if isinstance(given, dict) and given.get("parts"):
+            plan, errors = assembly_plan.validate(given)
+            if errors:
+                return {**base, "answer": ("The plan you confirmed cannot be used, so no job was started: "
+                                           + "; ".join(errors[:4])),
+                        "assembly": {"plan": plan, "errors": errors, "job_id": None}}
+            request = str((ctx or {}).get("assembly_request") or msg)
+            block = _assembly_job(plan, request, provider)
+            return {**base, "answer": ("Plan confirmed. " + block["estimate"]["text"] + " Each part is designed on "
+                                       "its own and kept as it finishes; the parts are placed together at the end,"
+                                       " and IDRIS does not analyse the assembly as one system."),
+                    "assembly": block}
+        out = assembly_plan.plan_for(msg, provider=provider)
+        if not out.get("ok"):
+            return {**base, "answer": ("IDRIS could not turn this into a part-by-part plan, so no job was started: "
+                                       + str(out.get("error") or "the plan was empty")
+                                       + ". A plan needs unique part ids, interfaces between parts that exist and a "
+                                         "frame for every part."),
+                    "assembly": {"plan": out.get("plan"), "errors": out.get("errors") or [],
+                                 "estimate": out.get("estimate"), "job_id": None}}
+        plan = out["plan"]
+        questions = plan.get("questions") or []
+        if questions:
+            return {**base, "answer": ("This is an assembly, so IDRIS planned it as parts instead of one solid -- "
+                                       "but it needs an answer first: " + " ".join(questions[:3])
+                                       + " Answer it, then send the plan back in context.assembly_plan and the job "
+                                         "starts."),
+                    "assembly": {"plan": plan, "questions": questions, "estimate": out.get("estimate"),
+                                 "job_id": None,
+                                 "how_to_continue": "answer the question(s), then send context.assembly_plan"}}
+        block = _assembly_job(plan, msg, provider)
+        return {**base, "answer": (block["estimate"]["text"] + " The job has started; each part is designed on its "
+                                   "own and kept as it finishes, and IDRIS does not analyse the assembly as one "
+                                   "system."),
+                "assembly": block}
+
     def _chat_cad(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
         """Non-gearbox object -> AI writes replicad code (field `cad`); the browser builds and checks it."""
         import cad_codegen
@@ -690,6 +763,7 @@ class Handler(BaseHTTPRequestHandler):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
                        "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank",
                        "/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
+                       "/assembly/plan", "/assembly/design",
                        "/exchange/step", "/engineer/solve", "/engineer/verify")
         base = self.path.split("?")[0]
         is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
@@ -717,6 +791,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"success": False, "error": "unknown endpoint"})
             else:
                 self._send_ace(*res)
+            return
+
+        if base in ("/assembly/plan", "/assembly/design"):
+            # Bagian E: the plan, and the job that designs each part (follow it with GET /assembly/design/<job_id>)
+            try:
+                import assembly_ext
+                res = assembly_ext.handle_post(base, params)
+            except Exception as e:
+                traceback.print_exc()
+                res = (500, {"success": False, "error": f"assembly route failed: {_fault(e)}"})
+            self._send_json(*res)
             return
 
         if base.startswith(("/model/", "/assembly/", "/exchange/", "/engineer/")):
@@ -757,6 +842,12 @@ class Handler(BaseHTTPRequestHandler):
                 rl = params.get("reply_language")
                 has_gearbox = bool(params.get("current") or params.get("variants"))
                 from physics import parts_library as plib
+                # Bagian E: the plan came back from the engineer (confirmed or corrected) -- start the job at once,
+                # before the router or a keyword rule reads the message again.
+                if isinstance(ctx, dict) and isinstance(ctx.get("assembly_plan"), dict):
+                    out = self._chat_assembly(msg, ctx, params.get("provider"), rl)
+                    self._send_json(200, out)
+                    return
                 hit = None
                 # v0.34: for a fresh sentence the AI reads first and picks the route; keyword rules are the fallback
                 routed = None
@@ -767,6 +858,13 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         traceback.print_exc()
                         routed = None
+                # Bagian E: a whole product ("whole bicycle") is planned as parts and designed part by part. The
+                # router reads the sentence; when it says assembly, the fat single-solid path is never taken.
+                if routed and routed.get("route") == "assembly":
+                    out = self._chat_assembly(msg, ctx, params.get("provider"), rl)
+                    out["route"] = routed
+                    self._send_json(200, out)
+                    return
                 # v0.36.2: a formula question is still looked up while a design is open; only a request that
                 # changes or repairs that design (cad_error, or an answer to a missing size) is skipped. A design
                 # request (whatever route the router picked), a greeting and a message that never asks for a

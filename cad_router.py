@@ -3,6 +3,7 @@
     library      one standard part from the IDRIS library (bolt, bearing, spur gear, plow blade, ...)
     primitive    a plain box / cylinder / tube / plate, nothing else
     gearbox      the gearbox workflow (ACE variants, ISO 6336)
+    assembly     a whole product of several separate parts: planned as parts, then designed part by part
     free_design  any other part: the AI CAD designer, then kernel checks, FEA, variants
     other        a question, or an edit of the open design
 
@@ -19,7 +20,7 @@ import re
 import llm
 from physics import parts_library as plib
 
-ROUTES = ("library", "primitive", "gearbox", "free_design", "other")
+ROUTES = ("library", "primitive", "gearbox", "assembly", "free_design", "other")
 
 
 def enabled() -> bool:
@@ -37,7 +38,7 @@ def _library_lines() -> str:
 def _system() -> str:
     return ("""You are the first reader in IDRIS, an engineering design tool. Read ONE sentence from an engineer and decide
 who handles it. Output ONE JSON object only, no prose:
-{"route": "library"|"primitive"|"gearbox"|"free_design"|"other", "library_id": string|null, "query": {},
+{"route": "library"|"primitive"|"gearbox"|"assembly"|"free_design"|"other", "library_id": string|null, "query": {},
  "concepts": [], "reason": "max 12 words"}
 
 Routes:
@@ -46,6 +47,9 @@ Routes:
 - "primitive": ONLY a plain box/cube, solid cylinder, tube/ring, or flat plate with a simple hole pattern, and
   nothing else in the sentence. Any frame, weldment, slot, step, thread grid, pocket, rib or named product is free_design.
 - "gearbox": design, size or change a gearbox / reducer / gear pair by power, ratio, speed or torque.
+- "assembly": a whole product built from several separate parts that have to fit each other (a bicycle, a cart,
+  a robot arm, a test stand, a machine frame with wheels and drive). Use this for "whole ..." / "complete ..." and
+  for any product name, not for one part or a gearbox. IDRIS plans the parts first, then designs them one by one.
 - "free_design": any other physical part or assembly to design (bracket, housing, frame, fixture, jaw, hook, stand,
   enclosure, impeller, ...), in any language.
 - "other": a question, a greeting, or a change to the design that is already open ("make it lighter").
