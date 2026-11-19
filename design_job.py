@@ -40,6 +40,13 @@ _STORE: dict = {}
 _LOCK = threading.Lock()
 _DURATIONS: list = []                      # seconds per finished design, for the E4b/G1 estimate
 
+# Review of PR #5-#8, item 8: the build, the renders and the strength numbers happen in the browser, so a
+# round has to wait for them. The wait is bounded: a browser that never answers stops the job with a plain
+# reason instead of leaving the round marked not checked forever.
+FEEDBACK_ENV = "IDRIS_JOB_FEEDBACK_WAIT_S"
+DEFAULT_FEEDBACK_WAIT_S = 600.0
+_WAIT: dict = {}                           # job_id -> {round, need, event, data, since}
+
 
 def setting(name: str) -> float:
     """A limit from the environment, with the loose default Bagian G asks for (never a crash on a typo)."""
@@ -81,6 +88,107 @@ def estimate_s(unique_parts: int = 1, standard_parts: int = 0) -> dict:
     unique_parts = max(0, int(unique_parts or 0))
     return {"parts_to_design": unique_parts, "standard_parts": max(0, int(standard_parts or 0)),
             "per_part_s": per, "estimate_s": round(unique_parts * per, 1)}
+
+
+# ------------------------------------------------------------------ browser feedback (item 8)
+def feedback_wait_s() -> float:
+    """IDRIS_JOB_FEEDBACK_WAIT_S: how long one round waits for the browser (0 = never wait)."""
+    raw = os.environ.get(FEEDBACK_ENV)
+    try:
+        wait = float(raw) if raw not in (None, "") else DEFAULT_FEEDBACK_WAIT_S
+    except (TypeError, ValueError):
+        return DEFAULT_FEEDBACK_WAIT_S
+    return max(0.0, wait)
+
+
+def waiting_for(job_id: str | None) -> dict | None:
+    """What this job waits for right now: {need: "browser_build" | "fea", round, since}, or None."""
+    if not job_id:
+        return None
+    with _LOCK:
+        box = _WAIT.get(job_id)
+        if box is None or box["event"].is_set():
+            return None
+        return {"need": box["need"], "round": box["round"], "since": box["since"]}
+
+
+def browser_feedback(job_id: str | None):
+    """The callable a round uses to ask the browser for its half of the circle, then wait for it."""
+    def ask(rnd: int, need: str, cad: dict | None = None) -> dict:
+        wait_s = feedback_wait_s()
+        if not job_id or wait_s <= 0:
+            return {"skipped": True}
+        box = {"round": rnd, "need": need, "event": threading.Event(), "data": {}, "since": time.time()}
+        with _LOCK:
+            _WAIT[job_id] = box
+            store = _STORE.setdefault(job_id, {"events": [], "result": None, "created": time.time()})
+            store["waiting_for"] = need
+            store["waiting_round"] = rnd
+        try:
+            answered = box["event"].wait(wait_s)
+        finally:
+            with _LOCK:
+                _WAIT.pop(job_id, None)
+                store = _STORE.get(job_id) or {}
+                store.pop("waiting_for", None)
+                store.pop("waiting_round", None)
+        if not answered:
+            return {"timeout": True, "waited_s": round(time.time() - box["since"], 1), "need": need}
+        return dict(box["data"] or {})
+    return ask
+
+
+def accept_feedback(job_id: str, rnd=None, measurements=None, review_images=None, part_check=None) -> tuple:
+    """POST /design/job/<id>/feedback: one round's build, renders and strength numbers, from the browser."""
+    with _LOCK:
+        box = _WAIT.get(job_id)
+        target = box["round"] if box else None
+        need = box["need"] if box else None
+    if box is None:
+        return 404, {"success": False,
+                     "error": f"job '{str(job_id)[:40]}' is not waiting for the browser right now (it may be "
+                              f"finished, or it has not written code yet)"}
+    try:
+        got_round = int(rnd) if rnd is not None else target
+    except (TypeError, ValueError):
+        got_round = target
+    if got_round != target:
+        return 409, {"success": False, "error": f"the job is waiting for round {target}, not {got_round}",
+                     "round": target, "waiting_for": need}
+    data = {"measurements": measurements if isinstance(measurements, dict) else None,
+            "review_images": [im for im in review_images if isinstance(im, dict)]
+                            if isinstance(review_images, list) else None,
+            "part_check": part_check if isinstance(part_check, dict) else None}
+    given = [k for k, v in data.items() if v]
+    if not given:
+        return 400, {"success": False,
+                     "error": "send at least one of measurements, review_images or part_check"}
+    with _LOCK:
+        box["data"] = data
+    box["event"].set()
+    return 200, {"success": True, "job_id": job_id, "round": target, "accepted": given,
+                 "poll": f"/design/job/{job_id}"}
+
+
+def handle_feedback(base: str, params: dict):
+    """Route hook: /design/job/<id>/feedback (http_ext asks this, so main.py needs no new route line)."""
+    p = str(base or "").rstrip("/")
+    if not (p.startswith("/design/job/") and p.endswith("/feedback")):
+        return None
+    job_id = p[len("/design/job/"):-len("/feedback")].strip("/")
+    return accept_feedback(job_id, params.get("round"), params.get("measurements"),
+                           params.get("review_images"), params.get("part_check"))
+
+
+def _image_review(request: str, cad: dict, images: list, rnd: int, provider=None):
+    """The browser's renders -> the AI reviewer, when the job was not given one (item 8)."""
+    def look(cad_now: dict) -> dict:
+        import cad_codegen
+        r = cad_codegen.review(request, cad_now or cad, images, None, rnd, provider, None) or {}
+        verdict = r.get("verdict") or ("ok" if r.get("ok") else "revise")
+        note = str(r.get("answer") or r.get("error") or "").strip()
+        return {"verdict": verdict, "notes": [note] if note else []}
+    return look
 
 
 # ------------------------------------------------------------------ the log (G3)
@@ -173,7 +281,8 @@ def not_checked_text(checks: list) -> list:
 
 # ------------------------------------------------------------------ one design, in rounds
 def run(request: str, context: dict | None = None, provider: str | None = None, review=None, fea=None,
-        fea_trial=None, cad_fn=None, measurements: dict | None = None, on_event=None, job_id=None) -> dict:
+        fea_trial=None, cad_fn=None, measurements: dict | None = None, on_event=None, job_id=None,
+        feedback=None) -> dict:
     """The validation circle. Returns the last design with its log, checks and label.
 
     `fea(cad)` -> {"sf": number, "numbers": {...}} and `fea_trial(cad, target)` -> {"param","from","to","sf"}
@@ -243,11 +352,33 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
                        "max_lines": int(setting("IDRIS_CAD_MAX_LINES"))},
               source=str(cad.get("read_by") or "AI"))
 
-        # 2) build: the kernel is the browser's, so this is only known when a measurement came with the request
-        event("build", status="pass" if measurements else "not_checked",
-              message=("kernel measurements were sent with the request" if measurements else
-                       "the CAD kernel runs in the browser; no measurement was sent, so the build is not "
-                       "confirmed here"), source="the CAD kernel in the browser")
+        # 2) build: the kernel is the browser's, so this is only known when a measurement came with the request.
+        # Review item 8: on the browser path the job asks for that measurement and waits for it, and a wait
+        # nobody answers stops the job with a plain reason instead of leaving the round not checked forever.
+        images = part_check = None
+        if feedback is not None and measurements is None:
+            got = feedback(rnd, "browser_build", cad)
+            if got.get("timeout"):
+                answer = (f"waiting for the browser timed out after {got.get('waited_s')} s in round {rnd}: the "
+                          "build, the renders and the strength numbers were never sent, so no check could run. "
+                          "Nothing is reported as a pass.")
+                event("build", status="not_checked", message=answer, source="the CAD kernel in the browser")
+                break
+            if not got.get("skipped"):
+                measurements = got.get("measurements") or measurements
+                images = got.get("review_images")
+                part_check = got.get("part_check")
+            event("build", status="pass" if measurements else "not_checked",
+                  message=(f"the browser sent the kernel measurements for round {rnd}" if measurements else
+                           "the browser answered without measurements, so the build is not confirmed here"),
+                  source="the CAD kernel in the browser")
+        else:
+            event("build", status="pass" if measurements else "not_checked",
+                  message=("kernel measurements were sent with the request" if measurements else
+                           "the CAD kernel runs in the browser; no measurement was sent, so the build is not "
+                           "confirmed here"), source="the CAD kernel in the browser")
+        if images and review is None:
+            review = _image_review(request, cad, images, rnd, provider)
 
         # 3) measure against what the engineer asked for
         measured = measure_check(cad, measurements)
@@ -284,6 +415,21 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
                            "message": "the review reads renders of the built part, which the browser has",
                            "source": "/cad/review"})
             event("review", status="not_checked", message="no renders were supplied", source="/cad/review")
+
+        # 6a) review item 8: Part Stress in the browser produces the safety factor; ask for it once, and stop
+        # honestly when it never comes (the load and the support were given, so this is not a pass either way).
+        req0 = cad.get("requirements") if isinstance(cad.get("requirements"), dict) else None
+        if (feedback is not None and req0 and req0.get("loads") and fea is None
+                and not (isinstance(part_check, dict) and part_check.get("sf") is not None)):
+            got = feedback(rnd, "fea", cad)
+            if got.get("timeout"):
+                answer = (f"waiting for the browser to run the strength check timed out after "
+                          f"{got.get('waited_s')} s in round {rnd}; the check did not run, so it is not a pass.")
+                event("fea", status="not_checked", message=answer, source="/part-check")
+                break
+            part_check = got.get("part_check") or part_check
+        if isinstance(part_check, dict) and part_check.get("sf") is not None and fea is None:
+            fea = lambda cad_now: part_check          # Part Stress in the browser: its number, its source
 
         # 6) strength, only when the engineer gave a load
         req = cad.get("requirements") if isinstance(cad.get("requirements"), dict) else None
@@ -396,14 +542,22 @@ def answer_text(result: dict) -> str:
 
 
 # ------------------------------------------------------------------ job plumbing
-def submit(request: str, **kw) -> str | None:
-    """Start a design on the shared worker. -> job_id, or None when the queue is full."""
+def submit(request: str, interactive: bool | None = None, **kw) -> str | None:
+    """Start a design on the shared worker. -> job_id, or None when the queue is full.
+
+    `interactive` (review item 8): ask the browser for each round's build, renders and strength numbers and
+    wait for them. None means "ask when this job writes its own code", so a job with an injected writer (a
+    test double) never waits; IDRIS_JOB_FEEDBACK_WAIT_S=0 turns the wait off for everyone.
+    """
     gate = threading.Event()
     holder: dict = {}
 
     def runner(_progress):
         gate.wait(30)                      # the id is handed over right after submit()
-        return run(request, job_id=holder.get("id"), **kw), None
+        job_id = holder.get("id")
+        wants_browser = (kw.get("cad_fn") is None) if interactive is None else bool(interactive)
+        return run(request, job_id=job_id, feedback=browser_feedback(job_id) if wants_browser else None,
+                   **kw), None
 
     job_id = jobs.submit("/design/job", runner)
     if job_id is None:
@@ -433,4 +587,11 @@ def status(job_id: str) -> dict | None:
         body["error"] = (job or {}).get("error")
     if box.get("request"):
         body["request"] = box["request"]
+    wait = waiting_for(job_id)             # review item 8: what the Studio has to send right now
+    if wait:
+        body["waiting_for"] = wait["need"]
+        body["waiting_round"] = wait["round"]
+        body["waiting_s"] = round(time.time() - wait["since"], 1)
+        body["how_to_continue"] = (f"POST /design/job/{job_id}/feedback with round {wait['round']} and "
+                                   f"{'measurements' if wait['need'] == 'browser_build' else 'part_check'}")
     return body
