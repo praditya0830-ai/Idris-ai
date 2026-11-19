@@ -14,6 +14,7 @@ checks only; the reply carries "Not checked by IDRIS: ...".
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import traceback
@@ -24,10 +25,44 @@ import assembly_plan
 import llm
 
 JOB_TTL_S = 3600
+DEFAULT_MAX_JOBS = 1                    # review item 3: one assembly designs parts at a time by default
+QUEUE_MAX = 2                           # a job that would be the third one waiting is refused (503), not queued
 _JOBS: dict = {}
 _LOCK = threading.Lock()
 _AVG = {"n": 0, "total": 0.0}          # running average design time of a part, in seconds
+_RUNNING = {"n": 0}
+_SLOTS = threading.Condition()          # one slot per job that is allowed to design parts right now
 
+
+def max_jobs() -> int:
+    """IDRIS_ASSEMBLY_MAX_JOBS: how many assembly jobs may design parts at the same time (default 1)."""
+    try:
+        return max(1, int(os.environ.get("IDRIS_ASSEMBLY_MAX_JOBS", DEFAULT_MAX_JOBS)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_JOBS
+
+
+def running_jobs() -> int:
+    return _RUNNING["n"]
+
+
+def queued_jobs() -> int:
+    with _LOCK:
+        return sum(1 for j in _JOBS.values() if j.get("status") == "queued")
+
+
+def _acquire_slot() -> None:
+    """Wait until fewer than max_jobs() assembly jobs are designing: each one spends AI money per part."""
+    with _SLOTS:
+        while _RUNNING["n"] >= max_jobs():
+            _SLOTS.wait(timeout=1.0)
+        _RUNNING["n"] += 1
+
+
+def _release_slot() -> None:
+    with _SLOTS:
+        _RUNNING["n"] = max(0, _RUNNING["n"] - 1)
+        _SLOTS.notify_all()
 
 NOT_CHECKED = ("kinematics of the assembly, loads between parts, and the assembly as one system: IDRIS checks "
                "geometry, interference and each part on its own")
@@ -132,20 +167,31 @@ def _job_public(job: dict) -> dict:
 
 
 def run_job(job: dict, designer=None, provider=None) -> None:
-    """The worker body. Kept separate so a test can run it without a thread."""
-    with _LOCK:
-        job.update(status="running", started=job.get("started") or time.time())
+    """The worker body. Kept separate so a test can run it without a thread.
+
+    A job waits here for a free slot (review item 3): the maximum number of jobs designing parts at once is
+    IDRIS_ASSEMBLY_MAX_JOBS, so several costly assemblies cannot run together by accident.
+    """
+    _acquire_slot()
     try:
-        parts, asm = design_parts(job["plan"], designer, provider,
-                                  on_event=lambda step, msg, pid=None: job["events"].append(
-                                      {"t": round(time.time(), 2), "step": step, "message": msg, "part": pid}))
-        job.update(parts=parts, assembly=asm, status="done", finished=time.time(), stopped=ai_budget.gate())
-    except Exception as e:
-        traceback.print_exc()
-        job.update(status="failed", error=f"{type(e).__name__}: {e}", finished=time.time())
+        with _LOCK:
+            job.update(status="running", started=job.get("started") or time.time())
+        try:
+            parts, asm = design_parts(job["plan"], designer, provider,
+                                      on_event=lambda step, msg, pid=None: job["events"].append(
+                                          {"t": round(time.time(), 2), "step": step, "message": msg, "part": pid}))
+            job.update(parts=parts, assembly=asm, status="done", finished=time.time(), stopped=ai_budget.gate())
+        except Exception as e:
+            traceback.print_exc()
+            job.update(status="failed", error=f"{type(e).__name__}: {e}", finished=time.time())
+    finally:
+        _release_slot()
 
 
-def start_job(request: str, plan: dict, provider=None, designer=None) -> str:
+def start_job(request: str, plan: dict, provider=None, designer=None):
+    """-> job_id, or None when the queue is full (the route answers 503; nothing is designed)."""
+    if queued_jobs() >= QUEUE_MAX:
+        return None
     job_id = uuid.uuid4().hex[:12]
     job = {"id": job_id, "request": request, "plan": plan, "parts": [], "events": [], "status": "queued",
            "started": time.time(), "finished": None, "error": None, "assembly": None, "stopped": None}
@@ -206,7 +252,19 @@ def handle_post(base: str, params: dict):
         plan, errs = assembly_plan.validate(plan_raw if isinstance(plan_raw, dict) else {})
         if errs:
             return 422, {"success": False, "error": "; ".join(errs[:4]), "errors": errs}
+        if params.get("confirm"):
+            plan = assembly_plan.confirm(plan, params.get("confirm"))
+        if plan.get("unsourced"):
+            # review item 4: a size without a source is never accepted silently, so the job does not start
+            return 200, {"success": True, "need": "confirmation", "plan": plan,
+                         "unsourced": plan["unsourced"], "questions": plan.get("questions") or [],
+                         "how_to_continue": "send the same request with \"confirm\": [the ids you accept], or "
+                                            "send the plan again with a source for each size (user, "
+                                            "standard: <name>, default: <reason>)"}
         job_id = start_job(request, plan, params.get("provider"))
+        if job_id is None:
+            return 503, {"success": False, "error": "The assembly queue is full. Please retry in a minute.",
+                         "running": running_jobs(), "max_jobs": max_jobs(), "queued": queued_jobs()}
         return 200, {"success": True, "job_id": job_id, "status": "queued", "plan": plan,
                      "estimate": assembly_plan.estimate(plan),
                      "poll": f"/assembly/design/{job_id}"}
