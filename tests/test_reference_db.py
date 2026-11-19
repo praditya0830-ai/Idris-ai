@@ -140,10 +140,51 @@ def test_a_greeting_never_searches_and_stores_nothing(gh, monkeypatch):
     assert gh.calls == [] and gh.writes() == []
 
 
-def test_a_follow_up_on_an_open_design_never_looks_up_a_reference(gh, monkeypatch):
+def test_a_formula_question_while_a_design_is_open_is_still_looked_up(gh, monkeypatch):
+    """v0.36.2: an open design no longer hides a real formula question."""
+    _wire_web(monkeypatch)
+    res = flow.for_chat(WELD_Q, None, "claude", design_change=False)
+    assert res is not None and res["mode"] == "candidate_new" and res["searched"] is True
+    assert len(gh.writes()) == 1
+
+
+def test_a_change_to_an_open_design_is_not_a_reference_question(gh, monkeypatch):
+    """The other side of the same rule: a repair or a size answer never searches."""
     _no_web(monkeypatch)
-    assert flow.for_chat(GEAR_Q, None, "claude", follow_up=True) is None
-    assert gh.calls == []
+    assert flow.for_chat(WELD_Q, None, "claude", design_change=True) is None
+    assert flow.for_chat("make it 80 mm", None, "claude", design_change=True) is None
+    assert flow.for_chat("make it 80 mm", None, "claude") is None
+    assert gh.calls == [] and gh.writes() == []
+
+
+# ------------------------------------------------------------------ C1: the empty lookup is explained
+def test_no_search_key_says_so_instead_of_staying_silent(gh, monkeypatch):
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    res = flow.for_request(WELD_Q, None, "claude")
+    assert res["mode"] == "none" and res["reasons"] == ["search_off"]
+    note = flow.reply_note(res)
+    assert "Web search is not enabled on this server, so no reference was looked up." in note
+    assert "not a verified formula" in note
+    assert "Unverified formula" not in res["block"]
+
+
+def test_nothing_found_says_no_formula_was_found(gh, monkeypatch):
+    _wire_web(monkeypatch, hit_url="https://www.eng-tips.com/viewthread.cfm?qid=1")
+    res = flow.for_request(WELD_Q, None, "claude")
+    assert res["mode"] == "none" and res["reasons"] == ["no_formula"]
+    assert flow.reply_note(res) == "No formula was found in the sources that were read."
+
+
+def test_an_unreachable_database_is_reported_as_well(gh, monkeypatch):
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    gh.fail = True
+    res = flow.for_request(WELD_Q, None, "claude")
+    assert res["mode"] == "none"
+    assert res["reasons"] == ["search_off", "db_unreachable"]
+    note = flow.reply_note(res)
+    assert "The reference database could not be reached, so nothing was stored." in note
+    assert "Web search is not enabled" in note
 
 
 def test_a_message_without_a_calculation_topic_is_never_searched_or_stored(gh, monkeypatch):
@@ -296,6 +337,50 @@ def test_list_endpoint_shows_slug_topic_title_status_url(gh):
     assert row["status"] == "candidate" and row["slug"] == "weld-fillet-weld"
 
 
+# ------------------------------------------------------------------ C3/C4: one door in, one self-test
+def test_status_reports_configuration_without_any_secret(gh, monkeypatch):
+    db.save({"topic": "weld", "title": "Fillet weld", "url": "https://www.iso.org/w",
+             "formula": "tau = F / (a l)", "source_name": "ISO 2553"})
+    body = flow.status()
+    assert body["search"] == {"configured": True, "provider": "brave"}
+    assert body["database"]["configured"] is True and body["database"]["readable"] is True
+    assert body["database"]["branch"] == "reference-db" and body["stored_count"] == 1
+    assert "main" in body["database"]["writable_hint"]
+    blob = json.dumps(body)
+    assert "test-token" not in blob and "BRAVE_SEARCH_API_KEY" not in blob
+
+
+def test_status_says_nothing_is_configured_when_it_is_not(gh, monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    db.reset_cache()
+    body = flow.status()
+    assert body["search"] == {"configured": False, "provider": None}
+    assert body["database"]["configured"] is False and body["database"]["readable"] is False
+    assert body["database"]["error"] and body["stored_count"] == 0
+
+
+def test_selftest_runs_the_real_lookup_and_reports_the_labels(gh, monkeypatch):
+    _wire_web(monkeypatch)
+    flow.reset_selftest()
+    out = flow.selftest("rumus tegangan las fillet", "claude")
+    assert out["ok"] is True and out["mode"] == "candidate_new"
+    assert out["topic"] == "weld" and out["found"] == 1 and out["stored"] == 1
+    assert out["items"][0]["status"] == "candidate"
+    assert out["items"][0]["label"] == "**Unverified formula from ISO 2553:2019: not used for any IDRIS result yet**"
+    assert len(gh.writes()) == 1
+
+
+def test_selftest_is_limited_to_one_call_a_minute(gh, monkeypatch):
+    _wire_web(monkeypatch)
+    flow.reset_selftest()
+    assert flow.selftest("rumus las fillet", "claude", now=1000.0)["ok"] is True
+    second = flow.selftest("rumus las fillet", "claude", now=1030.0)
+    assert second["ok"] is False and second["limited"] is True
+    assert 1 <= second["retry_after_s"] <= 60 and "one selftest per 60 s" in second["note"]
+    assert flow.selftest("rumus las fillet", "claude", now=1061.0)["ok"] is True
+
+
 def test_one_reference_endpoint_returns_every_field_and_the_label(gh):
     slug = db.save({"topic": "weld", "title": "Fillet weld", "url": "https://www.iso.org/w",
                     "formula": "tau = F / (a l)", "source_name": "ISO 2553"})["slug"]
@@ -320,10 +405,17 @@ def test_the_code_cannot_promote_a_reference(gh):
 def test_main_py_exposes_the_reference_routes_and_runs_the_lookup():
     src = open(os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8").read()
     assert '"GET /references/db"' in src and '"GET /references/db/<slug>"' in src
+    assert '"GET /references/status"' in src and '"GET /references/selftest"' in src
     assert 'self.path.split("?")[0].rstrip("/") == "/references/db"' in src
     assert 'self.path.split("?")[0].startswith("/references/db/")' in src
+    assert 'self.path.split("?")[0].rstrip("/") == "/references/status"' in src
+    assert 'self.path.split("?")[0].rstrip("/") == "/references/selftest"' in src
+    assert "**rflow.status()" in src and "rflow.selftest(" in src
     chat = src[src.index('if base == "/chat"'):src.index('if base == "/catalog/bolt-check"')]
     assert "reference_flow as _REF" in chat and "_REF.for_chat(msg, eng" in chat
-    assert "follow_up=bool(gear_ctx or cad_ctx)" in chat      # a follow-up on an open design is never looked up
+    # a repair or a size answer changes the design, so it is not a reference question (v0.36.2)
+    assert "design_change=design_change" in chat
+    assert 'isinstance((ctx or {}).get("cad_error"), dict)' in chat
+    assert 'pend and pend.get("missing")' in chat
     assert 'ctx["references"] = refs["block"]' in chat
-    assert 'res["references"] = {k: refs.get(k)' in chat
+    assert 'res["references"] = {k: refs.get(k)' in chat and '"reasons"' in chat
