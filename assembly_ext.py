@@ -19,6 +19,7 @@ import time
 import traceback
 import uuid
 
+import ai_budget
 import assembly_plan
 import llm
 
@@ -26,6 +27,7 @@ JOB_TTL_S = 3600
 _JOBS: dict = {}
 _LOCK = threading.Lock()
 _AVG = {"n": 0, "total": 0.0}          # running average design time of a part, in seconds
+
 
 NOT_CHECKED = ("kinematics of the assembly, loads between parts, and the assembly as one system: IDRIS checks "
                "geometry, interference and each part on its own")
@@ -67,6 +69,12 @@ def design_parts(plan: dict, designer=None, provider=None, on_event=None) -> tup
     index = {x["id"]: x for x in parts}
     for p in to_design:
         slot = index[p["id"]]
+        why = ai_budget.gate()             # review item 7b: a job stops, with the reason, when AI is capped
+        if why:
+            slot.update(status="failed", fidelity=None, cad=None, error=why)
+            if on_event:
+                on_event("design", f"{p['name']} not designed: {why}"[:200], p["id"])
+            continue
         slot["status"] = "designing"
         if on_event:
             on_event("design", f"Designing {p['name']}", p["id"])
@@ -120,7 +128,7 @@ def _job_public(job: dict) -> dict:
             "events": job["events"][-40:], "elapsed_s": elapsed,
             "eta_s": round(len(remaining) * average_s(), 1), "seconds_per_part": average_s(),
             "not_checked": [NOT_CHECKED],
-            "error": job.get("error")}
+            "error": job.get("error"), "stopped": job.get("stopped")}
 
 
 def run_job(job: dict, designer=None, provider=None) -> None:
@@ -131,7 +139,7 @@ def run_job(job: dict, designer=None, provider=None) -> None:
         parts, asm = design_parts(job["plan"], designer, provider,
                                   on_event=lambda step, msg, pid=None: job["events"].append(
                                       {"t": round(time.time(), 2), "step": step, "message": msg, "part": pid}))
-        job.update(parts=parts, assembly=asm, status="done", finished=time.time())
+        job.update(parts=parts, assembly=asm, status="done", finished=time.time(), stopped=ai_budget.gate())
     except Exception as e:
         traceback.print_exc()
         job.update(status="failed", error=f"{type(e).__name__}: {e}", finished=time.time())
@@ -140,7 +148,7 @@ def run_job(job: dict, designer=None, provider=None) -> None:
 def start_job(request: str, plan: dict, provider=None, designer=None) -> str:
     job_id = uuid.uuid4().hex[:12]
     job = {"id": job_id, "request": request, "plan": plan, "parts": [], "events": [], "status": "queued",
-           "started": time.time(), "finished": None, "error": None, "assembly": None}
+           "started": time.time(), "finished": None, "error": None, "assembly": None, "stopped": None}
     with _LOCK:
         _JOBS[job_id] = job
         for old, j in list(_JOBS.items()):
