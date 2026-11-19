@@ -202,6 +202,8 @@ class Handler(BaseHTTPRequestHandler):
                     "GET /references/db/<slug>": "one stored reference in full: formula exactly as the source prints it, units, valid range, worked example, status",
                     "GET /references/status": "one door to check the reference lookup: is web search configured (provider name only, never the key), can the reference-db branch be read, how many references are stored",
                     "GET /references/selftest": "runs the same reference lookup as POST /chat (no final AI answer) for ?q=..., at most once a minute: mode, topic, solvers, notes, item labels, how many were stored",
+                    "POST /design/job": "start a design as a background job (code -> measure -> DFM -> review -> FEA -> repair, in rounds) so the ~85 s HTTP limit never cuts it: returns job_id",
+                    "GET /design/job/<job_id>": "design job: status, stage, events (what is happening now), the checks with their source, the trust label (Validated / Geometry only / Not validated) and cad.steps",
                     "POST /chat (calculation reference)": "solver first (named with its benchmark), then the stored candidates, then the web, stored as a CANDIDATE that may not produce any number",
                     "GET /chat/selftest": "QA: 5 bait questions to the live AI with a real thermal result as context",
                     "GET /download/<filename>": "download a previously generated file (STL, BOM CSV, drawing)",
@@ -371,6 +373,17 @@ class Handler(BaseHTTPRequestHandler):
                                                               f"(see GET /references/db)"})
             else:
                 self._send_json(200, {"success": True, **rec})
+            return
+
+        if self.path.split("?")[0].rstrip("/").startswith("/design/job/"):
+            # Bagian G1: the design runs in the background; this is what the workspace polls
+            import design_job
+            job_id = self.path.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+            body = design_job.status(job_id)
+            if body is None:
+                self._send_json(404, {"success": False, "error": "unknown design job (it may have expired)"})
+                return
+            self._send_json(200, {"success": body.get("status") != "failed", **body})
             return
 
         if self.path.split("?")[0] == "/references":
@@ -688,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
-                       "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank",
+                       "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank", "/design/job",
                        "/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
                        "/exchange/step", "/engineer/solve", "/engineer/verify")
         base = self.path.split("?")[0]
@@ -726,6 +739,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"success": False, "error": "unknown endpoint"})
             else:
                 self._send_json(*res)
+            return
+
+        if base == "/design/job":
+            # Bagian G1: a design is not cut off by the ~85 s HTTP limit, so it runs as a job
+            import design_job
+            msg = str(params.get("message") or params.get("request") or "")[:llm.MAX_MSG]
+            if not msg.strip():
+                self._send_json(400, {"success": False, "error": "send a message: what should IDRIS design?"})
+                return
+            ctx = params.get("context") if isinstance(params.get("context"), dict) else None
+            meas = params.get("measurements") if isinstance(params.get("measurements"), dict) else None
+            try:
+                unique_parts = max(1, int(params.get("parts") or 1))
+            except (TypeError, ValueError):
+                unique_parts = 1
+            est = design_job.estimate_s(unique_parts)
+            job_id = design_job.submit(msg, context=ctx, provider=params.get("provider"), measurements=meas)
+            if job_id is None:
+                self._send_json(503, {"success": False, "error": "The design queue is full. Please retry in a minute."})
+                return
+            self._send_json(202, {"success": True, "status": "queued", "job_id": job_id, "estimate": est,
+                                  "note": "IDRIS designs in the background and logs every step; poll "
+                                          "GET /design/job/<job_id> for the events, the checks and the label."})
             return
 
         if base == "/chat":

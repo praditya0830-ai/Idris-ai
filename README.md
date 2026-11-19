@@ -25,6 +25,7 @@ limitations; physics is never delegated to an LLM.
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
 | Calculation references (formula + source) stored as candidates | `GET /references/db`, `/references/db/<slug>` |
+| Free-form design as a background job, with every check it ran | `POST /design/job`, `GET /design/job/<job_id>` |
 | One door to check the reference lookup, and a self-test of it | `GET /references/status`, `/references/selftest` |
 | Live solver benchmarks vs published reference values | `GET /verify` |
 | End-to-end check of the three demo scenarios | `GET /selfcheck` |
@@ -97,6 +98,10 @@ tests/               pytest suite + standalone QA scripts
 | `IDRIS_MODEL_<PROVIDER>` | Override the model per provider |
 | `IDRIS_LLM_PER_MIN`, `IDRIS_LLM_DAILY_CAP` | LLM rate limits (default 12/min, 400/day) |
 | `IDRIS_REPLY_LANGUAGE` | Reply language (`en` default, `auto` follows the request) |
+| `IDRIS_CAD_CALL_S` | Timeout for one AI CAD call (default `120` s for a design job; was 45) |
+| `IDRIS_PART_BUDGET_S` | Whole-design budget for the background job (default `600` s) |
+| `IDRIS_CAD_MAX_LINES` | Code length a design job asks the AI for (default `200` lines; was 80) |
+| `IDRIS_DESIGN_ROUNDS` | Validation rounds per design (default `4`) |
 | `GITHUB_TOKEN` | Fine-grained token, **this repo only**, Contents **read/write**: reads and stores calculation references. Without it the chat still answers, without the reference database |
 | `IDRIS_REFERENCE_BRANCH` | Branch that holds `references/*.json` (default `reference-db`; `main` is refused in code) |
 | `IDRIS_GITHUB_REPO` | Repository for the reference database (default `praditya0830-ai/Idris-ai`) |
