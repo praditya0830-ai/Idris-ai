@@ -18,6 +18,10 @@ import importlib
 
 MODULES = ("design_ext", "shape_ext", "assembly_ext", "report_ext")
 
+# Review of PR #5-#8, item 7a: module routes that can call a paid provider. main.py rate limits these per IP
+# before it hands the request over, exactly like /chat. A module may also name its own with AI_POST_ROUTES.
+AI_POSTS = ("/assembly/plan", "/assembly/design", "/shape/families")
+
 
 def _mods():
     """Yield the modules that exist in this checkout (a section that is not merged yet is skipped)."""
@@ -26,6 +30,13 @@ def _mods():
             yield importlib.import_module(name)
         except ImportError:
             continue
+
+
+def calls_ai(base: str) -> bool:
+    """True when a module route can spend AI money: the caller rate limits it per IP first."""
+    if base in AI_POSTS:
+        return True
+    return any(base in tuple(getattr(m, "AI_POST_ROUTES", ())) for m in _mods())
 
 
 def known_post(base: str) -> bool:

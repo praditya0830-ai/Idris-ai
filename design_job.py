@@ -261,7 +261,8 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
         dfm = dfm_rules.check(cad)
         checks.extend(dfm["checks"])
         event("dfm", status="fail" if dfm["failed"] else
-              ("pass" if any(c["status"] == "pass" for c in dfm["checks"]) else "not_checked"),
+              ("warn" if dfm.get("warned") else
+               ("pass" if any(c["status"] == "pass" for c in dfm["checks"]) else "not_checked")),
               message=dfm_rules.summary(dfm)[:300],
               numbers={"rules": len(dfm["checks"]), "failed": len(dfm["failed"])},
               source="physics/dfm_rules.py (table with a source per rule)")
@@ -356,8 +357,11 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
     result = {"ok": bool(cad) and label != "Not validated", "fidelity": "full", "cad": cad,
               "checks": checks, "label": label, "rounds": rnd, "events": events,
               "elapsed_s": round(time.time() - start, 1), "proposal": proposal,
-              "not_checked": not_checked_text(checks), "budget_s": budget}
-    result["answer"] = answer_text(result)
+              "not_checked": not_checked_text(checks), "budget_s": budget,
+              "stop_reason": str(answer).strip() or None}
+    # Review item 7b: when a round stopped early (the AI budget, a rejected design), the reason comes first in
+    # the answer; the table below it stays the same.
+    result["answer"] = ((str(answer).strip() + "\n") if answer else "") + answer_text(result)
     with _LOCK:
         box = _STORE.setdefault(job_id or "-", {"events": [], "result": None, "created": time.time()})
         box["result"] = result
