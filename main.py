@@ -200,6 +200,8 @@ class Handler(BaseHTTPRequestHandler):
                     "GET /references": "calculation references the engineer can choose (lewis, iso6336) and their status",
                     "GET /references/db": "calculation-reference database stored on the reference-db branch: slug, topic, title, status, url",
                     "GET /references/db/<slug>": "one stored reference in full: formula exactly as the source prints it, units, valid range, worked example, status",
+                    "GET /references/status": "one door to check the reference lookup: is web search configured (provider name only, never the key), can the reference-db branch be read, how many references are stored",
+                    "GET /references/selftest": "runs the same reference lookup as POST /chat (no final AI answer) for ?q=..., at most once a minute: mode, topic, solvers, notes, item labels, how many were stored",
                     "POST /design/job": "start a design as a background job (code -> measure -> DFM -> review -> FEA -> repair, in rounds) so the ~85 s HTTP limit never cuts it: returns job_id",
                     "GET /design/job/<job_id>": "design job: status, stage, events (what is happening now), the checks with their source, the trust label (Validated / Geometry only / Not validated) and cad.steps",
                     "POST /chat (calculation reference)": "solver first (named with its benchmark), then the stored candidates, then the web, stored as a CANDIDATE that may not produce any number",
@@ -340,6 +342,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"success": True, "default": DEFAULT_METHOD, "methods": DESIGN_METHODS,
                                   "note": "Send \"design_method\" to POST /generate-variants. Only methods with "
                                           "status 'available' generate designs; the others are planned."})
+            return
+
+        if self.path.split("?")[0].rstrip("/") == "/references/status":
+            # v0.36.2: booleans and a provider name only, so a key can never leak through this route
+            from research import reference_flow as rflow
+            self._send_json(200, {"success": True, **rflow.status(), "solver_version": SOLVER_VERSION})
+            return
+
+        if self.path.split("?")[0].rstrip("/") == "/references/selftest":
+            # v0.36.2: the real lookup, no final AI answer. Rate-limited inside reference_flow (60 s).
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            from research import reference_flow as rflow
+            out = rflow.selftest((qs.get("q") or [""])[0], (qs.get("provider") or [None])[0] or None)
+            self._send_json(200 if out.get("ok") else 429, {"success": bool(out.get("ok")), **out})
             return
 
         if self.path.split("?")[0].rstrip("/") == "/references/db":
@@ -776,7 +793,6 @@ class Handler(BaseHTTPRequestHandler):
                 rl = params.get("reply_language")
                 has_gearbox = bool(params.get("current") or params.get("variants"))
                 from physics import parts_library as plib
-                pend = ctx.get("pending_cad") if ctx and isinstance(ctx.get("pending_cad"), dict) else None
                 hit = None
                 # v0.34: for a fresh sentence the AI reads first and picks the route; keyword rules are the fallback
                 routed = None
@@ -787,15 +803,18 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         traceback.print_exc()
                         routed = None
-                # v0.36.1: a calculation reference is settled before the model speaks, but only for a message
-                # that actually asks for a formula/standard/reference: a design request (whatever route the
-                # router picked), a greeting and a follow-up on an open design never look one up. The solver
-                # registry wins (nothing is browsed), then the stored candidates, then the web (a CANDIDATE).
+                # v0.36.2: a formula question is still looked up while a design is open; only a request that
+                # changes or repairs that design (cad_error, or an answer to a missing size) is skipped. A design
+                # request (whatever route the router picked), a greeting and a message that never asks for a
+                # formula are skipped too. The solver registry wins (nothing is browsed), then the stored
+                # candidates, then the web (a CANDIDATE that may not produce any number).
+                pend = ctx.get("pending_cad") if ctx and isinstance(ctx.get("pending_cad"), dict) else None
+                design_change = bool(isinstance((ctx or {}).get("cad_error"), dict) or (pend and pend.get("missing")))
                 refs, _ref = None, None
                 try:
                     from research import reference_flow as _REF
                     refs = _REF.for_chat(msg, eng, params.get("provider"), (routed or {}).get("route"),
-                                         follow_up=bool(gear_ctx or cad_ctx))
+                                         design_change=design_change)
                     _ref = _REF if refs is not None else None
                     if refs and refs.get("block"):
                         ctx = dict(ctx or {})
@@ -870,7 +889,7 @@ class Handler(BaseHTTPRequestHandler):
                     res["unverified"] = eng_verify(res.get("answer") or "", eng)
                 if refs and _ref:
                     res["references"] = {k: refs.get(k) for k in ("mode", "topic", "solvers", "items", "saved",
-                                                                 "notes", "branch", "error", "searched")}
+                                                                 "notes", "reasons", "branch", "error", "searched")}
                     # the label is shown even when the model forgets it: a candidate is never a result
                     note = _ref.reply_note(refs)
                     if note and note not in (res.get("answer") or ""):

@@ -6,7 +6,7 @@ thermal analyses. Every solver ships benchmarks with a published source and stat
 limitations; physics is never delegated to an LLM.
 
 - Live: <https://idris-ai-rwd6.onrender.com> (`GET /health` lists every route)
-- Solver version: **0.36.1** · **27** registered solvers · contract **1.0**
+- Solver version: **0.36.2** · **27** registered solvers · contract **1.0**
 - Frontend: [`Idris-studio`](https://github.com/praditya0830-ai/Idris-studio) (separate repo)
 - API contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md)
 
@@ -26,6 +26,7 @@ limitations; physics is never delegated to an LLM.
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
 | Calculation references (formula + source) stored as candidates | `GET /references/db`, `/references/db/<slug>` |
 | Free-form design as a background job, with every check it ran | `POST /design/job`, `GET /design/job/<job_id>` |
+| One door to check the reference lookup, and a self-test of it | `GET /references/status`, `/references/selftest` |
 | Live solver benchmarks vs published reference values | `GET /verify` |
 | End-to-end check of the three demo scenarios | `GET /selfcheck` |
 
@@ -124,7 +125,8 @@ untuk Qwen/Kimi) supaya jawaban JSON pendek tidak habis dipakai reasoning.
 
 ### Database acuan perhitungan (references on their own branch)
 
-Every design request in `/chat` settles its calculation reference in this order, before the model speaks:
+Every message in `/chat` that asks for a formula settles its calculation reference in this order, before the model
+speaks:
 
 1. **Solver registry** (`GET /solvers`, the bench in `ai/engineer.py`). If a solver covers it, that solver is used and
    named with its benchmark. Nothing is browsed.
@@ -140,9 +142,16 @@ Arya promotes a reference to `verified` by hand, and only after a worked example
 passing benchmark in `/verify` exist.
 
 The lookup only runs for a message that asks for a formula, a standard or a calculation reference. A design request
-(whatever route the router picks), a greeting, and a follow-up or repair on a design already open never look one up,
-and a message with no recognised topic is never searched or stored. When a registered solver covers the topic it is
-named with its benchmark and nothing is browsed, even if the bench did not run on that message.
+(whatever route the router picks), a greeting, and a message that never asks for a formula never look one up, and a
+message with no recognised topic is never searched or stored. Since v0.36.2 a formula question asked while a design is
+open **is** still looked up; only a request that changes or repairs that design (`context.cad_error`, or an answer to a
+missing size) is skipped. When a registered solver covers the topic it is named with its benchmark and nothing is
+browsed, even if the bench did not run on that message.
+
+When the lookup is empty the chat says why, in the answer and in `references.reasons`: `search_off` (no web-search key),
+`db_unreachable` (GitHub or the token), `no_formula` (the pages that were read had none) or `no_topic`.
+`GET /references/status` shows the same configuration as booleans plus the provider name only — never a key — and
+`GET /references/selftest?q=...` runs exactly the lookup `/chat` would run (no final AI answer), at most once a minute.
 
 Why a branch: Render deploys automatically from `main`, so a commit there restarts the live server. The database writes
 through the GitHub Contents API only, refuses `main`/`master` in code, never overwrites an existing file, and refreshes
@@ -157,6 +166,8 @@ Setup, once:
    Nothing else is needed; the token never reaches the browser or the repo.
 
 ```bash
+curl https://idris-ai-rwd6.onrender.com/references/status
+curl "https://idris-ai-rwd6.onrender.com/references/selftest?q=what+is+the+formula+for+fillet+weld+strength"
 curl https://idris-ai-rwd6.onrender.com/references/db
 curl https://idris-ai-rwd6.onrender.com/references/db/<slug>
 ```
