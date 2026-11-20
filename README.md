@@ -24,7 +24,7 @@ limitations; physics is never delegated to an LLM.
 | Eigen-buckling of a slender member (the four Euler column cases) | `POST /solve/buckling_beam` |
 | Pipe flow: friction factor, Darcy-Weisbach pressure drop, regimes | `POST /solve/pipe_flow_darcy` |
 | Standard-part library and catalogs, with ISO sources | `GET /library`, `/catalog` |
-| Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`) | `GET /materials` |
+| Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`), with a source on every row | `physics/part_fea.py` (`material_catalog()`); the ids are what `POST /part-check` accepts |
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
 | Chat: a whole product becomes a plan of parts, and the part-by-part job starts only after the engineer says Start | `POST /chat`, `POST /assembly/plan`, `POST /assembly/design` |
@@ -197,6 +197,46 @@ guard is bypassed:
 `POST /assembly/plan` is the planner alone (no job), `POST /assembly/design` starts the job once the plan is in the
 body, and `GET /assembly/design/<job_id>` shows each part as it finishes. The assembly as one system is still not
 analysed: the block says what was not checked.
+
+### The orientation contract of a placed part (UI v65)
+
+`origin_mm` alone is not a placement: a part can sit at the right point and still be turned wrong, and with only
+`axis` it is free to spin about that axis. Every frame therefore carries both directions, in assembly coordinates:
+
+- `axis` — where the part's own **+Z** points;
+- `x_axis` — where its own **+X** points; it may not be parallel to `axis` (the plan is refused with the reason,
+  because the part would still be free to spin);
+- `y_axis` — computed as `axis × x_axis`, so the three are a right-handed unit basis the Studio builds a rotation
+  from. A sloppy `x_axis` is projected perpendicular to `axis` first, so the basis is always orthonormal.
+
+When a plan names no `x_axis`, one is derived from the world axis least aligned with `axis` and the frame says
+`x_axis_source: "derived"` — deterministic, but not a decision the engineer made, and the reply never pretends
+otherwise. `GET /assembly/design/<job_id>` returns the same three vectors per part, plus
+`assembly.frame_contract`. IDRIS checks geometry and interference; it does not verify that the planned orientation
+is the one the product needs.
+
+### `context.shape_family`: the Studio's own family for one part (UI v65)
+
+`POST /chat` accepts `context.shape_family = {name, principle, design_space}` — the family the Studio can edit
+("l_bracket", "two legs at 90 degrees carry the load into the wall", `{L: [20, 80], leg_t: 3}`). It is checked
+before it reaches a prompt: name (≤ 60 chars), principle (≤ 400), and a design space of numbers, strings, booleans
+or lists of at most 8 of them (≤ 24 entries, ≤ 2000 characters). The accepted family is added to the CAD writer's
+user block, and the answer carries `shape_family: {used, name, principle, design_space, applied_to, not_checked}`.
+A family that cannot be read is **dropped**, and the answer says why (`{used: false, why}`) instead of half-using it.
+An assembly answer says it was not applied, because parts are designed one at a time.
+
+What this does not do: nothing verifies that the generated code stays inside the design space, that its parameters
+match the family, or that the family is the right one for the load. `not_checked` in the reply says exactly that.
+
+### Material table: every density and strength names its source
+
+`physics/part_fea.py` holds the material table the UI selector reads and `POST /part-check` accepts
+(`aluminium`, `steel`, `stainless`, `titanium`, `brass`, `cast_iron`, `pla`, `abs`, `nylon`). Each row carries
+`source: {density, strength, stiffness}` — ASM Handbook Vol. 2, EN 10025-2, ASTM A240, EN 12164, EN 1561, filament
+and `EOS PA 2200` datasheets — so a mass or a safety factor can be traced back to a page instead of a habit.
+Two limits are stated, not hidden: `stainless` is 304 at the **standard minimum** (`Rp0.2 ≥ 205 MPa`, annealed), and
+`cast_iron` (GJL-250) does not yield, so its reported safety factor is `Rm / von Mises` and its row says so
+(`brittle: true`). Printed plastics are datasheet values at 100 % infill; a real FDM part is weaker across layers.
 
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.

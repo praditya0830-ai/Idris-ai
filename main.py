@@ -145,6 +145,38 @@ def _assembly_confirming(msg: str, plan) -> bool:
     return bool(text) and len(text) <= 80 and bool(words & set(_ASSEMBLY_YES))
 
 
+def _clean_shape_family(ctx):
+    """UI v65: `context.shape_family` = {name, principle, design_space}, the Studio's own family for one part.
+
+    It is guidance for the CAD writer, so it is checked before it can reach a prompt: three fields, capped lengths,
+    and a design space made of numbers, strings, booleans or lists of them. A hint that cannot be read is dropped
+    and the reason travels in the answer (`shape_family: {used: false, why: ...}`) -- never half accepted.
+    -> (context, reply block or None)
+    """
+    if not isinstance(ctx, dict) or ctx.get("shape_family") is None:
+        return ctx, None
+    import shape_family
+    clean, errs = shape_family.parse(ctx["shape_family"])
+    out = {k: v for k, v in ctx.items() if k != "shape_family"}
+    if clean:
+        out["shape_family"] = clean
+        return out, shape_family.reply(clean)
+    why = "; ".join(errs[:2]) or "shape_family could not be read"
+    out["shape_family_error"] = why
+    return out, shape_family.reply(None, why)
+
+
+def _shape_family_reply(ctx):
+    """What the answer says about the Studio's shape family: accepted (and unverified), rejected, or nothing sent."""
+    import shape_family
+    ctx = ctx if isinstance(ctx, dict) else {}
+    sf = ctx.get("shape_family")
+    if isinstance(sf, dict):
+        return shape_family.reply(sf)
+    why = ctx.get("shape_family_error")
+    return shape_family.reply(None, str(why)) if why else None
+
+
 def _fault(e: Exception) -> str:
     """One line a screenshot can carry: what failed and where. No secrets: type, short message, file and line."""
     tb = traceback.extract_tb(e.__traceback__)
@@ -643,6 +675,11 @@ class Handler(BaseHTTPRequestHandler):
         base = {"success": True, "intent": "assembly", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None, "provider": provider, "language": None}
         ctx = ctx if isinstance(ctx, dict) else {}
+        sf = _shape_family_reply(ctx)          # never silently dropped: the answer says it was not applied
+        if sf is not None:
+            base["shape_family"] = ({"used": False, "why": "an assembly is planned part by part, so a Studio shape "
+                                                            "family is not applied to it; send it with the request "
+                                                            "for one part"} if sf.get("used") else sf)
         given = ctx.get("assembly_plan") if isinstance(ctx.get("assembly_plan"), dict) else None
         flag = ctx.get("assembly_confirm")
         confirmed = flag is True or str(flag).strip().lower() in ("1", "true", "yes", "ya", "start")
@@ -708,8 +745,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat_cad(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
         """Non-gearbox object -> CAD code the browser builds. Bagian F: the ladder full -> simplified ->
-        placeholder, so an answer carries geometry unless the request holds no usable size at all."""
+        placeholder, so an answer carries geometry unless the request holds no usable size at all.
+
+        UI v65: `context.shape_family` is checked here too, so every door that writes CAD code with a context
+        (`/chat`, `/cad/try`) reads the same contract and the answer always says what happened to the hint.
+        """
         import cad_fallback
+        ctx, _sf = _clean_shape_family(ctx)
         base = {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None}
         try:
@@ -723,6 +765,7 @@ class Handler(BaseHTTPRequestHandler):
                 "language": "en" if llm.want_english(reply_language) else None,
                 "cad_attempts": r.get("attempts") or [], "fidelity": r.get("fidelity"),
                 "validated": bool(r.get("validated")), "target_check": r.get("target_check"),
+                "shape_family": _shape_family_reply(ctx),          # UI v65: accepted, or why it was dropped
                 "not_checked": r.get("not_checked") or []}
 
     def _chat_concepts(self, msg: str, concepts: list, provider=None, reply_language=None) -> dict:
@@ -902,6 +945,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"success": False, "error": "send a message: what should IDRIS design?"})
                 return
             ctx = params.get("context") if isinstance(params.get("context"), dict) else None
+            ctx, _sf = _clean_shape_family(ctx)   # a shape family from the Studio never reaches a prompt unchecked
             meas = params.get("measurements") if isinstance(params.get("measurements"), dict) else None
             try:
                 unique_parts = max(1, int(params.get("parts") or 1))
@@ -922,6 +966,7 @@ class Handler(BaseHTTPRequestHandler):
                 ip = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
                 llm.check_rate(ip)
                 ctx = params.get("context") if isinstance(params.get("context"), dict) else None
+                ctx, _sf = _clean_shape_family(ctx)   # UI v65: the Studio's shape family, checked before any prompt
                 from physics.simple_part import looks_like_part_request
                 import cad_codegen
                 msg = str(params.get("message") or "")[:llm.MAX_MSG]
