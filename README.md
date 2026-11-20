@@ -6,7 +6,7 @@ thermal analyses. Every solver ships benchmarks with a published source and stat
 limitations; physics is never delegated to an LLM.
 
 - Live: <https://idris-ai-rwd6.onrender.com> (`GET /health` lists every route)
-- Solver version: **0.36.2** · **27** registered solvers · contract **1.0**
+- Solver version: **0.37.0** · **27** registered solvers · contract **1.0**
 - Frontend: [`Idris-studio`](https://github.com/praditya0830-ai/Idris-studio) (separate repo)
 - API contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md)
 
@@ -24,6 +24,7 @@ limitations; physics is never delegated to an LLM.
 | Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`) | `GET /materials` |
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
+| Chat: a whole product becomes a plan of parts, and the part-by-part job starts only after the engineer says Start | `POST /chat`, `POST /assembly/plan`, `POST /assembly/design` |
 | Calculation references (formula + source) stored as candidates | `GET /references/db`, `/references/db/<slug>` |
 | Free-form design as a background job, with every check it ran | `POST /design/job`, `GET /design/job/<job_id>` |
 | One door to check the reference lookup, and a self-test of it | `GET /references/status`, `/references/selftest` |
@@ -171,6 +172,28 @@ curl "https://idris-ai-rwd6.onrender.com/references/selftest?q=what+is+the+formu
 curl https://idris-ai-rwd6.onrender.com/references/db
 curl https://idris-ai-rwd6.onrender.com/references/db/<slug>
 ```
+
+### Chat → assembly: the plan comes first, and nothing starts without a yes
+
+A sentence for a whole product ("design whole bicycle 170 cm", "seluruh sepeda") is not designed as one solid. The
+router reads it as an **assembly**, and `/chat` answers with a plan: the parts and their roles, every interface size
+with its source, the open questions, and the estimate — `"This assembly has 4 parts: 3 to design (about 1 min
+each), 1 standard parts. Estimated time: about 3 minutes."` — ending in **`Start?`**. That reply also carries the
+`assembly` block: `{plan, questions, estimate, job_id: null, poll: null, eta_s, not_checked}`.
+
+The job starts only on a later message that carries **both** `context.assembly_plan` and
+`context.assembly_confirm: true`, and that message goes through the same door as `POST /assembly/design`, so no
+guard is bypassed:
+
+- a size with **no source** (`user`, `standard: <name>`, `default: <reason>`) keeps the job waiting, and the reply asks
+  for that one size; `context.assembly_confirm_dims` accepts the ids the engineer confirmed;
+- a **full queue** (`IDRIS_ASSEMBLY_MAX_JOBS`, `QUEUE_MAX`) is answered with "Another assembly is being designed right
+  now, so this one was not started. Try again in a few minutes." — never queued silently behind another costly job;
+- a spent **AI budget** (`ai_budget.gate()`) writes no plan and starts no job, and the reply is the budget message.
+
+`POST /assembly/plan` is the planner alone (no job), `POST /assembly/design` starts the job once the plan is in the
+body, and `GET /assembly/design/<job_id>` shows each part as it finishes. The assembly as one system is still not
+analysed: the block says what was not checked.
 
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.
