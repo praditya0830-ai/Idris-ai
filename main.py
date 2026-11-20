@@ -953,7 +953,8 @@ class Handler(BaseHTTPRequestHandler):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
                        "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank", "/design/job",
                        "/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
-                       "/exchange/step", "/engineer/solve", "/engineer/verify")
+                       "/exchange/step", "/exchange/step-ap242", "/exchange/solidworks-macro",
+                       "/engineer/solve", "/engineer/verify")
         import http_ext                     # Bagian F onward: routes owned by a small module of their own
         base = self.path.split("?")[0]
         is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check",
