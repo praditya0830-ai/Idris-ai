@@ -66,7 +66,10 @@ def handle_get(path):
     query = path.partition("?")[2]
     path = path.split("?")[0].rstrip("/")
     if path == "/solvers":
-        return 200, {"solvers": registry.catalog()}
+        # v0.39 P2: a solver that does not exist is listed as planned, with its reason, so a UI cannot show a
+        # button for analysis IDRIS does not do
+        from .planned import PLANNED
+        return 200, {"solvers": registry.catalog(), "planned": PLANNED}
     if path == "/solvers/tools":
         return 200, {"function_declarations": registry.llm_tools()}
     if path == "/verify":
