@@ -1,0 +1,169 @@
+diff --git a/main.py b/main.py
+index a188e96..159b568 100644
+--- a/main.py
++++ b/main.py
+@@ -104,6 +104,47 @@ def _requirements_from(params):
+     )
+ 
+ 
++def _assembly_summary(est: dict) -> str:
++    """What the engineer is told before a part is designed: how many parts, how long. No promise of speed."""
++    est = est if isinstance(est, dict) else {}
++    per_min = max(1, round(float(est.get("seconds_per_part") or 60.0) / 60))
++    minutes = max(1, round(float(est.get("eta_s") or 0) / 60))
++    return (f"This assembly has {est.get('parts_total', 0)} parts: {est.get('parts_to_design', 0)} to design "
++            f"(about {per_min} min each), {est.get('standard_parts', 0)} standard parts. Estimated time: about "
++            f"{minutes} minutes.")
++
++
++def _assembly_ask(est: dict, questions) -> str:
++    """The reply before any job: the estimate, the open questions, and the Start? the engineer has to answer."""
++    text = _assembly_summary(est)
++    qs = [str(q) for q in (questions or []) if str(q).strip()][:3]
++    if qs:
++        return (text + " Before it can start: " + " ".join(qs)
++                + " Answer it, correct the plan if needed, then send context.assembly_plan with "
++                  "context.assembly_confirm: true.")
++    return (text + " Start? Send context.assembly_plan back with context.assembly_confirm: true and the job "
++                   "starts; each part is designed on its own and kept as it finishes.")
++
++
++_ASSEMBLY_YES = ("yes", "yeah", "ok", "okay", "sure", "go", "start", "proceed", "confirm", "approved",
++                 "lanjut", "mulai", "ya", "setuju")
++
++
++def _assembly_confirming(msg: str, plan) -> bool:
++    """True when this message is an answer to a plan that is already in the context, not a new request.
++
++    A plan left in the context must not turn a later sentence ("make it lighter") into a question about a job that
++    was never started, so only a short yes / start, or a plan that still has open questions or sizes without a
++    source, is read back against it. Starting still needs context.assembly_confirm: true, never this message.
++    """
++    plan = plan if isinstance(plan, dict) else {}
++    if plan.get("questions") or plan.get("unsourced"):
++        return True
++    text = (msg or "").strip()
++    words = {w.strip(".,!?:;\"'") for w in text.lower().split()}
++    return bool(text) and len(text) <= 80 and bool(words & set(_ASSEMBLY_YES))
++
++
+ def _fault(e: Exception) -> str:
+     """One line a screenshot can carry: what failed and where. No secrets: type, short message, file and line."""
+     tb = traceback.extract_tb(e.__traceback__)
+@@ -583,6 +624,88 @@ class Handler(BaseHTTPRequestHandler):
+         ai = (lambda m: llm.parse_part(m, provider)) if llm.provider_order() else None
+         return design_from_message(message, OUTPUT_DIR, uuid.uuid4().hex[:8], ai, self._base_url())
+ 
++    def _chat_assembly(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
++        """Bagian E in /chat: "design whole bicycle" -> a plan of parts, then one job that designs the parts.
++
++        The first message starts nothing: it only asks the planner (`POST /assembly/plan`), and the reply is the
++        parts, where every interface size comes from, the open questions and the estimate, ending in "Start?". The
++        job starts on a later message, and only when it carries both `context.assembly_plan` and
++        `context.assembly_confirm: true`; a plan sent back without that flag is read back, never started.
++
++        The confirmed message goes through `assembly_ext.handle_post("/assembly/design", ...)`, the same door as
++        the route the browser uses, so its guards decide and none is skipped: a size without a source holds the job
++        back, a full queue is answered instead of queued silently, and a spent AI budget stops it. A part-by-part
++        job can be dozens of paid AI calls, so that is the point of the confirmation.
++        """
++        import ai_budget
++        import assembly_ext
++        import assembly_plan
++        base = {"success": True, "intent": "assembly", "actions": [], "params": {}, "rejected": [], "select": None,
++                "compare": None, "provider": provider, "language": None}
++        ctx = ctx if isinstance(ctx, dict) else {}
++        given = ctx.get("assembly_plan") if isinstance(ctx.get("assembly_plan"), dict) else None
++        flag = ctx.get("assembly_confirm")
++        confirmed = flag is True or str(flag).strip().lower() in ("1", "true", "yes", "ya", "start")
++        request = str(ctx.get("assembly_request") or msg or "").strip()[:llm.MAX_MSG]
++        not_checked = [assembly_ext.NOT_CHECKED]
++        if given and not confirmed:
++            # the plan came back without the engineer's yes: read it, ask what is still open, start nothing
++            plan, errors = assembly_plan.validate(given)
++            if errors:
++                return {**base, "answer": ("The plan cannot be used, so no job was started: "
++                                           + "; ".join(errors[:4])),
++                        "assembly": {"plan": plan, "questions": [], "estimate": None, "job_id": None,
++                                     "poll": None, "eta_s": None, "errors": errors, "not_checked": not_checked}}
++            est = assembly_plan.estimate(plan)
++            return {**base, "answer": _assembly_ask(est, plan.get("questions")),
++                    "assembly": {"plan": plan, "questions": plan.get("questions") or [], "estimate": est,
++                                 "job_id": None, "poll": None, "eta_s": est["eta_s"],
++                                 "how_to_continue": "send context.assembly_plan with context.assembly_confirm: true",
++                                 "not_checked": not_checked}}
++        why = ai_budget.gate()             # review item 7b: no plan and no job when the AI budget is spent
++        if why:
++            return {**base, "answer": "No assembly plan was written and no job was started. " + why,
++                    "assembly": {"plan": given, "questions": [], "estimate": None, "job_id": None, "poll": None,
++                                 "eta_s": None, "budget": why, "not_checked": not_checked}}
++        payload = {"request": request, "provider": provider}
++        if given:
++            payload["plan"] = given
++            if ctx.get("assembly_confirm_dims"):
++                payload["confirm"] = ctx.get("assembly_confirm_dims")
++        status, out = assembly_ext.handle_post("/assembly/design" if given else "/assembly/plan", payload)
++        out = out if isinstance(out, dict) else {}
++        plan = out.get("plan") if isinstance(out.get("plan"), dict) else given
++        est = out.get("estimate") if isinstance(out.get("estimate"), dict) else (
++            assembly_plan.estimate(plan) if plan else None)
++        if status == 503:
++            # the job limit (IDRIS_ASSEMBLY_MAX_JOBS / the queue) is answered, never waited out invisibly
++            return {**base, "answer": ("Another assembly is being designed right now, so this one was not started. "
++                                       "Try again in a few minutes. " + _assembly_summary(est)).strip(),
++                    "assembly": {"plan": plan, "questions": [], "estimate": est, "job_id": None, "poll": None,
++                                 "eta_s": None, "busy": out, "not_checked": not_checked}}
++        if status != 200 or not out.get("success", True):
++            return {**base, "answer": ("IDRIS could not turn this into a part-by-part plan, so no job was started: "
++                                       + str(out.get("error") or "the plan was empty")),
++                    "assembly": {"plan": plan, "questions": [], "estimate": est, "job_id": None, "poll": None,
++                                 "eta_s": None, "errors": out.get("errors") or [], "not_checked": not_checked}}
++        if not out.get("job_id"):
++            # the route answered "need confirmation": a size with no source, or a question the plan still has
++            questions = out.get("questions") or (plan or {}).get("questions") or []
++            return {**base, "answer": _assembly_ask(est, questions),
++                    "assembly": {"plan": plan, "questions": questions, "estimate": est, "job_id": None,
++                                 "poll": None, "eta_s": (est or {}).get("eta_s"),
++                                 "unsourced": out.get("unsourced") or (plan or {}).get("unsourced") or [],
++                                 "how_to_continue": out.get("how_to_continue")
++                                                    or "send context.assembly_plan with context.assembly_confirm: true",
++                                 "not_checked": not_checked}}
++        return {**base, "answer": (_assembly_summary(est)
++                                   + " The job has started: each part is designed on its own and kept as it finishes, "
++                                     "and IDRIS does not analyse the assembly as one system."),
++                "assembly": {"plan": plan, "questions": [], "estimate": est, "job_id": out["job_id"],
++                             "status": out.get("status"),
++                             "poll": out.get("poll") or f"/assembly/design/{out['job_id']}",
++                             "eta_s": (est or {}).get("eta_s"), "not_checked": not_checked}}
++
+     def _chat_cad(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
+         """Non-gearbox object -> CAD code the browser builds. Bagian F: the ladder full -> simplified ->
+         placeholder, so an answer carries geometry unless the request holds no usable size at all."""
+@@ -823,6 +946,13 @@ class Handler(BaseHTTPRequestHandler):
+                 rl = params.get("reply_language")
+                 has_gearbox = bool(params.get("current") or params.get("variants"))
+                 from physics import parts_library as plib
++                # Bagian E: a plan is already in the context, and this message answers it. Nothing starts here:
++                # without context.assembly_confirm the reply is the plan and the question "Start?", so a costly
++                # part-by-part job never begins on its own.
++                if (isinstance(ctx, dict) and isinstance(ctx.get("assembly_plan"), dict)
++                        and _assembly_confirming(msg, ctx.get("assembly_plan"))):
++                    self._send_json(200, self._chat_assembly(msg, ctx, params.get("provider"), rl))
++                    return
+                 hit = None
+                 # v0.34: for a fresh sentence the AI reads first and picks the route; keyword rules are the fallback
+                 routed = None
+@@ -833,6 +963,13 @@ class Handler(BaseHTTPRequestHandler):
+                     except Exception:
+                         traceback.print_exc()
+                         routed = None
++                # Bagian E: the router read a whole product ("whole bicycle", "seluruh sepeda") -- the fat
++                # single-solid path is never taken for it. The reply is the plan and the question "Start?".
++                if routed and routed.get("route") == "assembly":
++                    out = self._chat_assembly(msg, ctx, params.get("provider"), rl)
++                    out["route"] = routed
++                    self._send_json(200, out)
++                    return
+                 # v0.36.2: a formula question is still looked up while a design is open; only a request that
+                 # changes or repairs that design (cad_error, or an answer to a missing size) is skipped. A design
+                 # request (whatever route the router picked), a greeting and a message that never asks for a
