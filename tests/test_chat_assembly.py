@@ -210,7 +210,7 @@ def test_one_part_of_a_product_stays_a_design(monkeypatch):
     assert cad_router.route("bicycle frame 540 mm", provider="claude")["route"] == "free_design"
 
 
-def test_the_chat_reads_the_plan_before_it_routes_thesentence():
+def test_the_chat_reads_the_plan_before_it_routes_the_sentence():
     src = open(os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8").read()
     chat = src[src.index('if base == "/chat":'):]
     assert chat.index('ctx.get("assembly_plan")') < chat.index("cad_router.route(")
