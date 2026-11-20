@@ -35,8 +35,9 @@ def _library_lines() -> str:
     return "\n".join(out)
 
 
-def _system() -> str:
-    return ("""You are the first reader in IDRIS, an engineering design tool. Read ONE sentence from an engineer and decide
+def _system(concept_count: int | None = None) -> str:
+    n_concepts = max(1, min(10, int(concept_count or 3)))
+    text = ("""You are the first reader in IDRIS, an engineering design tool. Read ONE sentence from an engineer and decide
 who handles it. Output ONE JSON object only, no prose:
 {"route": "library"|"primitive"|"gearbox"|"assembly"|"free_design"|"other", "library_id": string|null, "query": {},
  "concepts": [], "reason": "max 12 words"}
@@ -55,22 +56,25 @@ Routes:
   enclosure, impeller, ...), in any language.
 - "other": a question, a greeting, or a change to the design that is already open ("make it lighter").
 
-"concepts" (free_design only): 3 design concepts that an experienced engineer would compare for this part, clearly
-different in SHAPE or construction, not only in size (e.g. for a bracket: "L-bracket with a gusset", "U-channel",
-"lightened plate with ribs"). Each: {"name": "max 4 words", "idea": "one short sentence, no numbers"}. Every concept
-must meet the request; never change what the engineer fixed (sizes, material, process, hole pattern).
+"concepts" (free_design only): @N_CONCEPTS@ design concepts that an experienced engineer would compare for this
+part, clearly different in SHAPE or construction, not only in size (e.g. for a bracket: "L-bracket with a gusset",
+"U-channel", "lightened plate with ribs"). Each: {"name": "max 4 words", "idea": "one short sentence, no
+numbers"}. The concepts must be distinct from each other: no two may differ only by a size. Every concept must meet
+the request; never change what the engineer fixed (sizes, material, process, hole pattern).
 
 "query" (library only): keys from that part's inputs. Copy values exactly as the sentence states them; convert cm, m
 and inch to mm. NEVER add a value the sentence does not give: missing inputs are asked from the engineer later.
 
 IDRIS library:
 """ + _library_lines())
+    return text.replace("@N_CONCEPTS@", f"{n_concepts} design concepts")
 
 
-def _clean_concepts(raw) -> list:
-    """-> up to 3 {name, idea}; numbers are removed so no size can travel from the AI's idea into the design."""
+def _clean_concepts(raw, limit: int = 3) -> list:
+    """-> up to `limit` {name, idea}; numbers are removed so no size can travel from the AI's idea into the design."""
     out, seen = [], set()
-    for c in (raw if isinstance(raw, list) else [])[:5]:
+    limit = max(1, min(10, int(limit or 3)))
+    for c in (raw if isinstance(raw, list) else [])[:limit * 2]:
         if not isinstance(c, dict):
             continue
         name = re.sub(r"\s+", " ", re.sub(r"\d+(?:[.,]\d+)?", "", str(c.get("name") or ""))).strip(" -:,.")[:40]
@@ -78,7 +82,7 @@ def _clean_concepts(raw) -> list:
         if name and name.lower() not in seen:
             seen.add(name.lower())
             out.append({"name": name, "idea": idea})
-    return out[:3]
+    return out[:limit]
 
 
 def _clean_query(tid: str, q, message: str) -> dict:
@@ -113,17 +117,22 @@ def _clean_query(tid: str, q, message: str) -> dict:
     return out
 
 
-def route(message: str, has_gearbox: bool = False, provider=None):
-    """-> {"route", "library_id", "query", "reason", "read_by"} or None (AI off, unreachable or unusable answer)."""
+def route(message: str, has_gearbox: bool = False, provider=None, concepts_wanted: int | None = None):
+    """-> {"route", "library_id", "query", "reason", "read_by"} or None (AI off, unreachable or unusable answer).
+
+    `concepts_wanted` (UI v66 B): how many concepts the engineer asked to compare (1-10). The same reader proposes
+    them, so asking for seven is one question and seven genuinely different shapes, not three repeated.
+    """
     if not enabled() or not (message or "").strip():
         return None
     order = [provider] if provider and provider != "auto" else llm.provider_order()
     order = [p for p in order if p in llm.KEY_ENV and os.environ.get(llm.KEY_ENV[p])]
     if not order:
         return None
-    user = (f"Sentence: {message.strip()[:800]}\nA gearbox design is open in the workspace: {'yes' if has_gearbox else 'no'}")
+    user = (f"Sentence: {message.strip()[:800]}\nA gearbox design is open in the workspace: {'yes' if has_gearbox else 'no'}"
+            + (f"\nConcepts wanted: {max(1, min(10, int(concepts_wanted)))}" if concepts_wanted else ""))
     try:
-        text, used = llm.call_provider(order[0], _system(), user, 450,
+        text, used = llm.call_provider(order[0], _system(concepts_wanted), user, 450,
                                        timeout=float(os.environ.get("IDRIS_ROUTER_TIMEOUT_S", "12")))
         raw = llm.extract_json(text)
     except Exception:
@@ -133,7 +142,7 @@ def route(message: str, has_gearbox: bool = False, provider=None):
     out = {"route": raw["route"], "library_id": None, "query": {}, "reason": str(raw.get("reason") or "")[:120],
            "read_by": f"{order[0]} ({used})", "concepts": []}
     if out["route"] == "free_design":
-        out["concepts"] = _clean_concepts(raw.get("concepts"))
+        out["concepts"] = _clean_concepts(raw.get("concepts"), concepts_wanted or 3)
     if out["route"] == "library":
         tid = raw.get("library_id")
         if tid not in plib.TEMPLATES:
@@ -145,3 +154,18 @@ def route(message: str, has_gearbox: bool = False, provider=None):
                 q = {**q, **rule[1]}
             out["library_id"], out["query"] = tid, q
     return out
+
+
+def concepts_for(message: str, count: int = 3, provider=None) -> list:
+    """n concept names for one sentence, from the same reader that routes it (UI v66 B).
+
+    -> [{name, idea}] with at most `count` entries; [] when the reader cannot be reached, so the caller says
+    "no concept could be proposed" instead of designing n copies of one shape. Nothing is padded: a request for
+    seven that the reader answers with three gives three, and the reply reports the number that was really made.
+    """
+    n = max(1, min(10, int(count or 3)))
+    out = route(message, False, provider, concepts_wanted=n) or {}
+    concepts = [c for c in (out.get("concepts") or []) if isinstance(c, dict) and c.get("name")][:n]
+    for c in concepts:
+        c.setdefault("read_by", out.get("read_by"))
+    return concepts
