@@ -1,0 +1,19 @@
+{
+  "slug": "weld-mitcalc---design-and-strength-check-of-welded-connections",
+  "topic": "weld",
+  "title": "MITcalc - Design and strength check of welded connections",
+  "source_type": "other",
+  "source_name": "MITcalc - Design and strength check of welded connections",
+  "url": "https://www.mitcalc.com/doc/welding/help/en/welding.htm",
+  "formula": "could not read the formula reliably",
+  "variables": {},
+  "units": "",
+  "valid_range": "",
+  "assumptions": "",
+  "worked_example": null,
+  "status": "candidate",
+  "found_for": "what is the formula for fillet weld strength?",
+  "found_by": "claude-haiku-5-5",
+  "date": "2026-11-20",
+  "verified_by": null
+}
