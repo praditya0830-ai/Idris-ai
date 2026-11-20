@@ -87,6 +87,12 @@ def handle_post(path, payload):
     if res is not None:
         return res
     path = path.split("?")[0].rstrip("/")
+    if path == "/dfm/part":
+        # v0.39 P3: the Studio's Evaluate -> DFM step posts a mesh (or a part's measurements) here. Same
+        # solver as /solve/dfm_part, at the address the UI knows, without a job wrapper: a mesh measurement is
+        # one pass over the triangles, not an FEA solve.
+        res = registry.run("dfm_part", payload)
+        return (200 if res.get("ok") else 400), res
     if path.startswith("/solve/"):
         name = path[len("/solve/"):]
         res = registry.run(name, payload)

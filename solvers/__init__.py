@@ -15,6 +15,7 @@ from . import bearing_life    # noqa: F401
 from . import mesh_convergence  # noqa: F401
 from . import gear_pair_iso   # noqa: F401
 from . import part_fea        # noqa: F401
+from . import dfm_part        # noqa: F401  (P3: DFM of any part from its mesh)
 
 try:                                    # new in v0.33; a fault here must not take the other solvers down
     from . import shell_plate   # noqa: F401

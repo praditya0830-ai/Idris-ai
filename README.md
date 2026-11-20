@@ -20,6 +20,7 @@ limitations; physics is never delegated to an LLM.
 | Static FEA / natural frequencies / thermal, as pollable jobs | `POST /fea`, `/modal`, `/cfd` |
 | Design review: interference, fits, DFM, assembly | `POST /review` |
 | FEA for an arbitrary part mesh | `POST /part-check` |
+| Manufacturability of any part from its mesh: measured wall thickness, overhang, draft, drill series | `POST /dfm/part` |
 | Standard-part library and catalogs, with ISO sources | `GET /library`, `/catalog` |
 | Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`), with a source on every row | `physics/part_fea.py` (`material_catalog()`); the ids are what `POST /part-check` accepts |
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
@@ -274,6 +275,30 @@ Two limits are stated, not hidden: `stainless` is 304 at the **standard minimum*
 
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.
+
+## DFM for any part: measured, not guessed (v0.39)
+
+`POST /dfm/part` takes the same triangle mesh as `POST /part-check` plus `process` (cnc, fdm, sls, sheet, weld,
+cast) and `material`, and answers with findings that each carry a number, a limit and the limit's source:
+
+- **wall thickness** — measured, not read from a parameter list: rays are cast from the surface along the inward
+  face normal through a voxel grid until the solid ends. The answer carries `resolution_mm` (one voxel) next to
+  the numbers, because that is the measurement's own uncertainty; a wall the ray never leaves is reported as *at
+  least* so long. Statistics: min, 5th percentile (what the limit is compared with), median, max.
+- **hole diameters** — checked against the DIN 338 / ISO 235 twist-drill series *when the caller declares the
+  holes*. A hole cannot be recognised reliably in a faceted mesh (a bore, a slot and a tessellation artefact look
+  alike), so an undeclared hole is `not_checked`, never a pass.
+- **overhang** (FDM) — the share of the surface whose normal leans more than 45 deg from the build direction.
+- **draft** (cast) — the share of the surface within 1 deg of parallel to the pull direction.
+- **undercuts, tool access, inside corner radius** — `not_checked` with the reason: they need the solid and the
+  sketch, not just the triangles.
+
+Limits keep their status: the weld fillet leg (AWS D1.1 Table 7.7) and the drill series are quoted from a
+standard and can fail a part; the wall minimums per process (including the new SLS and casting rows) and the
+overhang/draft angles are workshop guidelines, so they are **warnings**, never failures. `wall.thickness` per
+vertex is returned for the Studio's colour map.
+
+What it is not: no cost, no cycle time, no tolerance stack-up, and no feature recognition.
 
 ## Fidelity, honestly
 
