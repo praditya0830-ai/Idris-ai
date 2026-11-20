@@ -26,7 +26,8 @@ limitations; physics is never delegated to an LLM.
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
 | Chat: a whole product becomes a plan of parts, and the part-by-part job starts only after the engineer says Start | `POST /chat`, `POST /assembly/plan`, `POST /assembly/design` |
 | Calculation references (formula + source) stored as candidates | `GET /references/db`, `/references/db/<slug>` |
-| Free-form design as a background job, with every check it ran | `POST /design/job`, `GET /design/job/<job_id>` |
+| Free-form design as a background job, with every check it ran and the code the browser must build (`waiting_cad`) | `POST /design/job`, `GET /design/job/<job_id>` |
+| How many design concepts to compare (3 / 5 / 7 / 10), asked before any code is written | `POST /chat` with `concept_count` |
 | One door to check the reference lookup, and a self-test of it | `GET /references/status`, `/references/selftest` |
 | Live solver benchmarks vs published reference values | `GET /verify` |
 | End-to-end check of the three demo scenarios | `GET /selfcheck` |
@@ -224,6 +225,42 @@ An assembly answer says it was not applied, because parts are designed one at a 
 
 What this does not do: nothing verifies that the generated code stays inside the design space, that its parameters
 match the family, or that the family is the right one for the load. `not_checked` in the reply says exactly that.
+
+### The design job and the browser: `waiting_cad` (UI v66 A)
+
+A design job and the Studio each do half of the work: the job writes code, the browser builds it, measures it and
+runs the strength check. `GET /design/job/<job_id>` therefore says not only that it is waiting, but for what:
+
+- `waiting_for` — `"browser_build"` or `"fea"`, with `waiting_round` and `waiting_s`;
+- `waiting_cad` — the **contract of that round**, the same `cad` object `/chat` returns (`params`, `code`,
+  `expect`, `requirements`, `steps`, `concept` when there is one), so the Studio can build exactly that;
+- `waiting_cad_hash` — sha256 of the round's code. `POST /design/job/<id>/feedback` accepts an optional `cad_hash`;
+  a hash from another round is refused with **409** and the hash the job is waiting for, so numbers measured on one
+  code are never counted for another (omitting it still works, for an older Studio);
+- `rounds_data` — one entry per finished round: `{round, cad_hash, label, checks, changed}`. `changed` lists the
+  parameters a repair really changed (`{param, from, to, why}`, `why` being the failed check or FEA number that
+  caused it). The full code of old rounds is not repeated; only the round being waited for and the final
+  `result.cad` carry code, so a status polled every second stays small.
+
+### How many concepts? (UI v66 B)
+
+`POST /chat` accepts a top-level **`concept_count`** (integer 1–10). A fresh free design with no `concept_count`
+writes **no code**: the answer is `"How many concepts should I design?"` with
+`ask: {k: "concept_count", options: [3, 5, 7, 10], default: 3}` — one question, no AI code call. With a count:
+
+- **1–4**: that many concepts are written now, at most four AI calls at a time; the /chat time budget
+  (`IDRIS_CAD_BUDGET_S`) is shared, and a concept it cannot reach comes back `ok: false` with
+  `"time budget used up"` instead of quietly missing;
+- **5–10**: the concepts do not fit in one chat reply, so `/chat` starts `POST /design/job` with the same
+  `concept_count` and returns **202** with `job_id` and `poll`; the job writes them in the background and
+  `GET /design/job/<job_id>` returns `result.concepts` (label `Not validated`: nothing is built or checked until
+  the browser does it);
+- every AI call goes through `ai_budget`; when the budget runs out mid-way, the remaining concepts are returned
+  `ok: false` with that reason.
+
+A follow-up (`context.pending_cad`), a repair (`context.cad_error`) and a change to the open part
+(`context.current_cad`) are never asked, and neither is a library, primitive, gearbox or assembly route: those are
+about a design that already exists. `IDRIS_CONCEPTS=0` turns the question off and keeps the old one-design path.
 
 ### Material table: every density and strength names its source
 

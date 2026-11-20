@@ -17,6 +17,7 @@ caller's kernel/FEA numbers, and every limit carries its source.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import re
 import threading
@@ -101,15 +102,38 @@ def feedback_wait_s() -> float:
     return max(0.0, wait)
 
 
+# The cad contract the Studio needs to build a round: the shapes and sizes, without the server's own bookkeeping.
+CAD_KEYS = ("title", "kind", "process", "material", "params", "code", "expect", "requirements", "steps",
+            "concept", "variants", "warnings")
+
+
+def cad_contract(cad: dict | None) -> dict | None:
+    """The `cad` object of one round, as the browser builds it (steps included). None when there is no code yet."""
+    if not isinstance(cad, dict) or not cad.get("code"):
+        return None
+    return {k: cad[k] for k in CAD_KEYS if k in cad}
+
+
+def cad_hash(cad: dict | None) -> str | None:
+    """sha256 of the round's code, so the Studio can tell a new round from the one it already built."""
+    code = str((cad or {}).get("code") or "")
+    return hashlib.sha256(code.encode("utf-8")).hexdigest() if code else None
+
+
 def waiting_for(job_id: str | None) -> dict | None:
-    """What this job waits for right now: {need: "browser_build" | "fea", round, since}, or None."""
+    """What this job waits for right now: {need, round, since, cad, cad_hash}, or None.
+
+    `cad` is the contract of the round being waited for (params, code, expect, requirements, steps, concept):
+    without it the Studio knows that it must build something but not what.
+    """
     if not job_id:
         return None
     with _LOCK:
         box = _WAIT.get(job_id)
         if box is None or box["event"].is_set():
             return None
-        return {"need": box["need"], "round": box["round"], "since": box["since"]}
+        return {"need": box["need"], "round": box["round"], "since": box["since"],
+                "cad": box.get("cad"), "cad_hash": box.get("cad_hash")}
 
 
 def browser_feedback(job_id: str | None):
@@ -118,7 +142,8 @@ def browser_feedback(job_id: str | None):
         wait_s = feedback_wait_s()
         if not job_id or wait_s <= 0:
             return {"skipped": True}
-        box = {"round": rnd, "need": need, "event": threading.Event(), "data": {}, "since": time.time()}
+        box = {"round": rnd, "need": need, "event": threading.Event(), "data": {}, "since": time.time(),
+               "cad": cad_contract(cad), "cad_hash": cad_hash(cad)}
         with _LOCK:
             _WAIT[job_id] = box
             store = _STORE.setdefault(job_id, {"events": [], "result": None, "created": time.time()})
@@ -138,12 +163,18 @@ def browser_feedback(job_id: str | None):
     return ask
 
 
-def accept_feedback(job_id: str, rnd=None, measurements=None, review_images=None, part_check=None) -> tuple:
-    """POST /design/job/<id>/feedback: one round's build, renders and strength numbers, from the browser."""
+def accept_feedback(job_id: str, rnd=None, measurements=None, review_images=None, part_check=None,
+                    cad_hash_given=None) -> tuple:
+    """POST /design/job/<id>/feedback: one round's build, renders and strength numbers, from the browser.
+
+    `cad_hash_given` is optional but checked: a browser that measured a different round must not have its
+    numbers counted for this one, so a mismatch is refused (409) with the hash it should have built.
+    """
     with _LOCK:
         box = _WAIT.get(job_id)
         target = box["round"] if box else None
         need = box["need"] if box else None
+        want_hash = box.get("cad_hash") if box else None
     if box is None:
         return 404, {"success": False,
                      "error": f"job '{str(job_id)[:40]}' is not waiting for the browser right now (it may be "
@@ -154,7 +185,14 @@ def accept_feedback(job_id: str, rnd=None, measurements=None, review_images=None
         got_round = target
     if got_round != target:
         return 409, {"success": False, "error": f"the job is waiting for round {target}, not {got_round}",
-                     "round": target, "waiting_for": need}
+                     "round": target, "waiting_for": need, "waiting_cad_hash": want_hash}
+    given_hash = str(cad_hash_given or "").strip().lower()
+    if given_hash and want_hash and given_hash != want_hash:
+        return 409, {"success": False,
+                     "error": ("these numbers were measured on a different code than the round the job is waiting "
+                               "for, so they were not counted; build the cad of round "
+                               f"{target} (waiting_cad on GET /design/job/{job_id}) and send its hash"),
+                     "round": target, "waiting_for": need, "waiting_cad_hash": want_hash}
     data = {"measurements": measurements if isinstance(measurements, dict) else None,
             "review_images": [im for im in review_images if isinstance(im, dict)]
                             if isinstance(review_images, list) else None,
@@ -167,7 +205,7 @@ def accept_feedback(job_id: str, rnd=None, measurements=None, review_images=None
         box["data"] = data
     box["event"].set()
     return 200, {"success": True, "job_id": job_id, "round": target, "accepted": given,
-                 "poll": f"/design/job/{job_id}"}
+                 "cad_hash": want_hash, "poll": f"/design/job/{job_id}"}
 
 
 def handle_feedback(base: str, params: dict):
@@ -177,7 +215,7 @@ def handle_feedback(base: str, params: dict):
         return None
     job_id = p[len("/design/job/"):-len("/feedback")].strip("/")
     return accept_feedback(job_id, params.get("round"), params.get("measurements"),
-                           params.get("review_images"), params.get("part_check"))
+                           params.get("review_images"), params.get("part_check"), params.get("cad_hash"))
 
 
 def _image_review(request: str, cad: dict, images: list, rnd: int, provider=None):
@@ -280,15 +318,63 @@ def not_checked_text(checks: list) -> list:
 
 
 # ------------------------------------------------------------------ one design, in rounds
+def _concept_job(request: str, context: dict | None, provider, count: int, job_id, on_event=None) -> dict:
+    """UI v66 B: n concepts written in the background, so n >= 5 never hits the Studio's ~110 s limit.
+
+    The concepts come from the router (the same reader that proposes them for /chat) and are written in stages of
+    at most four; a concept the time budget or the AI budget does not reach is reported as not built, not dropped
+    silently. Nothing is checked here: the kernel that builds them runs in the browser.
+    """
+    import cad_codegen
+    import cad_router
+    start = time.time()
+    budget = setting("IDRIS_PART_BUDGET_S")
+    events = []
+
+    def event(step: str, **kw) -> None:
+        e = {"t": round(time.time() - start, 2), "step": step, "round": 0}
+        e.update(kw)
+        events.append(e)
+        _append(job_id, e, on_event)
+
+    event("plan", status="running", message=f"{count} concepts for: {str(request)[:140]}",
+          numbers={"concepts": count, "budget_s": budget}, source="IDRIS concept job")
+    concepts = cad_router.concepts_for(request, count, provider)
+    event("code", status="running", message=f"writing {len(concepts)} concepts in stages of four",
+          numbers={"concepts": len(concepts)},
+          source=str(((concepts[0] or {}).get("read_by") if concepts else "") or "the router"))
+    out = cad_codegen.generate_concepts(request, concepts, provider, None, deadline=time.time() + budget)
+    um = dict(context or {})
+    result = {"ok": bool(out.get("ok")), "fidelity": "full", "cad": out.get("cad"),
+              "concepts": out.get("concepts") or [], "checks": [], "label": "Not validated", "rounds": 0,
+              "events": events, "elapsed_s": round(time.time() - start, 1), "proposal": None,
+              "concept_count": int(count),
+              "not_checked": ["the CAD kernel and the strength check run in the browser: nothing was measured "
+                              "here, so no concept is a validated design"],
+              "answer": str(out.get("answer") or ""), "budget_s": budget,
+              "stop_reason": None if out.get("ok") else "no concept could be written"}
+    event("code", status="pass" if out.get("ok") else "fail",
+          message=f"{len([c for c in result['concepts'] if c.get('ok')])} of {len(result['concepts'])} concepts written",
+          numbers={"ok": len([c for c in result['concepts'] if c.get('ok')])}, source=str(out.get("read_by") or "AI"))
+    with _LOCK:
+        box = _STORE.setdefault(job_id or "-", {"events": [], "result": None, "created": time.time()})
+        box["result"] = result
+        if job_id:
+            _DURATIONS.append(result["elapsed_s"])
+    return result
+
+
 def run(request: str, context: dict | None = None, provider: str | None = None, review=None, fea=None,
         fea_trial=None, cad_fn=None, measurements: dict | None = None, on_event=None, job_id=None,
-        feedback=None) -> dict:
+        feedback=None, concept_count: int | None = None) -> dict:
     """The validation circle. Returns the last design with its log, checks and label.
 
     `fea(cad)` -> {"sf": number, "numbers": {...}} and `fea_trial(cad, target)` -> {"param","from","to","sf"}
     are injected because FEA needs a mesh (the browser builds it); without them the step is honestly
     `not_checked`. `review(cad)` -> {"verdict": "ok"|"revise", "notes": [...]} likewise needs renders.
     """
+    if concept_count:
+        return _concept_job(request, context, provider, int(concept_count), job_id, on_event)
     if cad_fn is None:
         import cad_codegen
         cad_fn = lambda msg, ctx, prov: cad_codegen.generate(msg, ctx, prov)     # noqa: E731
@@ -300,6 +386,9 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
     events, checks, cad = [], [], None
     label, answer, proposal = "Not validated", "", None
     rnd, prev_user = 0, None
+    rounds_data: list = []                 # UI v66 A: one summary per round, no code (except the last result)
+    prev_params: dict = {}                 # parameter values of the previous round, to name what a repair changed
+    last_why = None                        # the failed-check/FEA reason the next round is answering
 
     def event(step: str, **kw) -> None:
         e = {"t": round(time.time() - start, 2), "step": step, "round": rnd}
@@ -347,6 +436,16 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
                               "something that is not yours.")
             break
         cad["steps"] = split_steps(cad.get("code"))
+        this_params = {p.get("k"): p.get("value") for p in (cad.get("params") or []) if isinstance(p, dict)}
+        changed_params = []
+        for k, now in this_params.items():
+            was = prev_params.get(k)
+            try:
+                if was is not None and abs(float(now) - float(was)) > 1e-9:
+                    changed_params.append({"param": k, "from": was, "to": now, "why": last_why or ""})
+            except (TypeError, ValueError):
+                continue
+        prev_params = this_params
         event("code", status="pass", message=f"{len(cad['steps'])} step(s), {len(cad.get('params') or [])} parameter(s)",
               numbers={"steps": len(cad["steps"]), "lines": len(str(cad.get("code") or "").splitlines()),
                        "max_lines": int(setting("IDRIS_CAD_MAX_LINES"))},
@@ -482,6 +581,14 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
                           source="FEA, trial run")
 
         label = trust_label(checks, load_given, fea_ran)
+        # UI v66 A: what this round was, in one entry the Studio can show without the code of every round
+        rounds_data.append({"round": rnd, "cad_hash": cad_hash(cad), "label": label,
+                            "checks": [{k: c.get(k) for k in ("id", "check", "status", "value", "limit", "unit",
+                                                              "message")} for c in checks],
+                            "changed": changed_params})
+        with _LOCK:
+            store = _STORE.setdefault(job_id or "-", {"events": [], "result": None, "created": time.time()})
+            store["rounds_data"] = list(rounds_data)
         if not any(c["status"] == "fail" for c in checks) or proposal:
             break
 
@@ -499,9 +606,10 @@ def run(request: str, context: dict | None = None, provider: str | None = None, 
         event("repair", status="running", message=f"round {rnd} failed: {why[:200]}",
               numbers={"rounds_left": rounds - rnd, "engineer_sizes": len(before)},
               source="IDRIS design job")
+        last_why = why[:300]
 
     result = {"ok": bool(cad) and label != "Not validated", "fidelity": "full", "cad": cad,
-              "checks": checks, "label": label, "rounds": rnd, "events": events,
+              "checks": checks, "label": label, "rounds": rnd, "rounds_data": rounds_data, "events": events,
               "elapsed_s": round(time.time() - start, 1), "proposal": proposal,
               "not_checked": not_checked_text(checks), "budget_s": budget,
               "stop_reason": str(answer).strip() or None}
@@ -587,11 +695,18 @@ def status(job_id: str) -> dict | None:
         body["error"] = (job or {}).get("error")
     if box.get("request"):
         body["request"] = box["request"]
+    rounds_data = box.get("rounds_data")
+    if rounds_data:
+        body["rounds_data"] = rounds_data
     wait = waiting_for(job_id)             # review item 8: what the Studio has to send right now
     if wait:
         body["waiting_for"] = wait["need"]
         body["waiting_round"] = wait["round"]
         body["waiting_s"] = round(time.time() - wait["since"], 1)
-        body["how_to_continue"] = (f"POST /design/job/{job_id}/feedback with round {wait['round']} and "
-                                   f"{'measurements' if wait['need'] == 'browser_build' else 'part_check'}")
+        # UI v66 A: the contract of the round being waited for -- the Studio cannot build what it was not sent
+        body["waiting_cad"] = wait.get("cad")
+        body["waiting_cad_hash"] = wait.get("cad_hash")
+        body["how_to_continue"] = (f"POST /design/job/{job_id}/feedback with round {wait['round']}, "
+                                   f"{'measurements' if wait['need'] == 'browser_build' else 'part_check'} "
+                                   f"and cad_hash {wait.get('cad_hash')}")
     return body
