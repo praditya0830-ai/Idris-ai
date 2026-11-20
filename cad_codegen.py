@@ -20,11 +20,15 @@ import os
 import re
 
 import llm
+import shape_family
 
 KINDS = ("functional", "interface", "styling")
 PROCESSES = ("fdm", "cnc", "sheet", "weld")
 MATERIALS = ("aluminium", "steel", "stainless", "titanium", "brass", "pla", "abs", "nylon")
-# materials engineers name that the Studio density table does not have yet: say so instead of a silent wrong mass
+# materials engineers name that the Studio density table does not have yet: say so instead of a silent wrong mass.
+# The solver table (physics/part_fea.MATERIALS) has some of them under its own id; SOLVER_IDS names that id, so the
+# warning can point at the row that does have a sourced density and strength.
+SOLVER_IDS = {"Cast iron": "cast_iron"}
 UNLISTED_MATERIALS = ((("cast iron", "grey iron", "gray iron", "ductile iron", "besi cor", "gjl", "gjs"), "Cast iron"),
                       (("bronze", "perunggu"), "Bronze"), (("copper", "tembaga"), "Copper"),
                       (("magnesium",), "Magnesium"), (("carbon fibre", "carbon fiber", "cfrp", "carbon arm"), "Carbon fibre"),
@@ -285,8 +289,18 @@ def validate(raw: dict, message: str = "") -> tuple:
     low = (message or "").lower()
     for words, name in UNLISTED_MATERIALS:
         if any(w in low for w in words):
-            warns.append(f"{name} is not in the IDRIS material list yet, so mass is computed with "
-                         f"{raw.get('material') or 'the nearest listed material'}; check the mass with the real density")
+            sid = SOLVER_IDS.get(name)
+            used = raw.get("material") or "the nearest listed material"
+            if sid:
+                from physics import part_fea as _pf
+                row = _pf.MATERIALS.get(sid) or {}
+                warns.append(f"{name} is not in the Studio density table yet, so mass is computed with {used}; "
+                             f"check the mass with the real density. The solver table has {sid}: "
+                             f"{row.get('rho', 0):g} kg/m^3, strength {row.get('Sy', 0):g} MPa "
+                             f"(POST /part-check)")
+            else:
+                warns.append(f"{name} is not in the IDRIS material list yet, so mass is computed with {used}; "
+                             f"check the mass with the real density")
             break
     nums = message_numbers(message)
     cad = {"title": str(raw.get("title") or "Part")[:60],
@@ -559,6 +573,11 @@ def _user_block(message: str, context: dict | None) -> str:
         parts.append(f"Design THIS concept: {str(con.get('name'))[:40]}: {str(con.get('idea'))[:160]}. Other concepts "
                      "are written separately, so make this one clearly this concept. Use it as the title. Keep every "
                      "size, material, process and hole the user gave.")
+    # UI v65: the Studio names the family the part belongs to (context.shape_family). It is guidance for this
+    # writer; cad_codegen does not check that the code stays inside it (shape_family.reply says so in the answer).
+    sf = ctx.get("shape_family") if isinstance(ctx.get("shape_family"), dict) else None
+    if sf:
+        parts.append(shape_family.prompt_block(sf))
     err = ctx.get("cad_error") if isinstance(ctx.get("cad_error"), dict) else None
     if err:
         parts.append("Your previous code FAILED in the CAD kernel. Fix it and answer with the full JSON again "

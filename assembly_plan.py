@@ -13,6 +13,7 @@ return { body }") before spending another AI call.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 
@@ -28,13 +29,15 @@ PLAN_SYSTEM = (
     "\"needs\":[\"tube diameter\"],\"standard\":false}],\n"
     " \"interfaces\":[{\"between\":[\"frame\",\"fork\"],\"kind\":\"press\",\"params\":{\"diameter_mm\":44.5},"
     "\"source\":\"standard: ISO 5775\"}],\n"
-    " \"frames\":[{\"part_id\":\"frame\",\"origin_mm\":[0,0,0],\"axis\":[0,0,1]}],\n"
+    " \"frames\":[{\"part_id\":\"frame\",\"origin_mm\":[0,0,0],\"axis\":[0,0,1],\"x_axis\":[1,0,0]}],\n"
     " \"sources\":{\"diameter_mm\":\"standard: ISO 5775 BSD 622 mm\"},\n"
     " \"questions\":[\"one question only if a key size is unknown and cannot be derived\"]}\n"
     "Rules: every id is unique and lowercase; every interface names two existing ids; every frame names an "
-    "existing id and has three numbers for origin_mm and three for axis; a size from the engineer is copied "
-    "exactly; a size from a standard names that standard; a default carries the reason it was needed; at most "
-    "three questions; no performance numbers, savings or efficiencies."
+    "existing id and has three numbers for origin_mm, three for axis and three for x_axis; axis is where the "
+    "part's own +Z points in the assembly and x_axis where its own +X points, both in assembly coordinates and "
+    "x_axis never parallel to axis (a part must not be free to spin about its axis); a size from the engineer "
+    "is copied exactly; a size from a standard names that standard; a default carries the reason it was needed; "
+    "at most three questions; no performance numbers, savings or efficiencies."
 )
 
 
@@ -54,6 +57,67 @@ def _vec(v):
         return None
     out = [_num(x) for x in v]
     return out if all(x is not None for x in out) else None
+
+
+# ------------------------------------------------------------------ the orientation contract
+def _unit(v, tol: float = 1e-9):
+    n = math.sqrt(sum(x * x for x in v))
+    return None if n <= tol else [x / n for x in v]
+
+
+def _dot(a, b) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def basis(axis, x_axis=None) -> dict:
+    """The local frame a placed part needs: z = axis, x = x_axis made perpendicular to z, y = z x x.
+
+    Studio builds the part's rotation from these three unit vectors, so the contract has to be complete: with only
+    `axis` a part is still free to spin about it, and two engineers (or two runs) would place a bracket differently.
+    When the plan names `x_axis` it is used (projected perpendicular to z, so a sloppy plan still gives an
+    orthonormal frame); when it does not, one is derived from the world axis least aligned with z -- deterministic,
+    and marked `x_axis_source: "derived"` so nobody mistakes it for a decision the engineer made.
+
+    -> {axis, x_axis, y_axis, x_axis_source} or {"error": <reason>}
+    """
+    z = _unit([float(x) for x in axis])
+    if z is None:
+        return {"error": "axis is a zero vector, so there is no direction to point the part at"}
+    src = "plan"
+    if x_axis is not None:
+        xr = [float(x) for x in x_axis]
+        if _unit(xr) is None:
+            return {"error": "x_axis is a zero vector"}
+        d = _dot(xr, z)
+        x = _unit([xr[i] - d * z[i] for i in range(3)])
+        if x is None:
+            return {"error": "x_axis is parallel to axis, so the part could still spin about its axis; give an "
+                             "x_axis across the part"}
+    else:
+        src = "derived"
+        e = [0.0, 0.0, 0.0]
+        e[min(range(3), key=lambda i: abs(z[i]))] = 1.0      # the world axis least aligned with z
+        d = _dot(e, z)
+        x = _unit([e[i] - d * z[i] for i in range(3)])
+    y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]]
+    r6 = lambda v: [round(c, 6) for c in v]
+    return {"axis": r6(z), "x_axis": r6(x), "y_axis": r6(y), "x_axis_source": src}
+
+
+def placed_frame(frame: dict) -> dict:
+    """One placed part, ready for the Studio: where it goes and how it is turned (origin + three unit axes)."""
+    frame = frame if isinstance(frame, dict) else {}
+    b = basis(frame.get("axis") or [0, 0, 1], frame.get("x_axis"))
+    out = {"origin_mm": frame.get("origin_mm") or [0, 0, 0]}
+    if "error" in b:                     # a stored plan from before this contract: say so, never guess silently
+        out.update({"axis": [0, 0, 1], "x_axis": [1, 0, 0], "y_axis": [0, 1, 0],
+                    "x_axis_source": "default", "frame_error": b["error"]})
+        return out
+    out.update(b)
+    kept = frame.get("x_axis_source")
+    if kept in ("plan", "derived"):
+        out["x_axis_source"] = kept          # a validated plan already said where its x_axis came from
+    return out
 
 
 def validate(raw: dict) -> tuple:
@@ -126,13 +190,22 @@ def validate(raw: dict) -> tuple:
             continue
         pid = str(f.get("part_id") or "").strip().lower()
         origin, axis = _vec(f.get("origin_mm")), _vec(f.get("axis"))
+        xa = None if f.get("x_axis") is None else _vec(f.get("x_axis"))
         if pid not in ids:
             errs.append(f"frame for '{pid}' names a part that is not in the plan")
             continue
         if origin is None or axis is None:
             errs.append(f"frame for '{pid}' needs three numbers for origin_mm and three for axis")
             continue
-        frames.append({"part_id": pid, "origin_mm": origin, "axis": axis})
+        if f.get("x_axis") is not None and xa is None:
+            errs.append(f"frame for '{pid}' has an x_axis that is not three numbers")
+            continue
+        b = basis(axis, xa)
+        if "error" in b:
+            errs.append(f"frame for '{pid}': {b['error']}")
+            continue
+        frames.append({"part_id": pid, "origin_mm": origin, "axis": b["axis"], "x_axis": b["x_axis"],
+                       "y_axis": b["y_axis"], "x_axis_source": b["x_axis_source"]})
     questions = [str(q)[:200] for q in (raw.get("questions") or [])][:QUESTIONS_MAX]
     for u in unsourced:                        # one question per size that has no source yet
         questions.append(_confirm_question(u))
