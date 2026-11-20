@@ -30,6 +30,7 @@ def test_principal_stresses_are_the_eigenvalues_in_descending_order():
 def test_the_criterion_follows_the_material_and_says_which_strength_it_uses():
     brittle = pf.criterion_for(pf.MATERIALS["cast_iron"])
     assert brittle["id"] == "rankine" and "Rankine" in brittle["label"]
+    assert "max principal stress vs Rm (brittle" in brittle["label"]
     assert brittle["strength_symbol"] == "Rm" and "does not yield" in brittle["strength_basis"]
     ductile = pf.criterion_for(pf.MATERIALS["steel"])
     assert ductile["id"] == "von_mises" and "Rp0.2" in ductile["label"]
@@ -46,9 +47,46 @@ def test_rankine_uses_the_tensile_principal_stress_and_not_von_mises():
 
 
 def test_no_tension_means_no_rankine_factor_instead_of_a_huge_one():
-    out = pf.safety(pf.MATERIALS["cast_iron"], vm_max=40.0, s1_max=-5.0)
+    out = pf.safety(pf.MATERIALS["cast_iron"], vm_max=40.0, s1_max=-5.0, s3_min=-60.0)
     assert out["min_safety_factor"] is None
     assert "no tensile principal stress" in out["safety_note"]
+
+
+def test_a_compressed_part_says_compression_dominates_and_that_strength_is_not_used():
+    out = pf.safety(pf.MATERIALS["cast_iron"], vm_max=12.0, s1_max=1.0, s3_min=-30.0)
+    assert out["min_safety_factor"] is not None
+    assert "compression dominates" in out["safety_note"]
+    assert "stronger in compression" in out["safety_note"] and "not used" in out["safety_note"]
+
+
+def _loaded(force):
+    """The 100 x 10 x 10 bar, clamped at one end, pulled (+x) or pushed (-x) along its axis."""
+    return {**BRITTLE_BOX, "element_size_mm": 2.5,
+            "supports": [{"where": {"plane": "x", "side": "min"}}],
+            "loads": [{"force_N": list(force), "where": {"plane": "x", "side": "max"}}]}
+
+
+def test_pure_tension_is_judged_by_rankine_and_the_factor_is_rm_over_sigma_1():
+    o = pf.run(_loaded((1000.0, 0, 0)))          # F/A = 1000/100 = 10 MPa in tension (the clamped end adds some)
+    assert o["criterion"]["id"] == "rankine"
+    assert 5.0 < o["max_principal_MPa"] < 40.0
+    assert math.isclose(o["min_safety_factor"], o["strength_MPa"] / o["max_principal_MPa"], rel_tol=1e-6)
+    assert o["safety_note"] is None or "compression dominates" not in o["safety_note"]
+    assert len(o["surface"]["principal_max"]) == len(o["surface"]["von_mises"])
+
+
+def test_bending_puts_one_side_in_tension_and_the_other_in_compression():
+    o = pf.run(dict(BRITTLE_BOX, element_size_mm=2.5))       # the cantilever tip load: bending
+    assert o["max_principal_MPa"] > 0 > o["min_principal_MPa"]
+    assert o["criterion"]["id"] == "rankine"
+
+
+def test_an_axial_compression_run_never_reports_the_compressive_strength_as_used():
+    o = pf.run(_loaded((-1000.0, 0, 0)))
+    assert o["min_principal_MPa"] < 0
+    note = str(o["safety_note"] or "")
+    assert (o["min_safety_factor"] is None and "no tensile principal stress" in note) or \
+           "compression dominates" in note
 
 
 def test_part_check_on_cast_iron_reports_rankine_with_its_label():

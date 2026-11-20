@@ -89,7 +89,7 @@ CRITERIA = {
                   "stress_measure": "von Mises equivalent stress", "strength_symbol": "Rp0.2",
                   "strength_basis": "0.2 % proof stress (the material yields before it breaks)"},
     "rankine": {"id": "rankine",
-                "label": "Rankine maximum principal stress vs tensile Rm (brittle fracture)",
+                "label": "Rankine: max principal stress vs Rm (brittle fracture)",
                 "stress_measure": "largest principal stress (tension only)", "strength_symbol": "Rm",
                 "strength_basis": "minimum tensile strength Rm; this material does not yield"},
 }
@@ -114,11 +114,13 @@ def principal_stresses(s):
     return np.linalg.eigvalsh(m)[:, ::-1]
 
 
-def safety(mat: dict, vm_max: float, s1_max: float) -> dict:
+def safety(mat: dict, vm_max: float, s1_max: float, s3_min: float | None = None) -> dict:
     """-> {criterion, critical_stress_MPa, min_safety_factor, safety_note}. None when a factor cannot be one.
 
     Rankine is a tensile criterion, so a load case with no tension anywhere is not limited by it -- that is said
-    in `safety_note` instead of printing a huge number that looks like a result.
+    in `safety_note` instead of printing a huge number that looks like a result. When compression is what the part
+    is really doing, the note says so, and says that cast iron is stronger there: the compressive strength is not
+    in this table, so it is not used, and the tensile factor must not be read as a limit on that side.
     """
     crit = criterion_for(mat)
     strength = float((mat or {}).get("Sy") or 0.0)
@@ -128,8 +130,15 @@ def safety(mat: dict, vm_max: float, s1_max: float) -> dict:
                 "safety_note": ("no tensile principal stress anywhere, so Rankine does not limit this part; a "
                                 "compressive criterion for brittle materials is not in IDRIS yet")}
     factor = strength / stress if stress > 1e-12 else None
+    note = None
+    if factor is None:
+        note = "the stress is zero, so no factor can be computed"
+    elif crit["id"] == "rankine" and s3_min is not None and float(s3_min) < 0 and abs(float(s3_min)) > stress:
+        note = (f"compression dominates here: the most compressive principal stress is {abs(float(s3_min)):.1f} MPa "
+                f"against {stress:.1f} MPa in tension. Cast iron is stronger in compression, so that strength is "
+                f"not used and this factor is the tensile (conservative) one")
     return {"criterion": crit, "critical_stress_MPa": round(stress, 4), "min_safety_factor": factor,
-            "safety_note": None if factor is not None else "the stress is zero, so no factor can be computed"}
+            "safety_note": note}
 
 
 def material_catalog():
@@ -323,7 +332,7 @@ def run(p: dict, progress=lambda *a, **k: None, _h=None) -> dict:
     v995 = float(np.percentile(r["von_mises_elem"], 99.5))
     s1 = float(pr[:, 0].max())                                 # largest principal stress = most tensile
     s3 = float(pr[:, 2].min())
-    safe = safety(mat, vm_max=vmax, s1_max=s1)
+    safe = safety(mat, vm_max=vmax, s1_max=s1, s3_min=s3)
     sf = safe["min_safety_factor"]
     vvox = float(model.evol.sum())
     pos = model.nodes[ids]
