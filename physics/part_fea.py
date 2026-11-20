@@ -79,6 +79,59 @@ MATERIAL_NOTE = ("Typical handbook values for screening; printed plastics depend
                  "yield check.")
 
 
+# ------------------------------------------------------------------ strength criterion
+# A ductile metal is judged by von Mises against its proof stress. A brittle material has no proof stress: it
+# fails when the largest PRINCIPAL stress in tension reaches its tensile strength (Rankine), and a von Mises
+# number compared with "yield" would report a factor that means nothing. Each row says which number it used.
+CRITERIA = {
+    "von_mises": {"id": "von_mises",
+                  "label": "von Mises equivalent stress vs Rp0.2 (ductile yielding)",
+                  "stress_measure": "von Mises equivalent stress", "strength_symbol": "Rp0.2",
+                  "strength_basis": "0.2 % proof stress (the material yields before it breaks)"},
+    "rankine": {"id": "rankine",
+                "label": "Rankine maximum principal stress vs tensile Rm (brittle fracture)",
+                "stress_measure": "largest principal stress (tension only)", "strength_symbol": "Rm",
+                "strength_basis": "minimum tensile strength Rm; this material does not yield"},
+}
+
+
+def criterion_for(mat: dict) -> dict:
+    """Which criterion this material is judged by (`brittle: true` -> Rankine against Rm)."""
+    return dict(CRITERIA["rankine" if (mat or {}).get("brittle") else "von_mises"])
+
+
+def principal_stresses(s):
+    """Principal stresses of each row of [sx, sy, sz, txy, tyz, tzx] (the order fem3d.von_mises reads).
+
+    Descending: [:, 0] is the largest (most tensile) principal stress, [:, 2] the most compressive.
+    """
+    s = np.asarray(s, float).reshape(-1, 6)
+    m = np.empty((len(s), 3, 3))
+    m[:, 0, 0], m[:, 1, 1], m[:, 2, 2] = s[:, 0], s[:, 1], s[:, 2]
+    m[:, 0, 1] = m[:, 1, 0] = s[:, 3]
+    m[:, 1, 2] = m[:, 2, 1] = s[:, 4]
+    m[:, 0, 2] = m[:, 2, 0] = s[:, 5]
+    return np.linalg.eigvalsh(m)[:, ::-1]
+
+
+def safety(mat: dict, vm_max: float, s1_max: float) -> dict:
+    """-> {criterion, critical_stress_MPa, min_safety_factor, safety_note}. None when a factor cannot be one.
+
+    Rankine is a tensile criterion, so a load case with no tension anywhere is not limited by it -- that is said
+    in `safety_note` instead of printing a huge number that looks like a result.
+    """
+    crit = criterion_for(mat)
+    strength = float((mat or {}).get("Sy") or 0.0)
+    stress = float(s1_max if crit["id"] == "rankine" else vm_max)
+    if crit["id"] == "rankine" and stress <= 0:
+        return {"criterion": crit, "critical_stress_MPa": round(stress, 4), "min_safety_factor": None,
+                "safety_note": ("no tensile principal stress anywhere, so Rankine does not limit this part; a "
+                                "compressive criterion for brittle materials is not in IDRIS yet")}
+    factor = strength / stress if stress > 1e-12 else None
+    return {"criterion": crit, "critical_stress_MPa": round(stress, 4), "min_safety_factor": factor,
+            "safety_note": None if factor is not None else "the stress is zero, so no factor can be computed"}
+
+
 def material_catalog():
     """The one material table for the UI selector and the engineering report."""
     return {"materials": [{"id": key, **row} for key, row in MATERIALS.items()], "note": MATERIAL_NOTE}
@@ -261,21 +314,30 @@ def run(p: dict, progress=lambda *a, **k: None, _h=None) -> dict:
     r = model.solve(mat["E"], mat["nu"], fixed, loads,
                     progress=lambda it, res: progress("Solving", min(0.85, 0.2 + 0.65 * it / (it + 400))))
     vm = r["von_mises"]
+    pr = principal_stresses(r["stress"])                    # nodal, descending
     disp = np.linalg.norm(r["u"], axis=1)
     reac = r["reactions"][fixed].sum(0)
     app = loads.sum(0)
     bal = float(np.linalg.norm(reac + app) / (np.abs(loads).sum() or 1.0))
     vmax = float(vm.max())
     v995 = float(np.percentile(r["von_mises_elem"], 99.5))
-    sf = mat["Sy"] / max(vmax, 1e-12)
+    s1 = float(pr[:, 0].max())                                 # largest principal stress = most tensile
+    s3 = float(pr[:, 2].min())
+    safe = safety(mat, vm_max=vmax, s1_max=s1)
+    sf = safe["min_safety_factor"]
     vvox = float(model.evol.sum())
     pos = model.nodes[ids]
     surface = {"positions": np.round(pos, 2).ravel().tolist(), "indices": tris.ravel().tolist(),
                "von_mises": np.round(vm[ids], 2).tolist(),
+               "principal_max": np.round(pr[ids, 0], 2).tolist(),
                "displacement": np.round(r["u"][ids], 5).ravel().tolist()}
     return {
         "surface": surface, "material": mat, "yield_mpa": mat["Sy"],
+        "criterion": safe["criterion"], "critical_stress_MPa": safe["critical_stress_MPa"],
+        "strength_MPa": mat["Sy"], "strength_basis": safe["criterion"]["strength_basis"],
+        "safety_note": safe["safety_note"],
         "max_von_mises_MPa": vmax, "von_mises_p995_MPa": v995, "max_displacement_mm": float(disp.max()),
+        "max_principal_MPa": s1, "min_principal_MPa": s3,
         "min_safety_factor": sf,
         "mesh": {"type": "hex8-im voxel", "element_size_mm": round(float(h), 4), "elements": ne,
                  "nodes": model.n_nodes, "surface_triangles": int(len(tris)), "fixed_nodes": int(len(fixed))},
