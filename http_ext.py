@@ -39,8 +39,16 @@ def calls_ai(base: str) -> bool:
     return any(base in tuple(getattr(m, "AI_POST_ROUTES", ())) for m in _mods())
 
 
+def is_design_feedback(base: str) -> bool:
+    """True for /design/job/<id>/feedback (review of PR #5-#8, item 8): the browser posts a round's results."""
+    p = str(base or "").rstrip("/")
+    return p.startswith("/design/job/") and p.endswith("/feedback")
+
+
 def known_post(base: str) -> bool:
     """True when one of the modules answers this POST path: main.py's route gate asks this first."""
+    if is_design_feedback(base):
+        return True
     for m in _mods():
         if base in tuple(getattr(m, "POST_ROUTES", ())):
             return True
@@ -59,6 +67,9 @@ def handle_get(path: str):
 
 
 def handle_post(base: str, params: dict):
+    if is_design_feedback(base):
+        import design_job                  # the job owns its feedback route
+        return design_job.handle_feedback(base, params)
     for m in _mods():
         fn = getattr(m, "handle_post", None)
         if fn is None:
