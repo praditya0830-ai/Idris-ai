@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import importlib
 
-MODULES = ("design_ext", "shape_ext", "assembly_ext", "report_ext")
+MODULES = ("design_ext", "shape_ext", "assembly_ext", "report_ext", "vision_ext")
 
 # Review of PR #5-#8, item 7a: module routes that can call a paid provider. main.py rate limits these per IP
 # before it hands the request over, exactly like /chat. A module may also name its own with AI_POST_ROUTES.
-AI_POSTS = ("/assembly/plan", "/assembly/design", "/shape/families")
+AI_POSTS = ("/assembly/plan", "/assembly/design", "/shape/families", "/vision/read", "/vision/job")
 
 
 def _mods():
