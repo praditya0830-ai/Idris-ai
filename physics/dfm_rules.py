@@ -20,6 +20,12 @@ WALL_MIN_MM = {
               "pla": 1.0, "abs": 1.0, "nylon": 1.0},
     "weld": {"steel": 3.0, "stainless": 3.0, "aluminium": 2.0,
              "pla": 3.0, "abs": 3.0, "nylon": 3.0, "titanium": 3.0, "brass": 3.0},
+    # v0.39 (DFM for any part): SLS and casting were missing, so a part made that way came back "no rule"
+    # even though a workshop guideline exists. Both are named as guidelines, never as a standard.
+    "sls": {"nylon": 0.8, "pla": 0.8, "abs": 0.8, "aluminium": 0.8, "steel": 0.8, "stainless": 0.8,
+            "titanium": 0.8, "brass": 0.8},
+    "cast": {"cast_iron": 3.0, "aluminium": 2.5, "steel": 4.0, "stainless": 4.0, "brass": 1.5,
+             "titanium": 2.5, "pla": 3.0, "abs": 3.0, "nylon": 3.0},
 }
 # Review of PR #5-#8, item 6: a source may only be quoted when it really contains the number. ISO 2553 is the
 # standard for welding SYMBOLS and says nothing about a minimum fillet leg, so it is gone from this table.
@@ -49,6 +55,13 @@ WALL_SOURCE = {
                        "1.0 mm aluminium. A workshop guideline, not a clause in a standard.",
               "status": UNVERIFIED},
     "weld": {"text": WELD_SOURCE, "status": VERIFIED},
+    "sls": {"text": "SLS powder-bed guideline: 0.8 mm is the thinnest wall that sinters reliably; thicker is "
+                      "needed on tall thin features. A machine-shop rule of thumb, not a clause in a standard.",
+            "status": UNVERIFIED},
+    "cast": {"text": "Foundry guideline for minimum cast wall, by alloy: about 3 mm for grey cast iron, "
+                      "2.5 mm aluminium, 4 mm steel, 1.5 mm brass. A foundry rule of thumb, not a clause in a "
+                      "standard.",
+             "status": UNVERIFIED},
 }
 
 

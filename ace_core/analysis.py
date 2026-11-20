@@ -77,10 +77,20 @@ def _part_result(env):
     # chat come from one rule set (ai/review.py)
     from ai import review as REVIEW
     findings = REVIEW.review_part(o)
+    # the criterion travels with the numbers: which stress was compared with which strength, and what it is called
     return {"surface": o["surface"], "yield_mpa": o["yield_mpa"], "mesh": o["mesh"], "material": o["material"],
+            "criterion": o.get("criterion"), "strength_mpa": o.get("strength_MPa"),
+            "critical_stress_mpa": o.get("critical_stress_MPa"), "safety_note": o.get("safety_note"),
+            "max_principal_mpa": o.get("max_principal_MPa"), "min_principal_mpa": o.get("min_principal_MPa"),
             "review": findings, "review_summary": REVIEW.summary(findings),
             "solve_time_s": o["solve_time_s"], "applied_loads": o["applied_loads"], "reaction_n": o["reaction_N"],
             "summary": {"max_von_mises_mpa": o["max_von_mises_MPa"], "von_mises_p995_mpa": o["von_mises_p995_MPa"],
+                        "max_principal_mpa": o.get("max_principal_MPa"),
+                        "critical_stress_mpa": o.get("critical_stress_MPa"),
+                        "strength_mpa": o.get("strength_MPa"),
+                        "criterion": (o.get("criterion") or {}).get("id"),
+                        "criterion_label": (o.get("criterion") or {}).get("label"),
+                        "safety_note": o.get("safety_note"),
                         "max_displacement_mm": o["max_displacement_mm"], "min_safety_factor": o["min_safety_factor"],
                         "margin_of_safety": o["margin_of_safety"], "factor_of_safety": o["design_factor"],
                         "mass_kg": o["mass_kg"]},

@@ -177,6 +177,59 @@ def _shape_family_reply(ctx):
     return shape_family.reply(None, str(why)) if why else None
 
 
+CONCEPT_OPTIONS = (3, 5, 7, 10)
+
+
+def _concepts_on() -> bool:
+    """IDRIS_CONCEPTS=0 turns the concept question off for everyone (the one-design path is then used)."""
+    return os.environ.get("IDRIS_CONCEPTS", "1").lower() not in ("0", "off", "false", "no")
+
+
+def _concept_count(raw):
+    """UI v66 B: how many concepts the engineer asked to compare. -> (count or None, error or None)."""
+    msg = "concept_count must be an integer between 1 and 10"
+    if raw in (None, ""):
+        return None, None
+    if isinstance(raw, bool):                    # True is not a count
+        return None, msg
+    if isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        n = int(raw.strip())
+    else:                                        # 3.5, "many", [3]
+        return None, msg
+    return (n, None) if 1 <= n <= 10 else (None, msg)
+
+
+def _ask_concept_count(routed) -> dict:
+    """The question before any code is written (UI v66 B): the number of concepts, not a design yet.
+
+    It is answered without an AI code call, so asking costs nothing; the router already read the sentence.
+    """
+    return {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
+            "compare": None, "cad": None, "concepts": [], "provider": None, "route": routed,
+            "answer": "How many concepts should I design?",
+            "ask": {"k": "concept_count", "options": list(CONCEPT_OPTIONS), "default": 3}}
+
+
+def _concept_decision(routed, ctx, concept_count) -> str:
+    """What a message that would write CAD code must do about concepts (UI v66 B).
+
+    -> "ask" (how many concepts?), "job" (n >= 5, written in the background), "concepts" (write n now) or "cad"
+    (the one-design path). Only a FRESH free design is asked: a follow-up (`pending_cad`), a repair (`cad_error`)
+    and a change to the open part (`current_cad`) are about the design that is already there, and a library,
+    primitive, gearbox, assembly or other route never carries concepts.
+    """
+    free = bool(routed and routed.get("route") == "free_design")
+    ctx = ctx if isinstance(ctx, dict) else {}
+    design_open = any(isinstance(ctx.get(k), dict) for k in ("cad_error", "pending_cad", "current_cad"))
+    if not (free and not design_open and _concepts_on()):
+        return "cad"
+    if concept_count is None:
+        return "ask"
+    return "job" if int(concept_count) >= 5 else "concepts"
+
+
 def _fault(e: Exception) -> str:
     """One line a screenshot can carry: what failed and where. No secrets: type, short message, file and line."""
     tb = traceback.extract_tb(e.__traceback__)
@@ -231,8 +284,8 @@ class Handler(BaseHTTPRequestHandler):
     def _ace_unavailable(self, path: str) -> bool:
         """If the solver framework failed to import, answer ACE paths with a clear error."""
         p = path.split("?")[0]
-        if ACE_IMPORT_ERROR and (p in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check", "/solvers", "/solvers/tools", "/verify", "/selfcheck")
-                                 or p.startswith(("/fea/", "/modal/", "/cfd/", "/review/", "/part-check/", "/weldment-check/", "/solve/", "/verify/"))):
+        if ACE_IMPORT_ERROR and (p in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check", "/dfm/part", "/solvers", "/solvers/tools", "/verify", "/selfcheck")
+                                 or p.startswith(("/fea/", "/modal/", "/cfd/", "/review/", "/part-check/", "/weldment-check/", "/dfm/", "/solve/", "/verify/"))):
             self._send_json(503, {"success": False, "ok": False,
                                   "error": f"Solver framework failed to load: {ACE_IMPORT_ERROR}"})
             return True
@@ -768,17 +821,35 @@ class Handler(BaseHTTPRequestHandler):
                 "shape_family": _shape_family_reply(ctx),          # UI v65: accepted, or why it was dropped
                 "not_checked": r.get("not_checked") or []}
 
-    def _chat_concepts(self, msg: str, concepts: list, provider=None, reply_language=None) -> dict:
-        """Like the gearbox flow: several design concepts at once, each a full `cad` the browser builds and checks."""
+    def _chat_concepts(self, msg: str, concepts: list, provider=None, reply_language=None, count=None) -> dict:
+        """Like the gearbox flow: several design concepts at once, each a full `cad` the browser builds and checks.
+
+        UI v66 B: `count` concepts (1-10). When the router proposed fewer than asked, it is asked once more with
+        the number, so seven cards are seven shapes and not three repeated. The /chat time budget is shared: a
+        concept it cannot reach comes back `ok: false` with the reason, not silently missing.
+        """
         import cad_codegen
-        r = cad_codegen.generate_concepts(msg, concepts, provider, reply_language)
+        import cad_router
+        n = int(count or 0) or max(2, min(cad_codegen.CONCEPT_MAX, len(concepts) or 3))
+        if len(concepts) < n:
+            concepts = cad_router.concepts_for(msg, n, provider) or concepts
+        if not concepts:
+            return self._chat_cad(msg, None, provider, reply_language)      # no concept could be proposed
+        try:
+            budget = float(os.environ.get("IDRIS_CAD_BUDGET_S", "85"))
+        except (TypeError, ValueError):
+            budget = 85.0
+        r = cad_codegen.generate_concepts(msg, concepts, provider, reply_language,
+                                          deadline=time.time() + budget)
         if not r.get("ok"):
             return self._chat_cad(msg, None, provider, reply_language)      # fall back to one design
         return {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None, "answer": r["answer"], "cad": r["cad"], "provider": r.get("read_by"),
                 "language": "en" if llm.want_english(reply_language) else None,
+                "concept_count": n, "requested": r.get("requested"), "written": r.get("written"),
                 "concepts": [{"name": c["name"], "idea": c["idea"], "ok": c["ok"], "cad": c["cad"],
-                              "error": None if c["ok"] else c["answer"], "cad_attempts": c["attempts"]}
+                              "error": None if c["ok"] else c.get("error") or c["answer"],
+                              "cad_attempts": c["attempts"]}
                              for c in r["concepts"]]}
 
     def _cleanup_old_files(self, max_age_s: int = 3600) -> None:
@@ -882,10 +953,12 @@ class Handler(BaseHTTPRequestHandler):
         POST_ROUTES = ("/generate-housing", "/generate-variants", "/generate-assembly", "/chat", "/edit-variant",
                        "/catalog/bolt-check", "/cad/review", "/cad/explore", "/cad/rank", "/design/job",
                        "/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
-                       "/exchange/step", "/engineer/solve", "/engineer/verify")
+                       "/exchange/step", "/exchange/step-ap242", "/exchange/solidworks-macro",
+                       "/engineer/solve", "/engineer/verify")
         import http_ext                     # Bagian F onward: routes owned by a small module of their own
         base = self.path.split("?")[0]
-        is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
+        is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check",
+                        "/dfm/part") or base.startswith("/solve/")
         # every route handled below must be listed here (tests/test_routes.py checks it); a module registered in
         # http_ext keeps its own route list, so two sections never have to edit the same tuple
         if base not in POST_ROUTES and not is_ace and not http_ext.known_post(base):
@@ -947,12 +1020,17 @@ class Handler(BaseHTTPRequestHandler):
             ctx = params.get("context") if isinstance(params.get("context"), dict) else None
             ctx, _sf = _clean_shape_family(ctx)   # a shape family from the Studio never reaches a prompt unchecked
             meas = params.get("measurements") if isinstance(params.get("measurements"), dict) else None
+            concept_count, cc_error = _concept_count(params.get("concept_count"))   # UI v66 B
+            if cc_error:
+                self._send_json(400, {"success": False, "error": cc_error})
+                return
             try:
-                unique_parts = max(1, int(params.get("parts") or 1))
+                unique_parts = max(1, int(params.get("parts") or concept_count or 1))
             except (TypeError, ValueError):
                 unique_parts = 1
             est = design_job.estimate_s(unique_parts)
-            job_id = design_job.submit(msg, context=ctx, provider=params.get("provider"), measurements=meas)
+            job_id = design_job.submit(msg, context=ctx, provider=params.get("provider"), measurements=meas,
+                                       **({"concept_count": concept_count} if concept_count else {}))
             if job_id is None:
                 self._send_json(503, {"success": False, "error": "The design queue is full. Please retry in a minute."})
                 return
@@ -967,6 +1045,11 @@ class Handler(BaseHTTPRequestHandler):
                 llm.check_rate(ip)
                 ctx = params.get("context") if isinstance(params.get("context"), dict) else None
                 ctx, _sf = _clean_shape_family(ctx)   # UI v65: the Studio's shape family, checked before any prompt
+                concept_count, cc_error = _concept_count(params.get("concept_count"))   # UI v66 B
+                if cc_error:
+                    self._send_json(400, {"success": False, "error": cc_error, "ask": {
+                        "k": "concept_count", "options": list(CONCEPT_OPTIONS), "default": 3}})
+                    return
                 from physics.simple_part import looks_like_part_request
                 import cad_codegen
                 msg = str(params.get("message") or "")[:llm.MAX_MSG]
@@ -1076,9 +1159,29 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if cad_ctx or (not gear_ctx and not eng_ctx and not is_prim and is_obj):
                     concepts = (routed or {}).get("concepts") or []
-                    if (not cad_ctx and len(concepts) >= 2
-                            and os.environ.get("IDRIS_CONCEPTS", "1").lower() not in ("0", "off", "false", "no")):
-                        out = self._chat_concepts(msg, concepts, params.get("provider"), rl)
+                    decision = _concept_decision(routed, ctx, concept_count)      # UI v66 B
+                    if decision == "ask":
+                        self._send_json(200, _ask_concept_count(routed))
+                        return
+                    if decision == "job":
+                        import design_job as _dj
+                        job_id = _dj.submit(msg, context=ctx, provider=params.get("provider"),
+                                            concept_count=concept_count)
+                        if job_id is None:
+                            self._send_json(503, {"success": False,
+                                                  "error": "The design queue is full. Please retry in a minute."})
+                            return
+                        self._send_json(202, {
+                            "success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [],
+                            "select": None, "compare": None, "route": routed, "concept_count": concept_count,
+                            "job_id": job_id, "status": "queued", "poll": f"/design/job/{job_id}",
+                            "estimate": _dj.estimate_s(concept_count),
+                            "answer": (f"{concept_count} concepts do not fit in one chat reply, so IDRIS writes them "
+                                       f"in the background; poll GET /design/job/{job_id} and each one appears as it "
+                                       f"is written. Nothing is built or checked until your browser does it.")})
+                        return
+                    if decision == "concepts":
+                        out = self._chat_concepts(msg, concepts, params.get("provider"), rl, count=concept_count)
                     else:
                         out = self._chat_cad(msg, ctx, params.get("provider"), rl)
                     if routed:

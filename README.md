@@ -23,13 +23,17 @@ limitations; physics is never delegated to an LLM.
 | Natural frequencies and mode shapes of any part mesh | `POST /solve/modal_part_3d` |
 | Eigen-buckling of a slender member (the four Euler column cases) | `POST /solve/buckling_beam` |
 | Pipe flow: friction factor, Darcy-Weisbach pressure drop, regimes | `POST /solve/pipe_flow_darcy` |
+| STEP AP242 with named products, colours, mm units and an assembly tree | `POST /exchange/step-ap242` |
+| SolidWorks VBA macro that rebuilds the feature tree as parametric features | `POST /exchange/solidworks-macro` |
+| Manufacturability of any part from its mesh: measured wall thickness, overhang, draft, drill series | `POST /dfm/part` |
 | Standard-part library and catalogs, with ISO sources | `GET /library`, `/catalog` |
 | Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`), with a source on every row | `physics/part_fea.py` (`material_catalog()`); the ids are what `POST /part-check` accepts |
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
 | Chat: a whole product becomes a plan of parts, and the part-by-part job starts only after the engineer says Start | `POST /chat`, `POST /assembly/plan`, `POST /assembly/design` |
 | Calculation references (formula + source) stored as candidates | `GET /references/db`, `/references/db/<slug>` |
-| Free-form design as a background job, with every check it ran | `POST /design/job`, `GET /design/job/<job_id>` |
+| Free-form design as a background job, with every check it ran and the code the browser must build (`waiting_cad`) | `POST /design/job`, `GET /design/job/<job_id>` |
+| How many design concepts to compare (3 / 5 / 7 / 10), asked before any code is written | `POST /chat` with `concept_count` |
 | One door to check the reference lookup, and a self-test of it | `GET /references/status`, `/references/selftest` |
 | Live solver benchmarks vs published reference values | `GET /verify` |
 | End-to-end check of the three demo scenarios | `GET /selfcheck` |
@@ -228,6 +232,42 @@ An assembly answer says it was not applied, because parts are designed one at a 
 What this does not do: nothing verifies that the generated code stays inside the design space, that its parameters
 match the family, or that the family is the right one for the load. `not_checked` in the reply says exactly that.
 
+### The design job and the browser: `waiting_cad` (UI v66 A)
+
+A design job and the Studio each do half of the work: the job writes code, the browser builds it, measures it and
+runs the strength check. `GET /design/job/<job_id>` therefore says not only that it is waiting, but for what:
+
+- `waiting_for` — `"browser_build"` or `"fea"`, with `waiting_round` and `waiting_s`;
+- `waiting_cad` — the **contract of that round**, the same `cad` object `/chat` returns (`params`, `code`,
+  `expect`, `requirements`, `steps`, `concept` when there is one), so the Studio can build exactly that;
+- `waiting_cad_hash` — sha256 of the round's code. `POST /design/job/<id>/feedback` accepts an optional `cad_hash`;
+  a hash from another round is refused with **409** and the hash the job is waiting for, so numbers measured on one
+  code are never counted for another (omitting it still works, for an older Studio);
+- `rounds_data` — one entry per finished round: `{round, cad_hash, label, checks, changed}`. `changed` lists the
+  parameters a repair really changed (`{param, from, to, why}`, `why` being the failed check or FEA number that
+  caused it). The full code of old rounds is not repeated; only the round being waited for and the final
+  `result.cad` carry code, so a status polled every second stays small.
+
+### How many concepts? (UI v66 B)
+
+`POST /chat` accepts a top-level **`concept_count`** (integer 1–10). A fresh free design with no `concept_count`
+writes **no code**: the answer is `"How many concepts should I design?"` with
+`ask: {k: "concept_count", options: [3, 5, 7, 10], default: 3}` — one question, no AI code call. With a count:
+
+- **1–4**: that many concepts are written now, at most four AI calls at a time; the /chat time budget
+  (`IDRIS_CAD_BUDGET_S`) is shared, and a concept it cannot reach comes back `ok: false` with
+  `"time budget used up"` instead of quietly missing;
+- **5–10**: the concepts do not fit in one chat reply, so `/chat` starts `POST /design/job` with the same
+  `concept_count` and returns **202** with `job_id` and `poll`; the job writes them in the background and
+  `GET /design/job/<job_id>` returns `result.concepts` (label `Not validated`: nothing is built or checked until
+  the browser does it);
+- every AI call goes through `ai_budget`; when the budget runs out mid-way, the remaining concepts are returned
+  `ok: false` with that reason.
+
+A follow-up (`context.pending_cad`), a repair (`context.cad_error`) and a change to the open part
+(`context.current_cad`) are never asked, and neither is a library, primitive, gearbox or assembly route: those are
+about a design that already exists. `IDRIS_CONCEPTS=0` turns the question off and keeps the old one-design path.
+
 ### Material table: every density and strength names its source
 
 `physics/part_fea.py` holds the material table the UI selector reads and `POST /part-check` accepts
@@ -263,6 +303,56 @@ Three solvers were added, each with published benchmarks that `GET /verify/<name
 reason it does not exist and what would unblock it). Planned today: `drop_test` (decision and reasoning in
 `docs/P2-drop-test-decision.md`), `topology_simp_3d` (a qualitative MBB picture is not the quantitative benchmark
 IDRIS requires), `buckling_plate` (the shell element has no geometric stiffness yet) and `cfd_3d`.
+## Export to SolidWorks: what can be written and what cannot (v0.39)
+
+A native **`.SLDPRT` cannot be written** without SolidWorks or its licensed API. IDRIS does not claim to. What a
+buyer can be given instead:
+
+- **STEP AP242** (`POST /exchange/step-ap242`) — the same faceted geometry as the AP214 export, but written as an
+  AP242 file with one named `PRODUCT` per part, a `COLOUR_RGB` per part attached through `STYLED_ITEM`, millimetre
+  units stated in the geometric context, and an assembly tree: one `NEXT_ASSEMBLY_USAGE_OCCURRENCE` plus a
+  `REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION` per instance, so each part lands at its own rotation and
+  translation. Faces stay planar polygons — a bore is a polygon, not an analytic cylinder.
+  Self-check: every `#id` reference resolves, every edge is used once per direction, and the file is read back
+  (products, solid count, volumes by the divergence theorem) before it is returned. Reading it with OpenCascade
+  could not be done here: `OCP` is not installed in this environment, so that check is reported as not run.
+- **"Rebuild in SolidWorks" macro** (`POST /exchange/solidworks-macro`) — a VBA module generated from the IDRIS
+  feature graph: one sketch per sketch feature (with real `AddDimension2` dimensions, values in metres because that
+  is the API unit), `FeatureExtrusion2` for extrudes, `FeatureRevolve2`, `FeatureFillet3`, a circular cut for a
+  hole, and linear/circular patterns. Features with no mapping (an imported solid, an opaque part) are skipped and
+  written into the macro as `' NOT TRANSLATED` comments and into the export report. A part written by the AI as
+  code has no feature tree at all: for that, only STEP is offered, and the endpoint says so.
+
+**Not tested in SolidWorks.** There is no SolidWorks in this environment, so the macro is checked only for VBA
+structure (balanced blocks, only VBA statements, `Application.SldWorks` present) and for content (every feature is
+either an API call or a stated skip). Someone with SolidWorks has to run it once and confirm the rebuild. The
+endpoint returns `not_executed` saying exactly that.
+
+DWG is still not written: the drawing export is DXF (see the Drawing route).
+
+## DFM for any part: measured, not guessed (v0.39)
+
+`POST /dfm/part` takes the same triangle mesh as `POST /part-check` plus `process` (cnc, fdm, sls, sheet, weld,
+cast) and `material`, and answers with findings that each carry a number, a limit and the limit's source:
+
+- **wall thickness** — measured, not read from a parameter list: rays are cast from the surface along the inward
+  face normal through a voxel grid until the solid ends. The answer carries `resolution_mm` (one voxel) next to
+  the numbers, because that is the measurement's own uncertainty; a wall the ray never leaves is reported as *at
+  least* so long. Statistics: min, 5th percentile (what the limit is compared with), median, max.
+- **hole diameters** — checked against the DIN 338 / ISO 235 twist-drill series *when the caller declares the
+  holes*. A hole cannot be recognised reliably in a faceted mesh (a bore, a slot and a tessellation artefact look
+  alike), so an undeclared hole is `not_checked`, never a pass.
+- **overhang** (FDM) — the share of the surface whose normal leans more than 45 deg from the build direction.
+- **draft** (cast) — the share of the surface within 1 deg of parallel to the pull direction.
+- **undercuts, tool access, inside corner radius** — `not_checked` with the reason: they need the solid and the
+  sketch, not just the triangles.
+
+Limits keep their status: the weld fillet leg (AWS D1.1 Table 7.7) and the drill series are quoted from a
+standard and can fail a part; the wall minimums per process (including the new SLS and casting rows) and the
+overhang/draft angles are workshop guidelines, so they are **warnings**, never failures. `wall.thickness` per
+vertex is returned for the Studio's colour map.
+
+What it is not: no cost, no cycle time, no tolerance stack-up, and no feature recognition.
 
 ## Fidelity, honestly
 
