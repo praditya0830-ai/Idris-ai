@@ -15,6 +15,9 @@ from . import bearing_life    # noqa: F401
 from . import mesh_convergence  # noqa: F401
 from . import gear_pair_iso   # noqa: F401
 from . import part_fea        # noqa: F401
+from . import modal_part      # noqa: F401  (P2a: modal analysis of any part)
+from . import buckling_beam   # noqa: F401  (P2b: eigen-buckling of a slender member)
+from . import pipe_flow       # noqa: F401  (P2e: pipe flow, Darcy-Weisbach + Colebrook)
 from . import dfm_part        # noqa: F401  (P3: DFM of any part from its mesh)
 
 try:                                    # new in v0.33; a fault here must not take the other solvers down

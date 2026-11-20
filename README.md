@@ -20,6 +20,9 @@ limitations; physics is never delegated to an LLM.
 | Static FEA / natural frequencies / thermal, as pollable jobs | `POST /fea`, `/modal`, `/cfd` |
 | Design review: interference, fits, DFM, assembly | `POST /review` |
 | FEA for an arbitrary part mesh | `POST /part-check` |
+| Natural frequencies and mode shapes of any part mesh | `POST /solve/modal_part_3d` |
+| Eigen-buckling of a slender member (the four Euler column cases) | `POST /solve/buckling_beam` |
+| Pipe flow: friction factor, Darcy-Weisbach pressure drop, regimes | `POST /solve/pipe_flow_darcy` |
 | STEP AP242 with named products, colours, mm units and an assembly tree | `POST /exchange/step-ap242` |
 | SolidWorks VBA macro that rebuilds the feature tree as parametric features | `POST /exchange/solidworks-macro` |
 | Manufacturability of any part from its mesh: measured wall thickness, overhang, draft, drill series | `POST /dfm/part` |
@@ -278,6 +281,28 @@ Two limits are stated, not hidden: `stainless` is 304 at the **standard minimum*
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.
 
+## New solvers in v0.39, and what is still "Not yet"
+
+Three solvers were added, each with published benchmarks that `GET /verify/<name>` runs live:
+
+- **`modal_part_3d`** — natural frequencies of any part from its mesh, on the same voxel engine as
+  `/part-check`. Benchmarked against Euler-Bernoulli for a cantilever (Blevins Table 8-1) and a square plate with
+  all four edges clamped (Leissa, NASA SP-160; $\omega a^2\sqrt{\rho h/D} = 35.99$), both within 5 %/4 %. It reports
+  the voxel volume error and says that clamped supports make it an upper bound for a bolted joint. It does not
+  compute forced response or any electromagnetic excitation: only the structure's own frequencies.
+- **`buckling_beam`** — linear eigen-buckling of a slender prismatic member from a beam-column finite element
+  (bending stiffness + geometric stiffness). All four Euler column cases are benchmarks and all four come out
+  exact to the printed value: K = 2, 1, 0.699, 0.5. It says in the answer that linear buckling ignores
+  imperfections and is therefore an **upper bound**, and that it cannot do plate/shell buckling, torsion or
+  lateral-torsional buckling of an open section.
+- **`pipe_flow_darcy`** — Darcy-Weisbach with `f = 64/Re` below Re 2300 and Colebrook above Re 4000, plus a sum
+  of minor-loss K values. Benchmarked against Hagen-Poiseuille (exact) and two Colebrook factors read off the
+  Moody chart. The transitional band 2300 < Re < 4000 is reported as *transitional* and flagged, not used.
+
+`GET /solvers` now answers with two lists: `solvers` (registered, benchmarked) and `planned` (named, with the
+reason it does not exist and what would unblock it). Planned today: `drop_test` (decision and reasoning in
+`docs/P2-drop-test-decision.md`), `topology_simp_3d` (a qualitative MBB picture is not the quantitative benchmark
+IDRIS requires), `buckling_plate` (the shell element has no geometric stiffness yet) and `cfd_3d`.
 ## Export to SolidWorks: what can be written and what cannot (v0.39)
 
 A native **`.SLDPRT` cannot be written** without SolidWorks or its licensed API. IDRIS does not claim to. What a
@@ -304,6 +329,7 @@ either an API call or a stated skip). Someone with SolidWorks has to run it once
 endpoint returns `not_executed` saying exactly that.
 
 DWG is still not written: the drawing export is DXF (see the Drawing route).
+
 ## DFM for any part: measured, not guessed (v0.39)
 
 `POST /dfm/part` takes the same triangle mesh as `POST /part-check` plus `process` (cnc, fdm, sls, sheet, weld,
