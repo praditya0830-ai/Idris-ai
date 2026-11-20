@@ -389,9 +389,11 @@ def test_unlisted_material_is_named_not_silently_replaced():
     raw = json.loads(json.dumps(GOOD))
     raw["material"] = "steel"
     cad, errs, warns = cg.validate(raw, MSG + ", cast iron")
-    assert not errs and any("Cast iron is not in the IDRIS material list" in w and "steel" in w for w in warns)
+    # UI v65: cast iron is in the solver table now, so the warning says that instead of pretending it is nowhere
+    assert not errs and any("Cast iron is not in the Studio density table" in w and "steel" in w for w in warns)
+    assert any("cast_iron" in w and "7200" in w for w in warns)
     cad, errs, warns = cg.validate(json.loads(json.dumps(GOOD)), MSG)
-    assert not any("material list" in w for w in warns)
+    assert not any("density table" in w or "material list" in w for w in warns)
 
 
 def test_concepts_are_written_in_parallel_and_keep_the_user_sizes(monkeypatch):

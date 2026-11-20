@@ -25,19 +25,120 @@ import numpy as np
 
 from physics.fem3d import VoxelModel
 
-# typical handbook values (screening). E [MPa], nu, yield [MPa], density [kg/m^3]
+# Typical handbook values for screening. E [MPa], nu [-], Sy [MPa], rho [kg/m^3].
+# Every row says where its density and its strength come from (`source`), because a mass or a safety factor
+# without a source is a guess with a decimal point. `Sy` is the 0.2 % proof stress for metals that yield; cast
+# iron does not yield, so its row carries the minimum tensile strength and says so (`brittle`).
 MATERIALS = {
-    "aluminium": {"name": "Aluminium 6061-T6", "E": 68900.0, "nu": 0.33, "Sy": 276.0, "rho": 2700.0},
-    "steel": {"name": "Structural steel S235", "E": 210000.0, "nu": 0.3, "Sy": 235.0, "rho": 7850.0},
-    "stainless": {"name": "Stainless 304 (annealed)", "E": 193000.0, "nu": 0.29, "Sy": 215.0, "rho": 8000.0},
-    "titanium": {"name": "Ti-6Al-4V", "E": 114000.0, "nu": 0.34, "Sy": 880.0, "rho": 4430.0},
-    "brass": {"name": "Brass CW614N", "E": 97000.0, "nu": 0.34, "Sy": 200.0, "rho": 8470.0},
-    "pla": {"name": "PLA (FDM, 100 % infill)", "E": 3500.0, "nu": 0.36, "Sy": 45.0, "rho": 1240.0},
-    "abs": {"name": "ABS (FDM, 100 % infill)", "E": 2200.0, "nu": 0.35, "Sy": 35.0, "rho": 1050.0},
-    "nylon": {"name": "Nylon PA12 (FDM/SLS)", "E": 1700.0, "nu": 0.39, "Sy": 45.0, "rho": 1010.0},
+    "aluminium": {"name": "Aluminium 6061-T6", "E": 68900.0, "nu": 0.33, "Sy": 276.0, "rho": 2700.0,
+                  "source": {"density": "ASM Handbook Vol. 2: 6061-T6, 2.70 g/cm^3",
+                             "strength": "ASM Handbook Vol. 2: 6061-T6, Rp0.2 276 MPa",
+                             "stiffness": "ASM Handbook Vol. 2: 6061-T6, E 68.9 GPa"}},
+    "steel": {"name": "Structural steel S235", "E": 210000.0, "nu": 0.3, "Sy": 235.0, "rho": 7850.0,
+              "source": {"density": "EN 10025-2 S235JR: 7.85 g/cm^3",
+                         "strength": "EN 10025-2 S235JR: ReH min 235 MPa (t <= 16 mm)",
+                         "stiffness": "EN 10025-2: E 210 GPa"}},
+    "stainless": {"name": "Stainless 304 (annealed)", "E": 193000.0, "nu": 0.29, "Sy": 205.0, "rho": 8000.0,
+                  "source": {"density": "ASM Handbook Vol. 2: AISI 304, 8.00 g/cm^3",
+                             "strength": "ASTM A240/A276 304: Rp0.2 min 205 MPa (annealed)",
+                             "stiffness": "ASM Handbook Vol. 2: AISI 304, E 193 GPa"}},
+    "titanium": {"name": "Ti-6Al-4V", "E": 114000.0, "nu": 0.34, "Sy": 880.0, "rho": 4430.0,
+                 "source": {"density": "ASM Handbook Vol. 2: Ti-6Al-4V, 4.43 g/cm^3",
+                            "strength": "ASM Handbook Vol. 2: Ti-6Al-4V annealed, Rp0.2 880 MPa",
+                            "stiffness": "ASM Handbook Vol. 2: Ti-6Al-4V, E 114 GPa"}},
+    "brass": {"name": "Brass CW614N (CuZn39Pb3)", "E": 97000.0, "nu": 0.34, "Sy": 200.0, "rho": 8470.0,
+              "source": {"density": "EN 12164 CW614N: 8.47 g/cm^3",
+                         "strength": "EN 12164 CW614N: Rp0.2 is temper dependent (about 200-450 MPa); "
+                                     "200 MPa is the softest temper, a lower bound",
+                         "stiffness": "EN 12164 CW614N: E about 97 GPa"}},
+    "cast_iron": {"name": "Cast iron GJL-250 (grey)", "E": 105000.0, "nu": 0.26, "Sy": 250.0, "rho": 7200.0,
+                  "brittle": True,
+                  "source": {"density": "EN 1561 GJL-250: 7.20 g/cm^3",
+                             "strength": "EN 1561 GJL-250: Rm min 250 MPa in tension. Brittle: there is no yield "
+                                         "point, so the safety factor here is Rm / von Mises, not a yield check",
+                             "stiffness": "EN 1561 GJL-250: E 105 GPa (105-120 GPa for grey iron)"}},
+    "pla": {"name": "PLA (FDM, 100 % infill)", "E": 3500.0, "nu": 0.36, "Sy": 45.0, "rho": 1240.0,
+            "source": {"density": "filament datasheets: PLA 1.24 g/cm^3",
+                       "strength": "filament datasheets: tensile about 45 MPa printed at 100 % infill; no standard "
+                                   "specimen, and the bond between layers is weaker",
+                       "stiffness": "filament datasheets: E about 3.5 GPa"}},
+    "abs": {"name": "ABS (FDM, 100 % infill)", "E": 2200.0, "nu": 0.35, "Sy": 35.0, "rho": 1050.0,
+            "source": {"density": "filament datasheets: ABS 1.05 g/cm^3",
+                       "strength": "filament datasheets: tensile about 35 MPa printed at 100 % infill; no standard "
+                                   "specimen, and the bond between layers is weaker",
+                       "stiffness": "filament datasheets: E about 2.2 GPa"}},
+    "nylon": {"name": "Nylon PA12 (SLS/FDM)", "E": 1700.0, "nu": 0.39, "Sy": 45.0, "rho": 1010.0,
+              "source": {"density": "EOS PA 2200 datasheet: 1.01 g/cm^3",
+                         "strength": "EOS PA 2200 datasheet: tensile 45-48 MPa (dry); 45 MPa is used, and a wet "
+                                     "part is weaker",
+                         "stiffness": "EOS PA 2200 datasheet: E 1.7 GPa"}},
 }
 MATERIAL_NOTE = ("Typical handbook values for screening; printed plastics depend strongly on infill, layer "
-                 "direction and temperature (FDM parts are weaker across layers). Use certified data for sign-off.")
+                 "direction and temperature (FDM parts are weaker across layers). Use certified data for sign-off."
+                 " Cast iron GJL-250 is brittle: its reported safety factor is tensile strength / von Mises, not a "
+                 "yield check.")
+
+
+# ------------------------------------------------------------------ strength criterion
+# A ductile metal is judged by von Mises against its proof stress. A brittle material has no proof stress: it
+# fails when the largest PRINCIPAL stress in tension reaches its tensile strength (Rankine), and a von Mises
+# number compared with "yield" would report a factor that means nothing. Each row says which number it used.
+CRITERIA = {
+    "von_mises": {"id": "von_mises",
+                  "label": "von Mises equivalent stress vs Rp0.2 (ductile yielding)",
+                  "stress_measure": "von Mises equivalent stress", "strength_symbol": "Rp0.2",
+                  "strength_basis": "0.2 % proof stress (the material yields before it breaks)"},
+    "rankine": {"id": "rankine",
+                "label": "Rankine: max principal stress vs Rm (brittle fracture)",
+                "stress_measure": "largest principal stress (tension only)", "strength_symbol": "Rm",
+                "strength_basis": "minimum tensile strength Rm; this material does not yield"},
+}
+
+
+def criterion_for(mat: dict) -> dict:
+    """Which criterion this material is judged by (`brittle: true` -> Rankine against Rm)."""
+    return dict(CRITERIA["rankine" if (mat or {}).get("brittle") else "von_mises"])
+
+
+def principal_stresses(s):
+    """Principal stresses of each row of [sx, sy, sz, txy, tyz, tzx] (the order fem3d.von_mises reads).
+
+    Descending: [:, 0] is the largest (most tensile) principal stress, [:, 2] the most compressive.
+    """
+    s = np.asarray(s, float).reshape(-1, 6)
+    m = np.empty((len(s), 3, 3))
+    m[:, 0, 0], m[:, 1, 1], m[:, 2, 2] = s[:, 0], s[:, 1], s[:, 2]
+    m[:, 0, 1] = m[:, 1, 0] = s[:, 3]
+    m[:, 1, 2] = m[:, 2, 1] = s[:, 4]
+    m[:, 0, 2] = m[:, 2, 0] = s[:, 5]
+    return np.linalg.eigvalsh(m)[:, ::-1]
+
+
+def safety(mat: dict, vm_max: float, s1_max: float, s3_min: float | None = None) -> dict:
+    """-> {criterion, critical_stress_MPa, min_safety_factor, safety_note}. None when a factor cannot be one.
+
+    Rankine is a tensile criterion, so a load case with no tension anywhere is not limited by it -- that is said
+    in `safety_note` instead of printing a huge number that looks like a result. When compression is what the part
+    is really doing, the note says so, and says that cast iron is stronger there: the compressive strength is not
+    in this table, so it is not used, and the tensile factor must not be read as a limit on that side.
+    """
+    crit = criterion_for(mat)
+    strength = float((mat or {}).get("Sy") or 0.0)
+    stress = float(s1_max if crit["id"] == "rankine" else vm_max)
+    if crit["id"] == "rankine" and stress <= 0:
+        return {"criterion": crit, "critical_stress_MPa": round(stress, 4), "min_safety_factor": None,
+                "safety_note": ("no tensile principal stress anywhere, so Rankine does not limit this part; a "
+                                "compressive criterion for brittle materials is not in IDRIS yet")}
+    factor = strength / stress if stress > 1e-12 else None
+    note = None
+    if factor is None:
+        note = "the stress is zero, so no factor can be computed"
+    elif crit["id"] == "rankine" and s3_min is not None and float(s3_min) < 0 and abs(float(s3_min)) > stress:
+        note = (f"compression dominates here: the most compressive principal stress is {abs(float(s3_min)):.1f} MPa "
+                f"against {stress:.1f} MPa in tension. Cast iron is stronger in compression, so that strength is "
+                f"not used and this factor is the tensile (conservative) one")
+    return {"criterion": crit, "critical_stress_MPa": round(stress, 4), "min_safety_factor": factor,
+            "safety_note": note}
 
 
 def material_catalog():
@@ -222,21 +323,30 @@ def run(p: dict, progress=lambda *a, **k: None, _h=None) -> dict:
     r = model.solve(mat["E"], mat["nu"], fixed, loads,
                     progress=lambda it, res: progress("Solving", min(0.85, 0.2 + 0.65 * it / (it + 400))))
     vm = r["von_mises"]
+    pr = principal_stresses(r["stress"])                    # nodal, descending
     disp = np.linalg.norm(r["u"], axis=1)
     reac = r["reactions"][fixed].sum(0)
     app = loads.sum(0)
     bal = float(np.linalg.norm(reac + app) / (np.abs(loads).sum() or 1.0))
     vmax = float(vm.max())
     v995 = float(np.percentile(r["von_mises_elem"], 99.5))
-    sf = mat["Sy"] / max(vmax, 1e-12)
+    s1 = float(pr[:, 0].max())                                 # largest principal stress = most tensile
+    s3 = float(pr[:, 2].min())
+    safe = safety(mat, vm_max=vmax, s1_max=s1, s3_min=s3)
+    sf = safe["min_safety_factor"]
     vvox = float(model.evol.sum())
     pos = model.nodes[ids]
     surface = {"positions": np.round(pos, 2).ravel().tolist(), "indices": tris.ravel().tolist(),
                "von_mises": np.round(vm[ids], 2).tolist(),
+               "principal_max": np.round(pr[ids, 0], 2).tolist(),
                "displacement": np.round(r["u"][ids], 5).ravel().tolist()}
     return {
         "surface": surface, "material": mat, "yield_mpa": mat["Sy"],
+        "criterion": safe["criterion"], "critical_stress_MPa": safe["critical_stress_MPa"],
+        "strength_MPa": mat["Sy"], "strength_basis": safe["criterion"]["strength_basis"],
+        "safety_note": safe["safety_note"],
         "max_von_mises_MPa": vmax, "von_mises_p995_MPa": v995, "max_displacement_mm": float(disp.max()),
+        "max_principal_MPa": s1, "min_principal_MPa": s3,
         "min_safety_factor": sf,
         "mesh": {"type": "hex8-im voxel", "element_size_mm": round(float(h), 4), "elements": ne,
                  "nodes": model.n_nodes, "surface_triangles": int(len(tris)), "fixed_nodes": int(len(fixed))},

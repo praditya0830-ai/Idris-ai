@@ -22,13 +22,15 @@ limitations; physics is never delegated to an LLM.
 | FEA for an arbitrary part mesh | `POST /part-check` |
 | STEP AP242 with named products, colours, mm units and an assembly tree | `POST /exchange/step-ap242` |
 | SolidWorks VBA macro that rebuilds the feature tree as parametric features | `POST /exchange/solidworks-macro` |
+| Manufacturability of any part from its mesh: measured wall thickness, overhang, draft, drill series | `POST /dfm/part` |
 | Standard-part library and catalogs, with ISO sources | `GET /library`, `/catalog` |
-| Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`) | `GET /materials` |
+| Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`), with a source on every row | `physics/part_fea.py` (`material_catalog()`); the ids are what `POST /part-check` accepts |
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
 | Chat → requirements or CAD code (LLM, with built-in fallback parser) | `POST /chat` |
 | Chat: a whole product becomes a plan of parts, and the part-by-part job starts only after the engineer says Start | `POST /chat`, `POST /assembly/plan`, `POST /assembly/design` |
 | Calculation references (formula + source) stored as candidates | `GET /references/db`, `/references/db/<slug>` |
-| Free-form design as a background job, with every check it ran | `POST /design/job`, `GET /design/job/<job_id>` |
+| Free-form design as a background job, with every check it ran and the code the browser must build (`waiting_cad`) | `POST /design/job`, `GET /design/job/<job_id>` |
+| How many design concepts to compare (3 / 5 / 7 / 10), asked before any code is written | `POST /chat` with `concept_count` |
 | One door to check the reference lookup, and a self-test of it | `GET /references/status`, `/references/selftest` |
 | Live solver benchmarks vs published reference values | `GET /verify` |
 | End-to-end check of the three demo scenarios | `GET /selfcheck` |
@@ -197,6 +199,82 @@ guard is bypassed:
 body, and `GET /assembly/design/<job_id>` shows each part as it finishes. The assembly as one system is still not
 analysed: the block says what was not checked.
 
+### The orientation contract of a placed part (UI v65)
+
+`origin_mm` alone is not a placement: a part can sit at the right point and still be turned wrong, and with only
+`axis` it is free to spin about that axis. Every frame therefore carries both directions, in assembly coordinates:
+
+- `axis` — where the part's own **+Z** points;
+- `x_axis` — where its own **+X** points; it may not be parallel to `axis` (the plan is refused with the reason,
+  because the part would still be free to spin);
+- `y_axis` — computed as `axis × x_axis`, so the three are a right-handed unit basis the Studio builds a rotation
+  from. A sloppy `x_axis` is projected perpendicular to `axis` first, so the basis is always orthonormal.
+
+When a plan names no `x_axis`, one is derived from the world axis least aligned with `axis` and the frame says
+`x_axis_source: "derived"` — deterministic, but not a decision the engineer made, and the reply never pretends
+otherwise. `GET /assembly/design/<job_id>` returns the same three vectors per part, plus
+`assembly.frame_contract`. IDRIS checks geometry and interference; it does not verify that the planned orientation
+is the one the product needs.
+
+### `context.shape_family`: the Studio's own family for one part (UI v65)
+
+`POST /chat` accepts `context.shape_family = {name, principle, design_space}` — the family the Studio can edit
+("l_bracket", "two legs at 90 degrees carry the load into the wall", `{L: [20, 80], leg_t: 3}`). It is checked
+before it reaches a prompt: name (≤ 60 chars), principle (≤ 400), and a design space of numbers, strings, booleans
+or lists of at most 8 of them (≤ 24 entries, ≤ 2000 characters). The accepted family is added to the CAD writer's
+user block, and the answer carries `shape_family: {used, name, principle, design_space, applied_to, not_checked}`.
+A family that cannot be read is **dropped**, and the answer says why (`{used: false, why}`) instead of half-using it.
+An assembly answer says it was not applied, because parts are designed one at a time.
+
+What this does not do: nothing verifies that the generated code stays inside the design space, that its parameters
+match the family, or that the family is the right one for the load. `not_checked` in the reply says exactly that.
+
+### The design job and the browser: `waiting_cad` (UI v66 A)
+
+A design job and the Studio each do half of the work: the job writes code, the browser builds it, measures it and
+runs the strength check. `GET /design/job/<job_id>` therefore says not only that it is waiting, but for what:
+
+- `waiting_for` — `"browser_build"` or `"fea"`, with `waiting_round` and `waiting_s`;
+- `waiting_cad` — the **contract of that round**, the same `cad` object `/chat` returns (`params`, `code`,
+  `expect`, `requirements`, `steps`, `concept` when there is one), so the Studio can build exactly that;
+- `waiting_cad_hash` — sha256 of the round's code. `POST /design/job/<id>/feedback` accepts an optional `cad_hash`;
+  a hash from another round is refused with **409** and the hash the job is waiting for, so numbers measured on one
+  code are never counted for another (omitting it still works, for an older Studio);
+- `rounds_data` — one entry per finished round: `{round, cad_hash, label, checks, changed}`. `changed` lists the
+  parameters a repair really changed (`{param, from, to, why}`, `why` being the failed check or FEA number that
+  caused it). The full code of old rounds is not repeated; only the round being waited for and the final
+  `result.cad` carry code, so a status polled every second stays small.
+
+### How many concepts? (UI v66 B)
+
+`POST /chat` accepts a top-level **`concept_count`** (integer 1–10). A fresh free design with no `concept_count`
+writes **no code**: the answer is `"How many concepts should I design?"` with
+`ask: {k: "concept_count", options: [3, 5, 7, 10], default: 3}` — one question, no AI code call. With a count:
+
+- **1–4**: that many concepts are written now, at most four AI calls at a time; the /chat time budget
+  (`IDRIS_CAD_BUDGET_S`) is shared, and a concept it cannot reach comes back `ok: false` with
+  `"time budget used up"` instead of quietly missing;
+- **5–10**: the concepts do not fit in one chat reply, so `/chat` starts `POST /design/job` with the same
+  `concept_count` and returns **202** with `job_id` and `poll`; the job writes them in the background and
+  `GET /design/job/<job_id>` returns `result.concepts` (label `Not validated`: nothing is built or checked until
+  the browser does it);
+- every AI call goes through `ai_budget`; when the budget runs out mid-way, the remaining concepts are returned
+  `ok: false` with that reason.
+
+A follow-up (`context.pending_cad`), a repair (`context.cad_error`) and a change to the open part
+(`context.current_cad`) are never asked, and neither is a library, primitive, gearbox or assembly route: those are
+about a design that already exists. `IDRIS_CONCEPTS=0` turns the question off and keeps the old one-design path.
+
+### Material table: every density and strength names its source
+
+`physics/part_fea.py` holds the material table the UI selector reads and `POST /part-check` accepts
+(`aluminium`, `steel`, `stainless`, `titanium`, `brass`, `cast_iron`, `pla`, `abs`, `nylon`). Each row carries
+`source: {density, strength, stiffness}` — ASM Handbook Vol. 2, EN 10025-2, ASTM A240, EN 12164, EN 1561, filament
+and `EOS PA 2200` datasheets — so a mass or a safety factor can be traced back to a page instead of a habit.
+Two limits are stated, not hidden: `stainless` is 304 at the **standard minimum** (`Rp0.2 ≥ 205 MPa`, annealed), and
+`cast_iron` (GJL-250) does not yield, so its reported safety factor is `Rm / von Mises` and its row says so
+(`brittle: true`). Printed plastics are datasheet values at 100 % infill; a real FDM part is weaker across layers.
+
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.
 
@@ -226,6 +304,29 @@ either an API call or a stated skip). Someone with SolidWorks has to run it once
 endpoint returns `not_executed` saying exactly that.
 
 DWG is still not written: the drawing export is DXF (see the Drawing route).
+## DFM for any part: measured, not guessed (v0.39)
+
+`POST /dfm/part` takes the same triangle mesh as `POST /part-check` plus `process` (cnc, fdm, sls, sheet, weld,
+cast) and `material`, and answers with findings that each carry a number, a limit and the limit's source:
+
+- **wall thickness** — measured, not read from a parameter list: rays are cast from the surface along the inward
+  face normal through a voxel grid until the solid ends. The answer carries `resolution_mm` (one voxel) next to
+  the numbers, because that is the measurement's own uncertainty; a wall the ray never leaves is reported as *at
+  least* so long. Statistics: min, 5th percentile (what the limit is compared with), median, max.
+- **hole diameters** — checked against the DIN 338 / ISO 235 twist-drill series *when the caller declares the
+  holes*. A hole cannot be recognised reliably in a faceted mesh (a bore, a slot and a tessellation artefact look
+  alike), so an undeclared hole is `not_checked`, never a pass.
+- **overhang** (FDM) — the share of the surface whose normal leans more than 45 deg from the build direction.
+- **draft** (cast) — the share of the surface within 1 deg of parallel to the pull direction.
+- **undercuts, tool access, inside corner radius** — `not_checked` with the reason: they need the solid and the
+  sketch, not just the triangles.
+
+Limits keep their status: the weld fillet leg (AWS D1.1 Table 7.7) and the drill series are quoted from a
+standard and can fail a part; the wall minimums per process (including the new SLS and casting rows) and the
+overhang/draft angles are workshop guidelines, so they are **warnings**, never failures. `wall.thickness` per
+vertex is returned for the Studio's colour map.
+
+What it is not: no cost, no cycle time, no tolerance stack-up, and no feature recognition.
 
 ## Fidelity, honestly
 

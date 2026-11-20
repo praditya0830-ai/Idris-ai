@@ -66,6 +66,9 @@ def _release_slot() -> None:
 
 NOT_CHECKED = ("kinematics of the assembly, loads between parts, and the assembly as one system: IDRIS checks "
                "geometry, interference and each part on its own")
+FRAME_CONTRACT = ("a part is placed at origin_mm and turned so its own +Z points along axis and its own +X along "
+                  "x_axis; y_axis = axis x x_axis. x_axis_source says whether the plan chose x_axis or it was derived "
+                  "(derived means the part could have been turned differently about axis)")
 
 
 def average_s() -> float:
@@ -142,16 +145,21 @@ def design_parts(plan: dict, designer=None, provider=None, on_event=None) -> tup
 
 
 def assembly_of(plan: dict, parts: list) -> dict:
-    """Place every part at its frame. A pile of parts is not an analysis: the note says what was not checked."""
+    """Place every part at its frame. A pile of parts is not an analysis: the note says what was not checked.
+
+    Every placed part carries the full orientation (origin_mm + axis/x_axis/y_axis as unit vectors), not just a
+    direction, so the Studio can rotate a part as well as move it; see assembly_plan.basis for where x_axis comes
+    from and why a missing one is marked "derived".
+    """
     frames = {f["part_id"]: f for f in plan.get("frames") or []}
     placed = []
     for p in parts:
-        f = frames.get(p["id"]) or {}
-        placed.append({"id": p["id"], "name": p["name"], "origin_mm": f.get("origin_mm") or [0, 0, 0],
-                       "axis": f.get("axis") or [0, 0, 1], "status": p["status"],
-                       "fidelity": p.get("fidelity")})
+        fr = assembly_plan.placed_frame(frames.get(p["id"]) or {})
+        placed.append({"id": p["id"], "name": p["name"], "status": p["status"],
+                       "fidelity": p.get("fidelity"), **fr})
     return {"parts": placed, "interfaces": plan.get("interfaces") or [],
             "frames_complete": all(p["id"] in frames for p in parts),
+            "frame_contract": FRAME_CONTRACT,
             "not_checked": NOT_CHECKED}
 
 

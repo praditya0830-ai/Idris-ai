@@ -20,11 +20,15 @@ import os
 import re
 
 import llm
+import shape_family
 
 KINDS = ("functional", "interface", "styling")
 PROCESSES = ("fdm", "cnc", "sheet", "weld")
 MATERIALS = ("aluminium", "steel", "stainless", "titanium", "brass", "pla", "abs", "nylon")
-# materials engineers name that the Studio density table does not have yet: say so instead of a silent wrong mass
+# materials engineers name that the Studio density table does not have yet: say so instead of a silent wrong mass.
+# The solver table (physics/part_fea.MATERIALS) has some of them under its own id; SOLVER_IDS names that id, so the
+# warning can point at the row that does have a sourced density and strength.
+SOLVER_IDS = {"Cast iron": "cast_iron"}
 UNLISTED_MATERIALS = ((("cast iron", "grey iron", "gray iron", "ductile iron", "besi cor", "gjl", "gjs"), "Cast iron"),
                       (("bronze", "perunggu"), "Bronze"), (("copper", "tembaga"), "Copper"),
                       (("magnesium",), "Magnesium"), (("carbon fibre", "carbon fiber", "cfrp", "carbon arm"), "Carbon fibre"),
@@ -285,8 +289,18 @@ def validate(raw: dict, message: str = "") -> tuple:
     low = (message or "").lower()
     for words, name in UNLISTED_MATERIALS:
         if any(w in low for w in words):
-            warns.append(f"{name} is not in the IDRIS material list yet, so mass is computed with "
-                         f"{raw.get('material') or 'the nearest listed material'}; check the mass with the real density")
+            sid = SOLVER_IDS.get(name)
+            used = raw.get("material") or "the nearest listed material"
+            if sid:
+                from physics import part_fea as _pf
+                row = _pf.MATERIALS.get(sid) or {}
+                warns.append(f"{name} is not in the Studio density table yet, so mass is computed with {used}; "
+                             f"check the mass with the real density. The solver table has {sid}: "
+                             f"{row.get('rho', 0):g} kg/m^3, strength {row.get('Sy', 0):g} MPa "
+                             f"(POST /part-check)")
+            else:
+                warns.append(f"{name} is not in the IDRIS material list yet, so mass is computed with {used}; "
+                             f"check the mass with the real density")
             break
     nums = message_numbers(message)
     cad = {"title": str(raw.get("title") or "Part")[:60],
@@ -559,6 +573,11 @@ def _user_block(message: str, context: dict | None) -> str:
         parts.append(f"Design THIS concept: {str(con.get('name'))[:40]}: {str(con.get('idea'))[:160]}. Other concepts "
                      "are written separately, so make this one clearly this concept. Use it as the title. Keep every "
                      "size, material, process and hole the user gave.")
+    # UI v65: the Studio names the family the part belongs to (context.shape_family). It is guidance for this
+    # writer; cad_codegen does not check that the code stays inside it (shape_family.reply says so in the answer).
+    sf = ctx.get("shape_family") if isinstance(ctx.get("shape_family"), dict) else None
+    if sf:
+        parts.append(shape_family.prompt_block(sf))
     err = ctx.get("cad_error") if isinstance(ctx.get("cad_error"), dict) else None
     if err:
         parts.append("Your previous code FAILED in the CAD kernel. Fix it and answer with the full JSON again "
@@ -717,12 +736,22 @@ def failure_text(attempts: list) -> str:
     return head + " Details: " + ("; ".join(parts) or "no answer") + "."
 
 
+CONCEPT_MAX = 10          # UI v66 B: how many concepts an engineer may compare
+CONCEPT_BATCH = 4         # at most four AI calls at the same time, so a small server is not flooded
+
+
 def generate_concepts(message: str, concepts: list, provider: str | None = None,
-                      reply_language: str | None = None) -> dict:
-    """Several design concepts for one request, written in parallel (one AI call each, same time budget).
-    -> {ok, cad (first that passed), concepts: [{name, idea, ok, cad?, answer, attempts}], answer, read_by}."""
+                      reply_language: str | None = None, deadline: float | None = None) -> dict:
+    """Several design concepts for one request, written in stages of four (one AI call each).
+
+    UI v66 B: up to ten concepts, and a concept the time budget (`deadline`) or the AI budget does not reach is
+    returned as `ok: false` with that reason -- never dropped, and never written after the caller has given up.
+    -> {ok, cad (first that passed), concepts: [{name, idea, ok, cad?, answer, error?, attempts}], answer, read_by}
+    """
+    import time
     from concurrent.futures import ThreadPoolExecutor
-    concepts = [c for c in concepts if isinstance(c, dict) and c.get("name")][:3]
+    import ai_budget
+    concepts = [c for c in concepts if isinstance(c, dict) and c.get("name")][:CONCEPT_MAX]
 
     def one(c):
         try:
@@ -736,22 +765,46 @@ def generate_concepts(message: str, concepts: list, provider: str | None = None,
             r["cad"]["title"] = c["name"][:60]
         return {"name": c["name"], "idea": c.get("idea") or "", "ok": bool(r.get("ok")), "cad": r.get("cad"),
                 "answer": r.get("answer"), "attempts": r.get("attempts") or [], "read_by": r.get("read_by")}
-    with ThreadPoolExecutor(max_workers=len(concepts) or 1) as pool:
-        out = list(pool.map(one, concepts))
+    def skipped(c, why: str) -> dict:
+        return {"name": c["name"], "idea": c.get("idea") or "", "ok": False, "cad": None, "answer": why,
+                "error": why, "attempts": []}
+
+    out: list = []
+    for start in range(0, len(concepts), CONCEPT_BATCH):
+        stage = concepts[start:start + CONCEPT_BATCH]
+        todo = []
+        for c in stage:
+            if deadline is not None and time.time() >= deadline:
+                out.append(skipped(c, "time budget used up"))
+                continue
+            why = ai_budget.gate()
+            if why:
+                out.append(skipped(c, "not written: " + why))
+                continue
+            todo.append(c)
+        if todo:
+            with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+                out.extend(pool.map(one, todo))
     good = [c for c in out if c["ok"]]
     if not good:
         return {"ok": False, "concepts": out, "cad": None, "read_by": None,
                 "answer": out[0]["answer"] if out else "No concept could be written."}
     first = good[0]["cad"]
     names = ", ".join(f"{i + 1}. {c['name']}" for i, c in enumerate(out) if c["ok"])
-    lines = [f"IDRIS designed {len(good)} concept{'s' if len(good) > 1 else ''} for your request: {names}. "
+    asked = f" of the {len(out)}" if len(out) > len(good) else ""
+    lines = [f"IDRIS designed {len(good)} concept{'s' if len(good) > 1 else ''}{asked} for your request: {names}. "
              "Open each card to see its shape and sizes; every one keeps the sizes you gave.",
              "Status: geometry checked by the CAD kernel; strength not checked yet."]
-    failed = [c["name"] for c in out if not c["ok"]]
+    failed = [c for c in out if not c["ok"]]
     if failed:
-        lines.append("Not built: " + ", ".join(failed) + " (the AI could not write valid code for it).")
+        lines.append("Not built: " + ", ".join(c["name"] for c in failed) + " (the AI could not write valid code "
+                                                                           "for it).")
+        for c in failed:
+            if c.get("error") in ("time budget used up",) or str(c.get("error") or "").startswith("not written"):
+                lines.append(f"- {c['name']}: {c['error']}.")
     lines.append(requirements_text(first) or "")
     return {"ok": True, "cad": first, "concepts": out, "read_by": first.get("read_by"),
+            "requested": len(concepts), "written": len(good),
             "answer": "\n".join(x for x in lines if x)}
 
 

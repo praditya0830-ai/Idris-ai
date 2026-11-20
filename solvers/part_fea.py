@@ -16,7 +16,8 @@ def _run(p, progress):
     p = dict(p, _max_elements=MAX_ELEMENTS)
     warnings = [pf.MATERIAL_NOTE,
                 "Voxel mesh: curved faces are stair-stepped; peak stress at sharp corners, small holes and at the "
-                "supports is mesh-dependent (singular) - read von_mises_p995_MPa and the convergence study.",
+                "supports is mesh-dependent (singular) - read von_mises_p995_MPa, max_principal_MPa and the "
+                "convergence study; the safety factor is the peak stress / strength of the criterion above.",
                 "Supports are fully clamped (no sliding, no bolt flexibility); loads are spread evenly over the "
                 "selected area."]
     try:
@@ -24,12 +25,21 @@ def _run(p, progress):
     except ValueError as e:
         return {"ok": False, "errors": [str(e)]}
     df = float(p.get("design_factor") or 2.0)
+    crit = o.get("criterion") or {}
+    sf = o.get("min_safety_factor")
     o["design_factor"] = df
-    o["margin_of_safety"] = o["min_safety_factor"] / df - 1
-    checks = [Check("part safety factor on yield (peak von Mises)", o["min_safety_factor"], df, "-", "min"),
-              Check("force equilibrium error", o["equilibrium_error"], 1e-3, "-", "max", "solver self-check"),
-              Check("voxel volume error", abs(o["volume"]["error_pct"]), 5.0, "%", "max",
-                    "geometry fidelity of the voxel mesh vs the exact part volume")]
+    o["margin_of_safety"] = (sf / df - 1) if sf is not None else None
+    # the label travels with the number: a brittle part is not judged on yield, and the check says which rule it is
+    warnings.append(f"Strength criterion: {crit.get('label')}; strength {o['strength_MPa']:g} MPa "
+                    f"({crit.get('strength_basis')}).")
+    checks = []
+    if sf is not None:
+        checks.append(Check(f"part safety factor \u2014 {crit.get('label')}", sf, df, "-", "min"))
+    else:
+        warnings.append(o.get("safety_note") or "no safety factor was computed for this load case")
+    checks += [Check("force equilibrium error", o["equilibrium_error"], 1e-3, "-", "max", "solver self-check"),
+               Check("voxel volume error", abs(o["volume"]["error_pct"]), 5.0, "%", "max",
+                     "geometry fidelity of the voxel mesh vs the exact part volume")]
     if p.get("max_deflection_mm"):
         checks.append(Check("max deflection", o["max_displacement_mm"], float(p["max_deflection_mm"]), "mm", "max"))
     if p.get("convergence_study"):
@@ -57,7 +67,7 @@ def _run(p, progress):
             r.pop("surface", None)
     if abs(o["volume"]["error_pct"]) > 5:
         warnings.append(f"Voxel volume differs {o['volume']['error_pct']:+.1f} % from the part: refine element_size_mm.")
-    if o["margin_of_safety"] < 0:
+    if o["margin_of_safety"] is not None and o["margin_of_safety"] < 0:
         warnings.append(f"Margin of safety {o['margin_of_safety']:.2f} < 0 at design factor {df:g}.")
     progress("Post-processing", 1.0)
     return {"outputs": o, "checks": checks, "warnings": warnings}
