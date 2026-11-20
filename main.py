@@ -199,8 +199,8 @@ class Handler(BaseHTTPRequestHandler):
     def _ace_unavailable(self, path: str) -> bool:
         """If the solver framework failed to import, answer ACE paths with a clear error."""
         p = path.split("?")[0]
-        if ACE_IMPORT_ERROR and (p in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check", "/solvers", "/solvers/tools", "/verify", "/selfcheck")
-                                 or p.startswith(("/fea/", "/modal/", "/cfd/", "/review/", "/part-check/", "/weldment-check/", "/solve/", "/verify/"))):
+        if ACE_IMPORT_ERROR and (p in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check", "/dfm/part", "/solvers", "/solvers/tools", "/verify", "/selfcheck")
+                                 or p.startswith(("/fea/", "/modal/", "/cfd/", "/review/", "/part-check/", "/weldment-check/", "/dfm/", "/solve/", "/verify/"))):
             self._send_json(503, {"success": False, "ok": False,
                                   "error": f"Solver framework failed to load: {ACE_IMPORT_ERROR}"})
             return True
@@ -842,7 +842,8 @@ class Handler(BaseHTTPRequestHandler):
                        "/exchange/step", "/engineer/solve", "/engineer/verify")
         import http_ext                     # Bagian F onward: routes owned by a small module of their own
         base = self.path.split("?")[0]
-        is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check") or base.startswith("/solve/")
+        is_ace = base in ("/fea", "/modal", "/cfd", "/review", "/part-check", "/weldment-check",
+                        "/dfm/part") or base.startswith("/solve/")
         # every route handled below must be listed here (tests/test_routes.py checks it); a module registered in
         # http_ext keeps its own route list, so two sections never have to edit the same tuple
         if base not in POST_ROUTES and not is_ace and not http_ext.known_post(base):
