@@ -33,7 +33,8 @@ from model.graph import Graph, GraphError, regenerate
 
 GET_PATHS = ("/geometry/checks", "/geometry/kernel", "/geometry/selftest", "/engineer/materials")
 POST_PATHS = ("/model/validate", "/model/build", "/assembly/manifest", "/assembly/node",
-              "/exchange/step", "/engineer/solve", "/engineer/verify")
+              "/exchange/step", "/exchange/step-ap242", "/exchange/solidworks-macro",
+              "/engineer/solve", "/engineer/verify")
 
 KERNEL = kernel          # the kernel these endpoints use; tests swap in a stand-in
 _BUILDS: dict = {}       # model_id -> {"parts": {fid: Part}, "keys": {fid: params_key}}
@@ -395,6 +396,64 @@ def handle_post(base: str, params: dict):
                          checks=checks, status="ok" if rt.get("all_ok") else "quarantined")
         return 200, {"success": True, "bytes": len(blob), **rec, "run": record,
                      "roundtrip_self_check": {"all_ok": rt["all_ok"], "checks": rt["checks"]}}
+
+    if base == "/exchange/step-ap242":
+        # v0.39 P5a: the same faceted geometry, written as AP242 with named products, colours, millimetre
+        # units and an assembly tree (instance placement per part). Not a native SolidWorks file.
+        from physics.step_ap242 import read_back, step_references_ok, write_step_ap242
+        parts = params.get("parts")
+        if not isinstance(parts, list) or not parts:
+            return 400, {"success": False,
+                         "error": "send parts: [{name, verts, faces, colour?, rotation?, translation?}]"}
+        for i, p in enumerate(parts):
+            verts, faces = (p.get("verts"), p.get("faces")) if isinstance(p, dict) else (None, None)
+            if verts is None or faces is None or len(verts) == 0 or len(faces) == 0:
+                return 400, {"success": False, "error": f"part {i + 1} needs verts and faces"}
+        title = str(params.get("title") or params.get("name") or "Idris part")
+        try:
+            text, stats = write_step_ap242(parts, title=title)
+        except (ValueError, KeyError, IndexError) as exc:
+            return 400, {"success": False, "error": f"cannot write this geometry: {exc}"}
+        ok, detail = step_references_ok(text)
+        back = read_back(text)
+        checks = [{"id": "exchange.ap242.references_resolve", "ok": ok, "detail": str(detail)},
+                  {"id": "exchange.ap242.solids_read_back", "ok": back["solids"] == stats["solids"],
+                   "detail": f"{back['solids']} of {stats['solids']} solids"}]
+        record = _record("exchange_step_ap242", {"title": title, "parts": len(parts)},
+                         checks=checks, status="ok" if all(c["ok"] for c in checks) else "quarantined",
+                         extra={"solids": stats["solids"], "faces": stats["faces"]})
+        return 200, {"success": True, "filename": f"{title.replace(' ', '_')}_AP242.step",
+                     "format": "STEP AP242", "step": text, "stats": stats, "read_back": back,
+                     "checks": checks, "run": record,
+                     "note": "faceted planar faces (no analytic cylinders); colours and product names are in "
+                             "the file, and the assembly tree carries one placement per part"}
+
+    if base == "/exchange/solidworks-macro":
+        # v0.39 P5b: a VBA macro that rebuilds the feature tree as PARAMETRIC features in SolidWorks. A native
+        # .SLDPRT cannot be written without SolidWorks; this is what a buyer can actually run there.
+        from physics.sw_macro import check_vba, macro_from_model
+        model = _model_body(params)
+        if model is None:
+            return 400, {"success": False,
+                         "error": "expected a model object with a 'features' list (the IDRIS feature tree)"}
+        name = str(params.get("name") or model.get("model_id") or "Idris part")
+        try:
+            rep = macro_from_model(model, name=name)
+        except ValueError as exc:
+            return 400, {"success": False, "error": str(exc),
+                         "hint": "a part written by the AI as code has no feature tree: export STEP AP242 instead"}
+        ok, problems = check_vba(rep["vba"])
+        checks = [{"id": "export.macro.vba_structure", "ok": ok,
+                   "detail": "statements and blocks parse" if ok else "; ".join(problems[:4])}]
+        record = _record("exchange_solidworks_macro", {"name": name, "features": len(model.get("features") or [])},
+                         checks=checks, status="ok" if ok else "quarantined",
+                         extra={"translated": len(rep["translated"]), "skipped": len(rep["skipped"])})
+        return 200, {"success": True, "filename": f"{name.replace(' ', '_')}_rebuild.bas",
+                     "macro": rep["vba"], "translated": rep["translated"], "manual": rep["manual"],
+                     "skipped": rep["skipped"], "notes": rep["notes"], "vba_check": {"ok": ok,
+                     "problems": problems}, "checks": checks, "run": record,
+                     "not_executed": "this macro has not been run in SolidWorks: no SolidWorks is available "
+                                      "to IDRIS, so a person has to run it once and check the rebuild"}
 
     if base == "/model/build":
         model = _model_body(params)

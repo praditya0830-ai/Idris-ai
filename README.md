@@ -20,6 +20,8 @@ limitations; physics is never delegated to an LLM.
 | Static FEA / natural frequencies / thermal, as pollable jobs | `POST /fea`, `/modal`, `/cfd` |
 | Design review: interference, fits, DFM, assembly | `POST /review` |
 | FEA for an arbitrary part mesh | `POST /part-check` |
+| STEP AP242 with named products, colours, mm units and an assembly tree | `POST /exchange/step-ap242` |
+| SolidWorks VBA macro that rebuilds the feature tree as parametric features | `POST /exchange/solidworks-macro` |
 | Standard-part library and catalogs, with ISO sources | `GET /library`, `/catalog` |
 | Material table for the simulator and reports (`E`, `nu`, `Sy`, `rho`) | `GET /materials` |
 | Print-ready engineering report: requirements, checks, analyses, BOM, solver evidence | `POST /report` |
@@ -197,6 +199,33 @@ analysed: the block says what was not checked.
 
 Deploy as a Render Web Service with start command `python3 main.py`. Mount a disk only if
 you need generated files to survive deploys.
+
+## Export to SolidWorks: what can be written and what cannot (v0.39)
+
+A native **`.SLDPRT` cannot be written** without SolidWorks or its licensed API. IDRIS does not claim to. What a
+buyer can be given instead:
+
+- **STEP AP242** (`POST /exchange/step-ap242`) — the same faceted geometry as the AP214 export, but written as an
+  AP242 file with one named `PRODUCT` per part, a `COLOUR_RGB` per part attached through `STYLED_ITEM`, millimetre
+  units stated in the geometric context, and an assembly tree: one `NEXT_ASSEMBLY_USAGE_OCCURRENCE` plus a
+  `REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION` per instance, so each part lands at its own rotation and
+  translation. Faces stay planar polygons — a bore is a polygon, not an analytic cylinder.
+  Self-check: every `#id` reference resolves, every edge is used once per direction, and the file is read back
+  (products, solid count, volumes by the divergence theorem) before it is returned. Reading it with OpenCascade
+  could not be done here: `OCP` is not installed in this environment, so that check is reported as not run.
+- **"Rebuild in SolidWorks" macro** (`POST /exchange/solidworks-macro`) — a VBA module generated from the IDRIS
+  feature graph: one sketch per sketch feature (with real `AddDimension2` dimensions, values in metres because that
+  is the API unit), `FeatureExtrusion2` for extrudes, `FeatureRevolve2`, `FeatureFillet3`, a circular cut for a
+  hole, and linear/circular patterns. Features with no mapping (an imported solid, an opaque part) are skipped and
+  written into the macro as `' NOT TRANSLATED` comments and into the export report. A part written by the AI as
+  code has no feature tree at all: for that, only STEP is offered, and the endpoint says so.
+
+**Not tested in SolidWorks.** There is no SolidWorks in this environment, so the macro is checked only for VBA
+structure (balanced blocks, only VBA statements, `Application.SldWorks` present) and for content (every feature is
+either an API call or a stated skip). Someone with SolidWorks has to run it once and confirm the rebuild. The
+endpoint returns `not_executed` saying exactly that.
+
+DWG is still not written: the drawing export is DXF (see the Drawing route).
 
 ## Fidelity, honestly
 
