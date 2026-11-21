@@ -237,6 +237,32 @@ def _fault(e: Exception) -> str:
     return f"{type(e).__name__}: {str(e)[:160]} at {where}"
 
 
+def _brief_fallback(b, miss, kind, lang, berr=None) -> dict:
+    """No usable AI answer: the fixed local questions, so the engineer is still asked and nothing is built.
+
+    This is the one place the old silent fallback is gone: a failed brief never reaches the planner or codegen.
+    `brief_error` carries provider, model, stop reason, answer length and its first 300 characters, and the same
+    summary is written to the server log so the cause is visible without asking the engineer to reproduce it.
+    """
+    import brief as B
+    import sys
+    w = B.fallback_questions(b, miss, lang)
+    b = {**b, "asked": True, "source": "fallback questions (AI unavailable)"}
+    out = B.brief_answer(b, w, kind, lang)
+    out["brief"] = b
+    out["questions"] = w["questions"]
+    if berr:
+        out["brief_error"] = berr
+        try:
+            sys.stderr.write("[brief] AI questions unavailable: " + json.dumps(
+                {k: berr.get(k) for k in ("provider", "model", "stop_reason", "chars", "head", "error")},
+                ensure_ascii=False) + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    return {"continue": False, "brief": b, "out": out}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "IdrisCorePOC/0.1"
 
@@ -735,10 +761,10 @@ class Handler(BaseHTTPRequestHandler):
         if not miss:
             b = {**b, "ready": True, "asked": True}
             return {"continue": False, "brief": b, "out": B.ready_answer(b, kind, lang)}
-        w = B.write(msg, b, miss, provider, lang)
+        w, berr = B.write_detail(msg, b, miss, provider, lang)
         if w is None:
-            # the AI could not write the questions: keep the old path instead of pretending to have asked
-            return {"continue": True, "brief": b, "message": msg, "kind": kind}
+            # the AI could not write the questions: ask them here instead of sliding silently into the design path
+            return _brief_fallback(b, miss, kind, lang, berr)
         b = B.merge(b, w.get("brief") or {}, msg)
         miss = B.missing(b)
         if not miss and kind == "assembly":
@@ -748,8 +774,8 @@ class Handler(BaseHTTPRequestHandler):
             b = {**b, "ready": True, "asked": True}
             return {"continue": False, "brief": b, "out": B.ready_answer(b, kind, lang)}
         if not w.get("questions"):
-            # the reader filled some fields but asked nothing: do not show an empty question, keep the old path
-            return {"continue": True, "brief": b, "message": msg, "kind": kind}
+            # the reader filled some fields but asked nothing while the brief is still open: the fixed questions
+            return _brief_fallback(b, miss, kind, lang, berr)
         b = {**b, "asked": True}
         return {"continue": False, "brief": b, "out": B.brief_answer(b, w, kind, lang)}
 

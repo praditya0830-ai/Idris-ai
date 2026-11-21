@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -123,6 +124,19 @@ def check_rate(ip: str, now: float | None = None) -> None:
 
 
 # ------------------------------------------------------------------ provider calls
+_meta = threading.local()
+
+
+def _note(provider: str, model, stop_reason=None) -> None:
+    """Remember how the last provider call ended, for callers that have to explain a bad answer."""
+    _meta.v = {"provider": provider, "model": model, "stop_reason": stop_reason}
+
+
+def last_meta() -> dict:
+    """{provider, model, stop_reason} of the last call made on this thread; {} before the first one."""
+    return dict(getattr(_meta, "v", None) or {})
+
+
 def configured() -> dict:
     return {p: bool(os.environ.get(KEY_ENV[p])) for p in PROVIDERS}
 
@@ -326,6 +340,7 @@ def _call_one(provider: str, model: str, system: str, user: str, max_tokens: int
         d = _post_t(base + "/v1/messages", {"x-api-key": key, "anthropic-version": "2023-06-01"},
                   {"model": model, "max_tokens": max_tokens, "temperature": 0, "system": system,
                    "messages": [{"role": "user", "content": user}]}, timeout=t)
+        _note(provider, model, d.get("stop_reason"))
         return "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
     if provider == "gemini":
         base = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")
@@ -334,6 +349,8 @@ def _call_one(provider: str, model: str, system: str, user: str, max_tokens: int
                           "contents": [{"role": "user", "parts": [{"text": user}]}],
                           "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens,
                                                "responseMimeType": "application/json"}}, t)
+        cand = (d.get("candidates") or [{}])[0] if isinstance(d, dict) else {}
+        _note(provider, model, (cand or {}).get("finishReason"))
         return _gemini_text(d)
     if provider == "nvidia":
         base = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com")
@@ -348,6 +365,7 @@ def _call_one(provider: str, model: str, system: str, user: str, max_tokens: int
             msg = d["choices"][0]["message"]
         except (KeyError, IndexError):
             raise LLMError("empty answer from NVIDIA")
+        _note(provider, model, d["choices"][0].get("finish_reason"))
         text = msg.get("content") or ""
         if not text.strip():
             fin = (d["choices"][0].get("finish_reason") or "?")
@@ -362,6 +380,7 @@ def _call_one(provider: str, model: str, system: str, user: str, max_tokens: int
         msg = d["choices"][0]["message"]
     except (KeyError, IndexError):
         raise LLMError(f"empty answer from {provider}")
+    _note(provider, model, d["choices"][0].get("finish_reason"))
     text = msg.get("content")
     text = text if isinstance(text, str) else ""
     if not text.strip():
