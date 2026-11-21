@@ -9,7 +9,7 @@ import pytest
 
 from assembly3d import build_box
 from engine_routes import handle_post
-from physics.step_ap242 import read_back, step_references_ok, write_step_ap242
+from physics.step_ap242 import _open_edges, _weld_part, read_back, step_references_ok, write_step_ap242
 from physics.step_export import check_step, step_solid_volumes, write_step
 
 
@@ -134,6 +134,41 @@ def test_a_part_with_two_bodies_says_so_instead_of_writing_silently():
     assert stats["solids"] == 2 and stats["solids_per_part"] == {"pair": 2}
     assert stats["warnings"] and "2 separate closed bodies" in stats["warnings"][0]
     assert read_back(text)["solids"] == 2
+
+
+def _l_bracket(scale: float = 1.0):
+    """60 x 40 x 45 L-bracket with 5 mm walls as one closed shell, in the Studio's own (x, y, z) frame."""
+    poly = np.array([(0, 0), (60, 0), (60, 5), (5, 5), (5, 45), (0, 45)], float) / scale
+    n = len(poly)
+    V = np.vstack([np.column_stack([poly[:, 0], np.zeros(n), poly[:, 1]]),
+                   np.column_stack([poly[:, 0], np.full(n, 40.0 / scale), poly[:, 1]])])
+    caps = [(3, 4, 5), (3, 5, 0), (3, 0, 1), (3, 1, 2)]
+    faces = []
+    for a, b, c in caps:
+        faces.append((a, c, b))                       # y = 0 cap
+        faces.append((a + n, b + n, c + n))           # y = 40 cap
+    for i in range(n):
+        j = (i + 1) % n
+        faces.append((i, j, j + n))
+        faces.append((i, j + n, i + n))
+    return V.tolist(), faces                        # one [x, y, z] row per vertex, as the writer takes it
+
+
+def test_a_bracket_sent_as_triangle_soup_reads_back_as_one_solid_with_no_bad_edge():
+    v, f = _l_bracket()
+    sv, sf = _soup(v, f)
+    assert len(sv) == 3 * len(sf)                    # every triangle carries its own three vertices
+    text, stats = write_step_ap242([{"name": "bracket", "verts": sv, "faces": sf}], title="bracket")
+    assert stats["solids_per_part"] == {"bracket": 1} and stats["solids"] == 1
+    assert stats["warnings"] == []
+    assert read_back(text)["solids"] == 1
+    ok, detail = step_references_ok(text)
+    assert ok, detail and detail["dangling_references"] == []
+    # "no bad edge": every edge is shared by exactly two triangles after the weld
+    V, F, _info = _weld_part(sv, sf)
+    assert _open_edges(F, len(V))[0] == 0
+    # the volume is kept: 500 mm2 of L-section x 40 mm
+    assert abs(abs(list(step_solid_volumes(text).values())[0]) - 20000.0) < 1e-6
 
 
 def test_the_ap214_export_is_unchanged():
