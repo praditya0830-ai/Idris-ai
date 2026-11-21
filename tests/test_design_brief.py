@@ -80,7 +80,7 @@ def test_a_general_drone_request_becomes_a_brief_with_questions_and_never_writes
     assert len(r["questions"]) >= 1 and all(len(q["options"]) >= 2 for q in r["questions"])
     assert all(q["allow_free_text"] is True for q in r["questions"])
     assert len(r["suggestions"]) >= 1
-    assert seen["max_tokens"] == 800 and seen["timeout"] <= 20          # one small call per brief turn
+    assert seen["max_tokens"] == 1800 and seen["timeout"] == 30         # room for questions + options + suggestions
     assert "one to three feature suggestions" in seen["system"].lower() or "feature suggestions" in seen["system"]
 
 
@@ -229,19 +229,27 @@ def test_a_reader_answer_with_no_questions_still_completes_the_brief(monkeypatch
     assert r["ask"]["k"] == "concept_count" and "450 mm" in r["answer"]
 
 
-def test_a_reader_answer_with_no_questions_and_a_still_open_brief_keeps_the_old_path(monkeypatch):
+def test_a_reader_answer_with_no_questions_and_a_still_open_brief_asks_the_fixed_questions(monkeypatch):
     _no_code(monkeypatch)
     _ai(monkeypatch, DRONE_ANSWER)
     first = main.Handler._chat_brief(None, DRONE, None, _routed(), None, None)
     ctx = {"brief": first["out"]["brief"]}
     _ai(monkeypatch, {"understanding": "Sizes still unknown.", "brief": {}, "questions": [], "suggestions": []})
     out = main.Handler._chat_brief(None, "yang kedua aja", ctx, _routed(), None, None)
-    assert out["continue"] is True and out["message"] == "yang kedua aja"
-    assert out["brief"]["object"] == "drone"          # the memory is kept, only the turn falls through
+    assert out["continue"] is False, "an open brief is never skipped because the reader asked nothing"
+    assert out["brief"]["object"] == "drone"          # the memory is kept
+    r = out["out"]
+    assert r["brief"]["source"] == "fallback questions (AI unavailable)"
+    assert r["questions"] and all(q["fallback"] for q in r["questions"])
 
 
-def test_with_no_ai_the_old_design_path_is_kept_instead_of_a_fake_question(monkeypatch):
+def test_with_no_ai_the_fixed_questions_are_asked_instead_of_designing_anyway(monkeypatch):
+    _no_code(monkeypatch)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("IDRIS_LLM_ORDER", "claude")
     out = main.Handler._chat_brief(None, DRONE, None, _routed(), None, None)
-    assert out["continue"] is True and out["message"] == DRONE
+    assert out["continue"] is False, "no AI must not mean 'design it anyway'"
+    r = out["out"]
+    assert r["questions"] and len(r["questions"]) <= 3
+    assert r["brief"]["source"] == "fallback questions (AI unavailable)"
+    assert "no AI provider is configured" in r["brief_error"]["error"]

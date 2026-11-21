@@ -13,8 +13,11 @@ Two rules run through every line here:
   * nothing is designed until the brief is ready AND the engineer says start. The brief lives in `context.brief`, so
     the Studio can show it, edit it field by field, and send it back every turn.
 
-The AI is one small call per brief turn (max_tokens 800) through `ai_budget`. With no AI the module returns None and
-the caller keeps the old path — IDRIS never pretends to have asked a question it could not write.
+The AI is one small call per brief turn (IDRIS_BRIEF_MAX_TOKENS, 1800 by default, 30 s) through `ai_budget`.
+When the AI is away, times out or answers with prose, a cut-off object or nothing at all, the caller does NOT slide
+back into the old "design it anyway" path: `fallback_questions` writes the same three questions locally from
+`missing()`, with common options and no invented number, and marks the brief `source: "fallback questions (AI
+unavailable)"`. The failure itself travels in `brief_error` (provider, model, stop reason, length, first 300 chars).
 """
 from __future__ import annotations
 
@@ -56,6 +59,7 @@ def blank(kind: str = "part") -> dict:
     b["ready"] = False
     b["asked"] = False
     b["assumed"] = False
+    b["source"] = ""            # "" / "AI" / "fallback questions (AI unavailable)"
     return b
 
 
@@ -74,6 +78,7 @@ def from_context(ctx) -> dict | None:
     out["ready"] = bool(b.get("ready"))
     out["asked"] = bool(b.get("asked"))
     out["assumed"] = bool(b.get("assumed"))
+    out["source"] = str(b.get("source") or "")[:120]
     return out
 
 
@@ -291,24 +296,165 @@ def _user(message: str, b: dict, miss: list) -> str:
             + ("\nThe engineer already chose to continue with assumptions." if b.get("assumed") else ""))
 
 
-def write(message: str, b: dict, miss: list, provider=None, lang: str = "en") -> dict | None:
-    """One small AI call that writes the engineer's next question. None when the AI is away or unusable."""
-    order = _order(provider)
-    if not order or ai_budget.gate():
-        return None
+DEFAULT_MAX_TOKENS = 1800
+DEFAULT_TIMEOUT_S = 30.0
+# one retry, with an instruction the model cannot read as "write a friendly paragraph"
+RETRY_NOTE = "\n\nReturn ONLY one JSON object, no prose and no markdown fence."
+
+
+def max_tokens() -> int:
     try:
-        text, used = llm.call_provider(order[0], _system(lang), _user(message, b, miss), 800,
-                                       timeout=float(os.environ.get("IDRIS_BRIEF_TIMEOUT_S", "20")))
+        return max(400, int(os.environ.get("IDRIS_BRIEF_MAX_TOKENS", str(DEFAULT_MAX_TOKENS))))
+    except ValueError:
+        return DEFAULT_MAX_TOKENS
+
+
+def timeout_s() -> float:
+    try:
+        return max(5.0, float(os.environ.get("IDRIS_BRIEF_TIMEOUT_S", str(DEFAULT_TIMEOUT_S))))
+    except ValueError:
+        return DEFAULT_TIMEOUT_S
+
+
+def _read_json(text: str):
+    """The answer as a dict: strict JSON first, then the same repair the CAD writer uses, so a cut-off object
+    (max_tokens) still yields its questions instead of losing the whole turn."""
+    try:
         raw = llm.extract_json(text)
+        if isinstance(raw, dict):
+            return raw
     except Exception:
-        return None
-    if not isinstance(raw, dict):
-        return None
-    qs = _clean_questions(raw.get("questions"), lang)
-    sug = _clean_suggestions(raw.get("suggestions"))
-    # zero questions is allowed: the answer may simply complete the brief. The caller never invents one.
-    return {"understanding": _clean_text(raw.get("understanding"), 400), "brief": raw.get("brief") or {},
-            "questions": qs, "suggestions": sug, "read_by": f"{order[0]} ({used})"}
+        pass
+    try:
+        raw = llm.salvage_json(text)
+    except Exception:
+        raw = None
+    return raw if isinstance(raw, dict) else None
+
+
+def _meta() -> dict:
+    try:
+        return llm.last_meta()
+    except Exception:
+        return {}
+
+
+def write_detail(message: str, b: dict, miss: list, provider=None, lang: str = "en") -> tuple:
+    """One small AI call (plus one stricter retry) that writes the engineer's next question.
+
+    -> (answer, error). `answer` is None when the AI is away, timed out, or answered with something that is not a
+    usable brief object; `error` then says provider, model, stop reason, length and the first 300 characters, plus
+    every attempt, so the server log and the JSON can show the real cause instead of "the AI did not return
+    structured data".
+    """
+    order = _order(provider)
+    gate = ai_budget.gate() if hasattr(ai_budget, "gate") else None
+    if not order or gate:
+        why = str(gate or "no AI provider is configured on the server")
+        return None, {"provider": (order[0] if order else None), "model": None, "stop_reason": None,
+                      "chars": 0, "head": "", "error": why[:300], "attempts": []}
+    prov = order[0]
+    system, user = _system(lang), _user(message, b, miss)
+    attempts = []
+    for attempt in (1, 2):
+        text, used, stop = "", None, None
+        try:
+            text, used = llm.call_provider(prov, system, user + (RETRY_NOTE if attempt == 2 else ""),
+                                           max_tokens(), timeout=timeout_s())
+            stop = _meta().get("stop_reason")
+        except Exception as e:
+            meta = _meta()
+            attempts.append({"provider": prov, "model": meta.get("model"), "stop_reason": meta.get("stop_reason"),
+                             "chars": 0, "head": "", "error": f"{type(e).__name__}: {e}"[:300]})
+            continue
+        raw = _read_json(text)
+        if isinstance(raw, dict) and any(raw.get(k) for k in ("understanding", "brief", "questions", "suggestions")):
+            qs = _clean_questions(raw.get("questions"), lang)
+            # an answer with no usable question while the brief is open is a failure too: say why the questions
+            # were dropped (usually one option, or a cut-off list), instead of showing an empty turn
+            err = None if qs else {"provider": prov, "model": _meta().get("model") or used, "stop_reason": stop,
+                                   "chars": len(text or ""), "head": (text or "")[:300],
+                                   "error": "the AI answer carried no usable question (each needs a text and "
+                                            "2-4 options)"}
+            return {"understanding": _clean_text(raw.get("understanding"), 400),
+                    "brief": raw.get("brief") if isinstance(raw.get("brief"), dict) else {},
+                    "questions": qs, "suggestions": _clean_suggestions(raw.get("suggestions")),
+                    "read_by": f"{prov} ({used})"}, err
+        attempts.append({"provider": prov, "model": _meta().get("model") or used, "stop_reason": stop,
+                         "chars": len(text or ""), "head": (text or "")[:300],
+                         "error": "the answer was not a JSON object with a brief, questions or suggestions"})
+    last = attempts[-1] if attempts else {}
+    return None, {**last, "attempts": attempts}
+
+
+def write(message: str, b: dict, miss: list, provider=None, lang: str = "en") -> dict | None:
+    """One small AI call that writes the engineer's next question. None when the AI is away or unusable;
+    `write_detail` carries the reason. Zero questions is allowed: the answer may simply complete the brief."""
+    w, _err = write_detail(message, b, miss, provider, lang)
+    return w
+
+
+# --------------------------------------------------------------------------- when the AI cannot write the questions
+# Fixed questions, one per missing field, with options an engineer would recognise. No option carries a digit: the
+# fallback may ask for a size or a load, it may never suggest one.
+_FALLBACK = {
+    "en": {
+        "object": ("What should IDRIS design?", [
+            ("Bracket or mount", "holds another part in place"),
+            ("Enclosure or housing", "protects what is inside"),
+            ("Shaft or axle", "carries a rotating load"),
+            ("Frame", "carries the main structure")]),
+        "purpose": ("What will it be used for?", [
+            ("Indoor / bench use", "light service, no weather"),
+            ("Outdoor / mobile", "weather and vibration"),
+            ("Machine or vehicle", "continuous load"),
+            ("Display or prototype", "form first, light load")]),
+        "sizes": ("Roughly how big?", [
+            ("Palm-sized", "fits in one hand, or give a size"),
+            ("Desk-sized", "sits on a desk, or give a size"),
+            ("Person-sized", "about as tall as a person, or give a size"),
+            ("Larger than a person", "or give a size")]),
+        "loads": ("What load or weight must it carry?", [
+            ("Hand load only", "nothing heavier than a hand"),
+            ("A person's weight", "steps, sits or leans on it"),
+            ("A vehicle load", "moves with a vehicle"),
+            ("Give a number", "type the load with its unit")]),
+    },
+    "id": {
+        "object": ("IDRIS harus mendesain apa?", [
+            ("Bracket atau dudukan", "menahan part lain"),
+            ("Enclosure atau housing", "melindungi isinya"),
+            ("Poros atau axle", "membawa beban berputar"),
+            ("Rangka", "membawa struktur utama")]),
+        "purpose": ("Untuk apa?", [
+            ("Dipakai di dalam / meja", "ringan, tanpa cuaca"),
+            ("Luar ruangan / bergerak", "cuaca dan getaran"),
+            ("Mesin atau kendaraan", "beban terus-menerus"),
+            ("Pajangan atau prototipe", "bentuk dulu, beban ringan")]),
+        "sizes": ("Kira-kira sebesar apa?", [
+            ("Seukuran telapak", "muat di satu tangan, atau sebutkan ukurannya"),
+            ("Seukuran meja", "muat di atas meja, atau sebutkan ukurannya"),
+            ("Seukuran orang", "setinggi orang, atau sebutkan ukurannya"),
+            ("Lebih besar dari orang", "atau sebutkan ukurannya")]),
+        "loads": ("Beban atau berat apa yang harus ditahan?", [
+            ("Beban tangan saja", "tidak lebih berat dari tangan"),
+            ("Berat orang", "diinjak, diduduki, atau disandari"),
+            ("Beban kendaraan", "ikut bergerak dengan kendaraan"),
+            ("Sebutkan angkanya", "ketik beban beserta satuannya")]),
+    },
+}
+
+
+def fallback_questions(b: dict, miss: list = None, lang: str = "en") -> dict:
+    """The same three questions, written here instead of by the AI: never a number, never a silent design."""
+    table = _FALLBACK["id" if lang == "id" else "en"]
+    out = []
+    for k in list(miss if miss is not None else missing(b))[:3]:
+        text, opts = table.get(k, table["purpose"])
+        out.append({"id": f"fallback_{k}", "text": text, "options": [{"label": a, "note": n} for a, n in opts],
+                    "allow_free_text": True, "fallback": True})
+    return {"understanding": "", "brief": {}, "questions": out, "suggestions": [],
+            "read_by": "fallback questions (no AI)"}
 
 
 # --------------------------------------------------------------------------- the answers

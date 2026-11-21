@@ -289,23 +289,89 @@ def part_prompt(plan: dict, part: dict) -> str:
             f"{shared_txt}. One solid, the sizes above exactly as given.")
 
 
-def plan_for(request: str, call=None, provider: str | None = None) -> dict:
-    """E2: one AI call -> a validated plan. -> {ok, plan, errors, estimate, error}."""
-    user = f"Assembly request: {request}"
+DEFAULT_PLAN_MAX_TOKENS = 4000
+DEFAULT_PLAN_TIMEOUT_S = 60.0
+PLAN_RETRY_NOTE = "\n\nReturn ONLY one JSON object, no prose and no markdown fence."
+
+
+def plan_max_tokens() -> int:
     try:
-        if call is None:
-            prov = provider or (llm.provider_order() or [None])[0]
-            if not prov:
-                return {"ok": False, "plan": None, "errors": [], "estimate": None,
-                        "error": "no AI provider is configured on the server, so no assembly plan was written"}
-            text, _model = llm.call_provider(prov, PLAN_SYSTEM, user, max_tokens=2000, timeout=60)
-        else:
-            text = call(PLAN_SYSTEM, user)
+        return max(800, int(os.environ.get("IDRIS_PLAN_MAX_TOKENS", str(DEFAULT_PLAN_MAX_TOKENS))))
+    except ValueError:
+        return DEFAULT_PLAN_MAX_TOKENS
+
+
+def plan_timeout_s() -> float:
+    try:
+        return max(10.0, float(os.environ.get("IDRIS_PLAN_TIMEOUT_S", str(DEFAULT_PLAN_TIMEOUT_S))))
+    except ValueError:
+        return DEFAULT_PLAN_TIMEOUT_S
+
+
+def _read_plan_json(text: str):
+    """Strict JSON first, then the cut-off repair: a plan truncated by max_tokens still names its parts."""
+    try:
         raw = llm.extract_json(text)
-    except llm.LLMError as e:
-        return {"ok": False, "plan": None, "errors": [], "estimate": None, "error": str(e)}
-    except Exception as e:
-        return {"ok": False, "plan": None, "errors": [], "estimate": None, "error": f"{type(e).__name__}: {e}"}
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    try:
+        raw = llm.salvage_json(text)
+    except Exception:
+        raw = None
+    return raw if isinstance(raw, dict) else None
+
+
+def plan_for(request: str, call=None, provider: str | None = None) -> dict:
+    """E2: one AI call (plus one stricter retry) -> a validated plan. -> {ok, plan, errors, estimate, error, plan_error}.
+
+    The live failure was a plan answer cut off at 2000 tokens, read as "the AI did not return structured data". The
+    call now has room (IDRIS_PLAN_MAX_TOKENS, 4000 by default), a `_close_json` repair for an object that is still
+    cut off, and one retry that says "Return ONLY one JSON object". `plan_error` keeps provider, model, stop reason,
+    length and the first 300 characters, so the reason reaches the engineer instead of a generic message.
+    """
+    user = f"Assembly request: {request}"
+    prov = provider or (llm.provider_order() or [None])[0]
+    if call is None and not prov:
+        return {"ok": False, "plan": None, "errors": [], "estimate": None,
+                "error": "no AI provider is configured on the server, so no assembly plan was written",
+                "plan_error": {"provider": None, "model": None, "stop_reason": None, "chars": 0, "head": "",
+                               "error": "no AI provider is configured on the server"}}
+    attempts = []
+    raw = None
+    for attempt in (1, 2):
+        text, model, stop = "", None, None
+        try:
+            if call is None:
+                text, model = llm.call_provider(prov, PLAN_SYSTEM, user + (PLAN_RETRY_NOTE if attempt == 2 else ""),
+                                                max_tokens=plan_max_tokens(), timeout=plan_timeout_s())
+            else:
+                text = call(PLAN_SYSTEM, user + (PLAN_RETRY_NOTE if attempt == 2 else ""))
+            try:
+                meta = llm.last_meta()
+            except Exception:
+                meta = {}
+            stop = meta.get("stop_reason")
+        except llm.LLMError as e:
+            attempts.append({"provider": prov, "model": None, "stop_reason": None, "chars": 0, "head": "",
+                             "error": str(e)[:300]})
+            continue
+        except Exception as e:
+            attempts.append({"provider": prov, "model": None, "stop_reason": None, "chars": 0, "head": "",
+                             "error": f"{type(e).__name__}: {e}"[:300]})
+            continue
+        raw = _read_plan_json(text)
+        if isinstance(raw, dict) and raw:
+            break
+        attempts.append({"provider": prov, "model": model, "stop_reason": stop, "chars": len(text or ""),
+                         "head": (text or "")[:300],
+                         "error": "the AI did not return structured data (no JSON object in the answer)"})
+    if not isinstance(raw, dict) or not raw:
+        last = attempts[-1] if attempts else {}
+        return {"ok": False, "plan": None, "errors": [], "estimate": None,
+                "error": (last.get("error") or "the AI did not return a usable plan"),
+                "plan_error": {**last, "attempts": attempts}}
     plan, errs = validate(raw)
     return {"ok": not errs, "plan": plan, "errors": errs,
             "estimate": estimate(plan) if plan else None,
