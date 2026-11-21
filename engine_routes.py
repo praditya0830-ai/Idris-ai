@@ -421,10 +421,12 @@ def handle_post(base: str, params: dict):
                    "detail": f"{back['solids']} of {stats['solids']} solids"}]
         record = _record("exchange_step_ap242", {"title": title, "parts": len(parts)},
                          checks=checks, status="ok" if all(c["ok"] for c in checks) else "quarantined",
-                         extra={"solids": stats["solids"], "faces": stats["faces"]})
+                         extra={"solids": stats["solids"], "faces": stats["faces"],
+                                "solids_per_part": stats["solids_per_part"]})
         return 200, {"success": True, "filename": f"{title.replace(' ', '_')}_AP242.step",
                      "format": "STEP AP242", "step": text, "stats": stats, "read_back": back,
                      "checks": checks, "run": record,
+                     "solids_per_part": stats["solids_per_part"], "warnings": stats["warnings"],
                      "note": "faceted planar faces (no analytic cylinders); colours and product names are in "
                              "the file, and the assembly tree carries one placement per part"}
 

@@ -6,12 +6,17 @@ sketch-and-feature tree, with dimensions as real dimensions, so the part is edit
 solid. That is what this module writes.
 
 Mapping (IDRIS op -> SolidWorks API):
-    sketch  -> Front/Top/Right Plane + CreateCornerRectangle / CreateCircleByRadius / CreatePolygon
+    sketch  -> Front/Top/Right Plane + CreateCornerRectangle / CreateCircleByRadius / CreatePolygon,
+               drawn at the profile centre (cx, cy) and not only at the plane origin,
                + AddDimension2 with SystemValue in METRES
-    extrude -> FeatureExtrusion2 (with draft if the IDRIS feature had one)
+    extrude -> FeatureExtrusion2 for a boss, FeatureCut4 for `op: "cut"` (depth, through all, symmetric)
     revolve -> FeatureRevolve2 about the sketch normal
-    hole    -> a circular cut through all (a Hole Wizard hole needs a standard-table selection, which a macro
-               cannot make reliably, so it is a cut and the report says so)
+    hole    -> a circular cut, through or to `depth`; `from: "top"` starts on a reference plane at `z_top`
+               (InsertRefPlane, 8 = swRefPlaneReferenceConstraint_Distance) instead of the sketch plane;
+               a counterbore becomes two cuts (a Hole Wizard hole needs a standard-table selection, which a
+               macro cannot make reliably, so it is a cut and the report says so)
+    chamfer -> InsertFeatureChamfer in equal-distance mode (swChamferDistanceDistance Or swChamferEqualDistance)
+    mirror  -> InsertMirrorFeature2 about the XY / XZ / YZ plane
     fillet  -> FeatureFillet3, with the edge selection left to the engineer when IDRIS selected "all"
     pattern -> FeatureLinearPattern4 / FeatureCircularPattern4
 
@@ -73,23 +78,27 @@ def _sketch_block(fid, p, lines, report):
     h = float(p.get("h") or w)
     n = int(p.get("n") or 6)
     off = float(p.get("offset") or 0.0)
-    lines.append(f"    ' [{fid}] sketch on {plane} ({sw_plane}): {profile} {w:g} x {h:g} mm, offset {off:g} mm")
+    cx = float(p.get("cx") or 0.0)
+    cy = float(p.get("cy") or 0.0)
+    centre = f", centre ({cx:g}, {cy:g}) mm" if (cx or cy) else ""
+    lines.append(f"    ' [{fid}] sketch on {plane} ({sw_plane}): {profile} {w:g} x {h:g} mm, offset {off:g} mm"
+                 f"{centre}")
     lines.append("    swModel.ClearSelection2 True")
     lines.append(f"    boolstatus = swModel.Extension.SelectByID2(\"{sw_plane}\", \"PLANE\", 0, 0, 0, False, 0, "
                  f"Nothing, 0)")
     lines.append("    boolstatus = swSketchMgr.InsertSketch(True)")
     if profile in ("rectangle", "lshape"):
-        lines.append(f"    swSketchMgr.CreateCornerRectangle({_m(-w / 2)}, {_m(-h / 2)}, 0, {_m(w / 2)}, "
-                     f"{_m(h / 2)}, 0)")
+        lines.append(f"    swSketchMgr.CreateCornerRectangle({_m(cx - w / 2)}, {_m(cy - h / 2)}, 0, "
+                     f"{_m(cx + w / 2)}, {_m(cy + h / 2)}, 0)")
         if profile == "lshape":
             t = float(p.get("thickness") or min(w, h) / 3.0)
             lines.append(f"    ' L-shape: the leg is {t:g} mm; trim the corner with a line at ({_m(t)}, 0) -> "
                          f"({_m(t)}, {_m(h / 2)}) and ({_m(t)}, {_m(t)}) -> ({_m(w / 2)}, {_m(t)})")
             report["manual"].append({"feature": fid, "what": f"the L-shape leg ({t:g} mm) needs two trim lines"})
     elif profile in ("circle", "round"):
-        lines.append(f"    swSketchMgr.CreateCircleByRadius(0, 0, 0, {_m(w / 2)})")
+        lines.append(f"    swSketchMgr.CreateCircleByRadius({_m(cx)}, {_m(cy)}, 0, {_m(w / 2)})")
     else:
-        lines.append(f"    swSketchMgr.CreatePolygon(0, 0, 0, {_m(w / 2)}, {_m(w / 2)}, {n}, False)")
+        lines.append(f"    swSketchMgr.CreatePolygon({_m(cx)}, {_m(cy)}, 0, {_m(w / 2)}, {_m(w / 2)}, {n}, False)")
     lines.append("    boolstatus = swSketchMgr.InsertSketch(True)")
     # parametric dimensions: a rectangle is dimensioned by its width and its height
     lines.append("    ' dimensions as real SolidWorks dimensions (edit them, the part rebuilds)")
@@ -102,6 +111,9 @@ def _sketch_block(fid, p, lines, report):
                          f"False, 0, Nothing, 0)")
             lines.append(f"    Set swDim = swModel.AddDimension2(0, 0.05, 0)")
             lines.append(f"    swDim.SystemValue = {_m(value)}       ' {label} = {value:g} mm")
+    if (cx or cy) and profile in ("rectangle", "lshape"):
+        lines.append(f"    ' the profile sits {cx:g} mm along X and {cy:g} mm along Y of {sw_plane}; the two "
+                     f"dimensions below are to the sketch origin (drag them if you want them to the corner)")
     if abs(off) > 1e-12:
         lines.append(f"    ' the sketch was offset {off:g} mm from {sw_plane}; set that in the sketch plane "
                      f"definition if you need it exact")
@@ -114,18 +126,34 @@ def _extrude_block(fid, p, sketch_name, lines, report):
     dist = float(p.get("distance") or 0.0)
     direction = str(p.get("direction") or "+normal")
     draft = float(p.get("draft_deg") or 0.0)
-    lines.append(f"    ' [{fid}] extrude {dist:g} mm, {direction}, draft {draft:g} deg")
+    kind = str(p.get("op") or "add").lower()
+    cut = kind == "cut"
+    through = bool(p.get("through")) and cut
+    lines.append(f"    ' [{fid}] {'cut' if cut else 'boss'} extrude {dist:g} mm, {direction}"
+                 f"{' (through all)' if through else ''}, draft {draft:g} deg")
     lines.append("    swModel.ClearSelection2 True")
     lines.append(f"    boolstatus = swModel.Extension.SelectByID2(\"{sketch_name}\", \"SKETCH\", 0, 0, 0, False, 0, "
                  f"Nothing, 0)")
     flip = ".True." if direction == "-normal" else ".False."
     both = ".True." if direction == "symmetric" else ".False."
     d = float(draft) * 0.0174532925199433           # degrees -> radians, which is what the API takes
-    lines.append(f"    Set swFeat = swFeatureMgr.FeatureExtrusion2(True, False, {flip}, 0, 0, {_m(dist)}, "
-                 f"{_m(dist)}, False, False, False, False, {d:.6g}, {d:.6g}, {both}, False, False, False, True, "
-                 f"True, True, 0, 0, False)")
-    report["translated"].append({"feature": fid, "op": "extrude"})
-    return f"Boss-Extrude_{fid}"
+    if not cut:
+        lines.append(f"    Set swFeat = swFeatureMgr.FeatureExtrusion2(True, False, {flip}, 0, 0, {_m(dist)}, "
+                     f"{_m(dist)}, False, False, False, False, {d:.6g}, {d:.6g}, {both}, False, False, False, True, "
+                     f"True, True, 0, 0, False)")
+        report["translated"].append({"feature": fid, "op": "extrude"})
+        return f"Boss-Extrude_{fid}"
+    # a cut: T1 = 0 (blind, D1), 1 (through all) or 6 (mid plane, D1 is half the total depth)
+    t1 = 1 if through else (6 if direction == "symmetric" else 0)
+    dep = 0.0 if through else (dist / 2.0 if direction == "symmetric" else dist) * MM
+    lines.append(f"    Set swFeat = swFeatureMgr.FeatureCut4(True, False, {flip}, {t1}, 0, {dep:.6g}, {dep:.6g}, "
+                 f"False, False, False, False, {d:.6g}, {d:.6g}, False, False, False, False, False, True, True, "
+                 f"True, True, False, 0, 0, False, False)")
+    if direction == "symmetric":
+        report["manual"].append({"feature": fid, "what": "the cut is mid-plane (swEndCondMidPlane); check that "
+                                                                  "it cuts both ways in your SolidWorks version"})
+    report["translated"].append({"feature": fid, "op": "extrude", "kind": "cut"})
+    return f"Cut-Extrude_{fid}"
 
 
 def _revolve_block(fid, p, sketch_name, plane, lines, report):
@@ -143,30 +171,63 @@ def _revolve_block(fid, p, sketch_name, plane, lines, report):
     return f"Revolve_{fid}"
 
 
+def _circle_cut(x, y, dia, depth, lines, start):
+    """Sketch a circle on the start face and cut it. `depth` None = through all."""
+    lines.append("    swModel.ClearSelection2 True")
+    lines.append(start)
+    lines.append("    boolstatus = swSketchMgr.InsertSketch(True)")
+    lines.append(f"    swSketchMgr.CreateCircleByRadius({_m(x)}, {_m(y)}, 0, {_m(dia / 2)})")
+    lines.append("    boolstatus = swSketchMgr.InsertSketch(True)")
+    lines.append("    swModel.ClearSelection2 True")
+    lines.append("    boolstatus = swModel.Extension.SelectByID2(\"Sketch\", \"SKETCH\", 0, 0, 0, False, 0, "
+                 "Nothing, 0)")
+    t = 1 if depth is None else 0
+    dep = 0.0 if depth is None else float(depth) * MM
+    lines.append(f"    Set swFeat = swFeatureMgr.FeatureCut4(True, False, False, {t}, 0, {dep:.6g}, {dep:.6g}, "
+                 f"False, False, False, False, 0, 0, False, False, False, False, False, True, True, True, True, "
+                 f"False, 0, 0, False, False)")
+
+
 def _hole_block(fid, p, plane, lines, report):
     x, y = float(p.get("x") or 0.0), float(p.get("y") or 0.0)
     d = float(p.get("d") or 0.0)
     through = bool(p.get("through", True)) or p.get("depth") is None
-    depth = p.get("depth")
-    sw_plane = PLANE.get(str(plane or "XY").upper(), "Front Plane")
-    lines.append(f"    ' [{fid}] hole d={d:g} mm at ({x:g}, {y:g}) on {plane}"
-                 + (" through all" if through else f", depth {float(depth):g} mm"))
-    lines.append("    swModel.ClearSelection2 True")
-    lines.append(f"    boolstatus = swModel.Extension.SelectByID2(\"{sw_plane}\", \"PLANE\", 0, 0, 0, False, 0, "
-                 f"Nothing, 0)")
-    lines.append("    boolstatus = swSketchMgr.InsertSketch(True)")
-    lines.append(f"    swSketchMgr.CreateCircleByRadius({_m(x)}, {_m(y)}, 0, {_m(d / 2)})")
-    lines.append("    boolstatus = swSketchMgr.InsertSketch(True)")
-    lines.append("    swModel.ClearSelection2 True")
-    lines.append(f"    boolstatus = swModel.Extension.SelectByID2(\"Sketch\", \"SKETCH\", 0, 0, 0, False, 0, "
-                 f"Nothing, 0)")
-    t = 1 if through else 0
-    dep = 0.0 if through else float(depth) * MM
-    lines.append(f"    Set swFeat = swFeatureMgr.FeatureCut4(True, False, False, {t}, 0, {dep:.6g}, {dep:.6g}, "
-                 f"False, False, False, False, 0, 0, False, False, False, False, False, True, True, True, True, "
-                 f"False, 0, 0, False, False)")
+    depth = None if through else float(p.get("depth"))
+    from_top = str(p.get("from") or "sketch").lower() == "top"
+    z_top = float(p["z_top"]) if p.get("z_top") is not None else None
+    plane_name = str(plane or "XY").upper()
+    sw_plane = PLANE.get(plane_name, "Front Plane")
+    cbore_d = p.get("cbore_d")
+    cbore_depth = p.get("cbore_depth")
+    where = (f"from the top face (z = {z_top:g} mm)" if from_top and z_top is not None else f"on {plane_name}")
+    lines.append(f"    ' [{fid}] hole d={d:g} mm at ({x:g}, {y:g}) {where}"
+                 + (" through all" if through else f", depth {depth:g} mm")
+                 + (f", counterbore {float(cbore_d):g} x {float(cbore_depth):g} mm" if cbore_d and cbore_depth else ""))
+    start = f'    boolstatus = swModel.Extension.SelectByID2("{sw_plane}", "PLANE", 0, 0, 0, False, 0, Nothing, 0)'
+    if from_top:
+        if z_top is None:
+            lines.append(f"    ' [{fid}] NOT TRANSLATED (hole): a hole drilled from the top face needs z_top")
+            report["skipped"].append({"feature": fid, "op": "hole",
+                                      "reason": "from: 'top' needs z_top, the height of the face it starts on"})
+            return None
+        lines.append("    swModel.ClearSelection2 True")
+        lines.append(start)
+        lines.append("    ' 8 = swRefPlaneReferenceConstraint_Distance: a plane parallel to the sketch plane at z_top")
+        lines.append(f"    Set swFeat = swFeatureMgr.InsertRefPlane(8, {_m(z_top)}, 0, 0, 0, 0)")
+        start = '    boolstatus = swModel.Extension.SelectByID2("Plane1", "PLANE", 0, 0, 0, False, 0, Nothing, 0)'
+        report["manual"].append({"feature": fid, "what": f"the plane at z = {z_top:g} mm is selected as "
+                                                                  "\"Plane1\"; select it by hand if SolidWorks "
+                                                                  "numbered it differently"})
+    _circle_cut(x, y, d, depth, lines, start)
+    if cbore_d and cbore_depth:
+        lines.append(f"    ' counterbore: a second cut, {float(cbore_d):g} mm wide and {float(cbore_depth):g} mm deep")
+        _circle_cut(x, y, float(cbore_d), float(cbore_depth), lines, start)
+        report["manual"].append({"feature": fid, "what": "the counterbore is two cuts, not a Hole Wizard hole; "
+                                                         "check the depth and that the wider cut starts on the "
+                                                         "same face"})
     report["manual"].append({"feature": fid, "what": "hole is a circular cut, not a Hole Wizard hole (no standard "
-                                                     "table can be selected from a macro)"})
+                                                     "table can be selected from a macro); the cut selects the "
+                                                     "sketch by the name \"Sketch\""})
     report["translated"].append({"feature": fid, "op": "hole"})
     return f"Cut_{fid}"
 
@@ -186,6 +247,48 @@ def _fillet_block(fid, p, lines, report):
                  f"Nothing, Nothing, Nothing, Nothing)")
     report["translated"].append({"feature": fid, "op": "fillet"})
     return f"Fillet_{fid}"
+
+
+def _chamfer_block(fid, p, lines, report):
+    dist = float(p.get("distance") or 0.0)
+    edges = str(p.get("edges") or "all")
+    lines.append(f"    ' [{fid}] chamfer {dist:g} mm (equal distance) on edges: {edges}")
+    lines.append("    swModel.ClearSelection2 True")
+    if edges in ("all", "ALL", ""):
+        lines.append("    ' IDRIS chamfered every edge; select the edges you want here (SelectAll picks faces)")
+        lines.append("    boolstatus = swModel.Extension.SelectByID2(\"\", \"EDGE\", 0, 0, 0, True, 0, Nothing, 0)")
+        report["manual"].append({"feature": fid, "what": "edge selection for 'all' edges is left to the engineer"})
+    else:
+        lines.append(f"    ' edges selector in IDRIS: {edges}")
+    lines.append("    ' 18 = swChamferDistanceDistance (2) Or swChamferEqualDistance (16): one distance on both sides")
+    lines.append(f"    Set swFeat = swFeatureMgr.InsertFeatureChamfer(0, 18, {_m(dist)}, 0, {_m(dist)}, {_m(dist)}, "
+                 f"{_m(dist)}, 0)")
+    report["translated"].append({"feature": fid, "op": "chamfer"})
+    return f"Chamfer_{fid}"
+
+
+def _mirror_block(fid, p, last_solid, lines, report):
+    plane = str(p.get("plane") or "XY").upper()
+    sw_plane = PLANE.get(plane, "Front Plane")
+    if not last_solid:
+        lines.append(f"    ' [{fid}] NOT TRANSLATED (mirror): there is no solid feature before it to mirror")
+        report["skipped"].append({"feature": fid, "op": "mirror",
+                                  "reason": "a mirror needs a solid feature before it"})
+        return None
+    lines.append(f"    ' [{fid}] mirror the feature above ({last_solid}) about {plane} ({sw_plane})")
+    lines.append("    swModel.ClearSelection2 True")
+    lines.append("    ' the last feature in the tree is the one the mirror copies; mark 1 = to mirror, mark 2 = plane")
+    lines.append("    Set swFeat = swModel.FeatureByPositionReverse(1)")
+    lines.append("    boolstatus = swFeat.Select2(False, 1)")
+    lines.append(f"    boolstatus = swModel.Extension.SelectByID2(\"{sw_plane}\", \"PLANE\", 0, 0, 0, True, 2, "
+                 f"Nothing, 0)")
+    lines.append("    ' 0 = swFeatureScope_AllBodies")
+    lines.append("    Set swFeat = swFeatureMgr.InsertMirrorFeature2(False, False, False, False, 0)")
+    report["manual"].append({"feature": fid, "what": "the mirror copies the last feature in the tree "
+                                                             "(FeatureByPositionReverse(1)); use the FeatureManager if "
+                                                             "that is not the feature you meant"})
+    report["translated"].append({"feature": fid, "op": "mirror"})
+    return f"Mirror_{fid}"
 
 
 def _pattern_block(fid, p, lines, report):
@@ -227,7 +330,7 @@ def macro_from_model(model: dict, name: str = "part") -> dict:
         raise ValueError("the model has no feature tree, so there is nothing to rebuild: export STEP instead")
     lines = _header(name, model)
     report = {"translated": [], "manual": [], "skipped": [], "notes": []}
-    last_sketch, last_plane = None, "XY"
+    last_sketch, last_plane, last_solid = None, "XY", None
     for f in feats:
         fid = str(f.get("id") or f"f{len(report['translated']) + 1}")
         op = str(f.get("op") or "").lower()
@@ -236,15 +339,24 @@ def macro_from_model(model: dict, name: str = "part") -> dict:
             last_sketch = _sketch_block(fid, p, lines, report)
             last_plane = str(p.get("plane") or "XY").upper()
         elif op == "extrude" and last_sketch:
-            _extrude_block(fid, p, last_sketch, lines, report)
+            last_solid = _extrude_block(fid, p, last_sketch, lines, report) or last_solid
         elif op == "revolve" and last_sketch:
-            _revolve_block(fid, p, last_sketch, last_plane, lines, report)
+            last_solid = _revolve_block(fid, p, last_sketch, last_plane, lines, report) or last_solid
         elif op == "hole":
-            _hole_block(fid, p, last_plane, lines, report)
+            last_solid = _hole_block(fid, p, last_plane, lines, report) or last_solid
         elif op == "fillet":
-            _fillet_block(fid, p, lines, report)
+            last_solid = _fillet_block(fid, p, lines, report) or last_solid
+        elif op == "chamfer":
+            last_solid = _chamfer_block(fid, p, lines, report) or last_solid
+        elif op == "mirror":
+            last_solid = _mirror_block(fid, p, last_solid, lines, report) or last_solid
         elif op == "pattern":
-            _pattern_block(fid, p, lines, report)
+            last_solid = _pattern_block(fid, p, lines, report) or last_solid
+        elif op == "not_translated":
+            what = str(p.get("what") or op)
+            why = str(p.get("why") or "IDRIS marked this feature as not translated")
+            report["skipped"].append({"feature": fid, "op": what, "reason": why})
+            lines.append(f"    ' [{fid}] NOT TRANSLATED ({what}): {why}")
         else:
             reason = ("a sketch must exist before a solid feature" if op in ("extrude", "revolve")
                       else f"no SolidWorks mapping for op '{op}'")
@@ -264,7 +376,10 @@ def macro_from_model(model: dict, name: str = "part") -> dict:
         "Generated from the documented SolidWorks API; NOT executed in SolidWorks here (there is no SolidWorks "
         "in this sandbox). Someone with SolidWorks has to run it once and check the rebuild.",
         "Lengths are metres (API unit); each line's comment repeats the millimetre value IDRIS used.",
-        "A hole becomes a circular cut, not a Hole Wizard hole; a fillet on 'all' edges needs the edges selected.",
+        "A hole becomes a circular cut, not a Hole Wizard hole; a fillet or chamfer on 'all' edges needs the "
+        "edges selected; a counterbore is two cuts; a mirror copies the last feature in the tree.",
+        "The chamfer uses InsertFeatureChamfer in equal-distance mode and the mirror uses InsertMirrorFeature2 "
+        "(swFeatureScope_AllBodies); both are documented SolidWorks API calls, not verified against a rebuild.",
     ]
     return report
 

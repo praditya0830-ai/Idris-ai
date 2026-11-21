@@ -13,6 +13,11 @@ buyer's CAD expects when the file is opened as an assembly:
 
 What it is not: analytic cylinders or NURBS (faces stay faceted; the CAD tool can measure and section them, but a
 hole is a polygon, not a cylinder), and not a SolidWorks native file -- that cannot be written without SolidWorks.
+
+v0.39.1: the writer no longer trusts the client's vertex sharing. Before a shell is built, coincident vertices
+are welded with a relative tolerance, degenerate triangles are dropped and every edge must be shared by exactly
+two triangles. A Studio that sends one vertex per triangle used to produce nine separate solids for one bracket;
+now it produces one, and the per-part solid count is reported instead of being sent silently.
 """
 from __future__ import annotations
 
@@ -24,6 +29,52 @@ from .step_export import _W, _components, _fmt, _pt, _solid, check_step, step_so
 
 SCHEMA_AP242 = "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }"
 DEFAULT_COLOUR = (0.72, 0.73, 0.75)
+WELD_REL_TOL = 1e-6          # x the part's diagonal
+WELD_MIN_MM = 1e-4           # never coarser than this, never so fine that a rounded float fails to weld
+
+
+def _weld_part(verts, faces):
+    """Merge coincident vertices and drop degenerate triangles -> (V, F, info).
+
+    A client may send every triangle with its own three vertices (a triangle soup); the shell then has no shared
+    edges and each triangle becomes a solid of its own. Welding here means the writer does not depend on the
+    client having done it.
+    """
+    V = np.asarray(verts, float).reshape(-1, 3)
+    F = np.asarray(faces, int).reshape(-1, 3)
+    if not len(V) or not len(F):
+        raise ValueError("needs verts and faces")
+    if F.max() >= len(V) or F.min() < 0:
+        raise ValueError("faces point outside verts")
+    diag = float(np.linalg.norm(V.max(0) - V.min(0)))
+    tol = max(WELD_REL_TOL * diag, WELD_MIN_MM)
+    keep = (F[:, 0] != F[:, 1]) & (F[:, 1] != F[:, 2]) & (F[:, 0] != F[:, 2])
+    F = F[keep]
+    e1 = V[F[:, 1]] - V[F[:, 0]]
+    e2 = V[F[:, 2]] - V[F[:, 0]]
+    F = F[np.linalg.norm(np.cross(e1, e2), axis=1) > 1e-12]
+    if not len(F):
+        raise ValueError("every triangle is degenerate (zero area)")
+    key = np.round(V / tol).astype(np.int64)
+    _k, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    inv = np.asarray(inv).reshape(-1)            # numpy 2 returns it shaped like the input
+    Fw = inv[F]
+    keep = (Fw[:, 0] != Fw[:, 1]) & (Fw[:, 1] != Fw[:, 2]) & (Fw[:, 0] != Fw[:, 2])
+    Fw = Fw[keep]
+    info = {"vertices_in": int(len(V)), "vertices_used": int(len(np.unique(Fw))),
+            "triangles_in": int(len(faces)), "triangles_used": int(len(Fw)),
+            "tolerance_mm": round(float(tol), 6)}
+    return V[first], Fw, info
+
+
+def _open_edges(F, nvert):
+    """-> (edges not shared by exactly two triangles, total edges). A solid needs a closed shell."""
+    e = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]).astype(np.int64)
+    lo = np.minimum(e[:, 0], e[:, 1])
+    hi = np.maximum(e[:, 0], e[:, 1])
+    key = lo * max(int(nvert), 1) + hi
+    _u, counts = np.unique(key, return_counts=True)
+    return int((counts != 2).sum()), int(len(key))
 
 
 def _axis(w, point, z, x):
@@ -81,11 +132,23 @@ def write_step_ap242(parts, title="Idris part", author="Idris AI (ACE solver)"):
     w.add(f"SHAPE_DEFINITION_REPRESENTATION(#{asm_pds},#{asm_rep})")
 
     solids, stats, styled, nauo = [], [], [], []
+    solids_per_part: dict = {}
+    weld_stats: list = []
+    warnings: list = []
     for i, p in enumerate(parts):
         name = str(p.get("name") or f"part {i + 1}").replace("'", "")
-        V = np.asarray(p["verts"], float).reshape(-1, 3)
-        F = np.asarray(p["faces"], int).reshape(-1, 3)
+        V, F, welded = _weld_part(p["verts"], p["faces"])
+        weld_stats.append({"part": name, **welded})
+        nopen, nedges = _open_edges(F, len(V))
+        if nopen:
+            raise ValueError(f"the mesh of part '{name}' is not closed: {nopen} of {nedges} edge(s) are not "
+                             f"shared by exactly two triangles, so no solid can be built from it; weld the "
+                             f"vertices or close the shell")
         ncomp = len(_components(F))
+        solids_per_part[name] = ncomp
+        if ncomp > 1:
+            warnings.append(f"part '{name}' is {ncomp} separate closed bodies; they are written as {ncomp} "
+                            f"solids of one product. Send one connected shell if it should be a single body")
         pp = w.add(f"PRODUCT('{name}','{name}','',(#{pctx}))")
         ppf = w.add(f"PRODUCT_DEFINITION_FORMATION('','',#{pp})")
         ppd = w.add(f"PRODUCT_DEFINITION('part','',#{ppf},#{pdc})")
@@ -127,7 +190,10 @@ def write_step_ap242(parts, title="Idris part", author="Idris AI (ACE solver)"):
     text = "\n".join(head + w.lines + ["ENDSEC;", "END-ISO-10303-21;"]) + "\n"
     return text, {"format": "STEP AP242", "products": [str(p.get("name") or "") for p in parts],
                   "solids": len(solids), "instances": len(nauo), "styled_items": len(styled),
-                  "units": "mm, rad", "faces": sum(s["faces"] for s in stats), "parts_detail": stats}
+                  "units": "mm, rad", "faces": sum(s["faces"] for s in stats), "parts_detail": stats,
+                  "solids_per_part": solids_per_part, "warnings": warnings, "weld": weld_stats,
+                  "sew": "coincident vertices welded in the writer (relative tolerance); OCP is not installed "
+                         "in this environment, so BRepBuilderAPI_Sewing was not used"}
 
 
 def step_references_ok(text: str) -> tuple:
