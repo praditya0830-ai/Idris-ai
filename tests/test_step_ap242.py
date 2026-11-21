@@ -1,5 +1,11 @@
-"""STEP AP242 export (P5a): named products, colours, units, assembly tree -- and the AP214 export untouched."""
+"""STEP AP242 export (P5a): named products, colours, units, assembly tree -- and the AP214 export untouched.
+
+v0.39.1 adds the client-independence the Studio found the hard way: a mesh sent as triangle soup (one vertex per
+triangle) used to become nine solids for one part. The writer now welds, drops degenerate triangles, refuses an
+open shell, and reports the solid count per part.
+"""
 import numpy as np
+import pytest
 
 from assembly3d import build_box
 from engine_routes import handle_post
@@ -77,6 +83,57 @@ def test_the_route_refuses_an_empty_part_list():
     assert code == 400 and body["success"] is False
     code, body = handle_post("/exchange/step-ap242", {"parts": [{"name": "x"}]})
     assert code == 400 and "verts" in body["error"]
+
+
+def _soup(verts, faces):
+    """The same closed box, but with every triangle carrying its own three vertices."""
+    V, F = np.asarray(verts, float), np.asarray(faces, int)
+    sv, sf = [], []
+    for tri in F:
+        base = len(sv)
+        sv += [V[i].tolist() for i in tri]
+        sf.append([base, base + 1, base + 2])
+    return sv, sf
+
+
+def test_a_triangle_soup_welds_into_one_solid_with_the_same_volume():
+    v, f = build_box(0, 10, 0, 10, 0, 10)
+    sv, sf = _soup(v, f)
+    assert len(sv) == 36 and len(sf) == 12
+    text, stats = write_step_ap242([{"name": "cube", "verts": sv, "faces": sf}], title="cube")
+    assert stats["solids"] == 1 and stats["solids_per_part"] == {"cube": 1}
+    assert stats["warnings"] == []
+    assert stats["weld"][0]["vertices_in"] == 36 and stats["weld"][0]["vertices_used"] == 8
+    assert stats["weld"][0]["tolerance_mm"] == 1e-4
+    vols = list(step_solid_volumes(text).values())
+    assert len(vols) == 1 and abs(abs(vols[0]) - 1000.0) < 1e-6
+
+
+def test_the_route_reports_the_solid_count_per_part():
+    v, f = build_box(0, 10, 0, 10, 0, 10)
+    sv, sf = _soup(v, f)
+    code, body = handle_post("/exchange/step-ap242", {"title": "cube", "parts": [{"name": "cube", "verts": sv, "faces": sf}]})
+    assert code == 200 and body["solids_per_part"] == {"cube": 1} and body["warnings"] == []
+
+
+def test_a_mesh_with_a_hole_is_refused_with_the_open_edge_count():
+    v, f = build_box(0, 10, 0, 10, 0, 10)
+    faces = np.asarray(f)[:-2].tolist()               # drop one face: the shell is no longer closed
+    with pytest.raises(ValueError, match="not closed"):
+        write_step_ap242([{"name": "open", "verts": v, "faces": faces}])
+    code, body = handle_post("/exchange/step-ap242", {"parts": [{"name": "open", "verts": v, "faces": faces}]})
+    assert code == 400 and body["success"] is False and "not closed" in body["error"]
+    assert "4 of" in body["error"]
+
+
+def test_a_part_with_two_bodies_says_so_instead_of_writing_silently():
+    a, b = _mesh(0, 10, 0, 10, 0, 10), _mesh(30, 40, 0, 10, 0, 10)
+    V = np.vstack([np.asarray(a["verts"], float), np.asarray(b["verts"], float)])
+    F = np.vstack([np.asarray(a["faces"], int), np.asarray(b["faces"], int) + 8])
+    text, stats = write_step_ap242([{"name": "pair", "verts": V, "faces": F}], title="pair")
+    assert stats["solids"] == 2 and stats["solids_per_part"] == {"pair": 2}
+    assert stats["warnings"] and "2 separate closed bodies" in stats["warnings"][0]
+    assert read_back(text)["solids"] == 2
 
 
 def test_the_ap214_export_is_unchanged():

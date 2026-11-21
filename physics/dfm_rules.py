@@ -94,8 +94,10 @@ INSIDE_CORNER_SOURCE = ("Milling guideline, source not verified: the smallest in
                         "from the sketch, so this check stays not_checked.")
 
 
-def _check(cid: str, name: str, status: str, *, value=None, limit=None, unit: str = "mm",
+def _check(cid: str, name: str, status: str, *, value=None, limit=None, unit: str | None = None,
            source: str | None = None, source_status: str | None = None, message: str = "") -> dict:
+    # v0.39.1: the default used to be "mm", which put millimetres on a hole COUNT. A check now states the unit
+    # of what it measured: mm for a length, count for a number of features, none when nothing was measured.
     out = {"id": cid, "check": name, "status": status, "unit": unit, "message": message}
     if value is not None:
         out["value"] = value
@@ -134,14 +136,14 @@ def check(cad: dict) -> dict:
             leg = weld_fillet_min_mm(value)
             ok = value + 1e-9 >= leg
             checks.append(_check("min_wall", f"minimum fillet leg ({label})", "pass" if ok else "fail",
-                                 value=value, limit=leg, source=WELD_SOURCE, source_status=VERIFIED,
+                                 value=value, limit=leg, unit="mm", source=WELD_SOURCE, source_status=VERIFIED,
                                  message=(f"{value:g} mm wall takes at least a {leg:g} mm fillet leg "
                                           f"(AWS D1.1 Table 7.7)" if ok else
                                           f"{value:g} mm wall needs at least a {leg:g} mm fillet leg; this leg "
                                           f"is below the AWS D1.1 Table 7.7 minimum")))
             continue
         if limit is None:
-            checks.append(_check("min_wall", f"minimum wall ({label})", "not_checked", value=value,
+            checks.append(_check("min_wall", f"minimum wall ({label})", "not_checked", value=value, unit="mm",
                                  message=f"no minimum-wall rule for process '{process or 'unknown'}' and "
                                          f"material '{material or 'unknown'}'; not guessed"))
             continue
@@ -152,7 +154,7 @@ def check(cad: dict) -> dict:
                    f"{'minimum' if status == 'fail' else 'guideline'} for {process} {material}")
         if status == "warn":
             message += "; the guideline's source is not verified, so this is a warning, not a failure"
-        checks.append(_check("min_wall", f"minimum wall ({label})", status, value=value, limit=limit,
+        checks.append(_check("min_wall", f"minimum wall ({label})", status, value=value, limit=limit, unit="mm",
                              source=rule.get("text"), source_status=rule.get("status"), message=message))
     if not walls:
         checks.append(_check("min_wall", "minimum wall", "not_checked",
@@ -171,12 +173,14 @@ def check(cad: dict) -> dict:
                 odd.append(round(d, 2))
         if odd:
             checks.append(_check("drill_size", "hole diameters in the drill series", "fail",
-                                 value=sorted(set(odd)), source=DRILL_SOURCE, source_status=DRILL_SOURCE_STATUS,
+                                 value=sorted(set(odd)), unit="mm", source=DRILL_SOURCE,
+                                 source_status=DRILL_SOURCE_STATUS,
                                  message=f"no standard drill for {', '.join(f'{d:g}' for d in sorted(set(odd)))} mm; "
                                          f"mill or ream it, or use the nearest drill diameter"))
         else:
             checks.append(_check("drill_size", "hole diameters in the drill series", "pass",
-                                 value=len(holes), source=DRILL_SOURCE, source_status=DRILL_SOURCE_STATUS,
+                                 value=len(holes), unit="count", source=DRILL_SOURCE,
+                                 source_status=DRILL_SOURCE_STATUS,
                                  message=f"{len(holes)} hole(s) take a standard drill diameter"))
     else:
         checks.append(_check("drill_size", "hole diameters in the drill series", "not_checked",
@@ -185,7 +189,7 @@ def check(cad: dict) -> dict:
     # 3) inside corner radius: known from the process rule, but not measurable from the parameters
     if process == "cnc":
         checks.append(_check("inside_corner_radius", "inside corner radius", "not_checked",
-                             limit=INSIDE_CORNER_MIN_MM, source=INSIDE_CORNER_SOURCE,
+                             limit=INSIDE_CORNER_MIN_MM, unit="mm", source=INSIDE_CORNER_SOURCE,
                              message="the corner radius lives in the sketch; the rule is at least 3 mm for a 3 mm "
                                      "cutter, but it is not measured here"))
     else:
