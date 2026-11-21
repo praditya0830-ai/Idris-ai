@@ -352,7 +352,10 @@ cast) and `material`, and answers with findings that each carry a number, a limi
   holes, `fraction` for a share of the surface. A count is never labelled millimetres (v0.39.1).
 - **hole diameters** — checked against the DIN 338 / ISO 235 twist-drill series *when the caller declares the
   holes*. A hole cannot be recognised reliably in a faceted mesh (a bore, a slot and a tessellation artefact look
-  alike), so an undeclared hole is `not_checked`, never a pass.
+  alike), so an undeclared hole is `not_checked`, never a pass. The finding also carries `diameters_mm`: one row
+  per declared diameter with the number of holes, whether the series has it, and the nearest standard drill
+  (`[{"d_mm": 6.2, "standard_drill_mm": 6.0, "in_series": false, "holes": 1}]`), so a pass is not just a count
+  signed off (X1b).
 - **overhang** (FDM) — the share of the surface whose normal leans more than 45 deg from the build direction.
 - **draft** (cast) — the share of the surface within 1 deg of parallel to the pull direction.
 - **undercuts, tool access, inside corner radius** — `not_checked` with the reason: they need the solid and the
