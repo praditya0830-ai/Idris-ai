@@ -314,6 +314,17 @@ def test_the_drill_check_lists_each_diameter_and_the_drill_that_makes_it():
     assert drill["status"] == "fail" and drill["unit"] == "mm"
 
 
+def test_the_route_passes_the_table_on_instead_of_a_fixed_key_list():
+    # the adapter used to rebuild each finding from a whitelist, which dropped diameters_mm before the answer
+    code, body = handle_post("/dfm/part", dict(PLATE, process="cnc", material="aluminium",
+                                               holes=[{"d": 6.0}, {"d": 6.2}]))
+    assert code == 200
+    drill = [f for f in body["outputs"]["findings"] if f["id"] == "drill_size"][0]
+    rows = {r["d_mm"]: r for r in drill["diameters_mm"]}
+    assert rows[6.0]["in_series"] is True and rows[6.2]["in_series"] is False
+    assert rows[6.2]["standard_drill_mm"] == 6.0 and drill["unit"] == "mm"
+
+
 def test_a_passing_drill_check_carries_the_same_table():
     ok = dfm_rules.check({"process": "cnc", "material": "aluminium", "holes": [{"d": 8.0}, {"d": 8.0}]})
     drill = [c for c in ok["checks"] if c["id"] == "drill_size"][0]
