@@ -356,6 +356,18 @@ buyer can be given instead:
   `chamfer` and `mirror` are carried by the exchange path (macro and `/model/validate`); the server-side kernel
   builder answers with a named `BuildError` rather than guessing geometry it cannot build.
 
+**The graph the Studio sends is checked first** (`POST /model/validate`, X3). The answer carries:
+
+- `ok` and `errors` (strings, as before) plus `problems`: one entry per rejected feature with `feature`, `op` and
+  the message, so the editor can put it next to the feature;
+- `dims` with every expression resolved, and the resolved `model` that the macro route can then take unchanged;
+- `exchange_only`: the features the exchange path carries but the server-side kernel does not build
+  (`chamfer`, `mirror`, `not_translated`); they validate, and the builder says so instead of guessing;
+- a dimension that cannot be resolved (a cycle, an unknown name) is an error in the answer, never a 500.
+
+A coordinate is not a length: `x`, `y`, `cx`, `cy` and `z_top` may be 0 or negative (a hole at y = 0 is a hole).
+A diameter, a distance, a radius or a depth may not.
+
 **Not tested in SolidWorks.** There is no SolidWorks in this environment, so the macro is checked only for VBA
 structure (balanced blocks, only VBA statements, `Application.SldWorks` present) and for content (every feature is
 either an API call or a stated skip). Someone with SolidWorks has to run it once and confirm the rebuild. The

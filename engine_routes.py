@@ -279,24 +279,30 @@ def handle_get(path: str):
 
 
 def _validate_features(model: dict):
-    """Build the graph feature by feature so every broken feature is named, not just the first."""
+    """Build the graph feature by feature so every broken feature is named, not just the first.
+
+    X3: every problem keeps the feature it came from, so the Studio can put the message next to the feature
+    instead of showing one list. -> (graph or None, [{"feature", "op", "error"}])
+    """
     features = model.get("features")
     if not isinstance(features, list):
-        return None, ["'features' must be a list"]
+        return None, [{"feature": None, "op": None, "error": "'features' must be a list"}]
     dims = model.get("dims") if isinstance(model.get("dims"), dict) else {}
     g = Graph(str(model.get("model_id") or "model"), dims=dims)
-    errors = []
+    problems = []
     for i, spec in enumerate(features):
         if not isinstance(spec, dict) or not spec.get("id") or not spec.get("op"):
-            errors.append(f"feature #{i}: an object with id and op is required")
+            problems.append({"feature": None, "op": None,
+                             "error": f"feature #{i}: an object with id and op is required"})
             continue
         try:
             g.add(str(spec["id"]), str(spec["op"]), spec.get("deps") or (), spec.get("params") or {})
         except GraphError as exc:
-            errors.append(str(exc))
+            problems.append({"feature": str(spec["id"]), "op": str(spec["op"]), "error": str(exc)})
         except Exception as exc:
-            errors.append(f"{spec.get('id')}: {type(exc).__name__}: {exc}")
-    return g, errors
+            problems.append({"feature": str(spec["id"]), "op": str(spec["op"]),
+                             "error": f"{spec['id']}: {type(exc).__name__}: {exc}"})
+    return g, problems
 
 
 def _model_body(params):
@@ -326,12 +332,24 @@ def handle_post(base: str, params: dict):
         model = _model_body(params)
         if model is None:
             return 400, {"success": False, "error": "expected a model object with a 'features' list"}
-        g, errors = _validate_features(model)
+        g, problems = _validate_features(model)
         if g is None:
-            return 400, {"success": False, "error": errors[0]}
-        return 200, {"success": True, "ok": not errors, "errors": errors, "order": g.topo(),
-                     "dims": g.resolved_dims(), "features": len(g),
+            return 400, {"success": False, "error": problems[0]["error"],
+                         "errors": [p["error"] for p in problems], "problems": problems}
+        errors = [p["error"] for p in problems]
+        try:
+            dims = g.resolved_dims()
+        except Exception as exc:                      # a dimension that cannot be resolved is an error, not a 500
+            msg = f"dims: {exc}"
+            errors.append(msg)
+            problems.append({"feature": None, "op": None, "error": msg})
+            dims = {}
+        # features the exchange path carries but the server-side kernel does not build (X2/X3)
+        exchange_only = [f.id for f in g.features() if f.op in ("chamfer", "mirror", "not_translated")]
+        return 200, {"success": True, "ok": not errors, "errors": errors, "problems": problems,
+                     "order": g.topo(), "dims": dims, "features": len(g),
                      "rejected": len(model.get("features") or []) - len(g),
+                     "exchange_only": exchange_only,
                      "model": g.to_dict() if not errors else None}
 
     if base == "/assembly/manifest":
