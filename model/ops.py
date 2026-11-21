@@ -138,7 +138,9 @@ def validate_params(op: str, params, dims: dict):
         except E.ExprError as exc:
             errors.append(f"{op}.{name}: {exc}")
             continue
-        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg", "offset", "cx", "cy", "z_top"):
+        # X3: a coordinate may be 0 or negative (a hole at y = 0 is a hole), a length or a diameter may not
+        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg", "offset", "cx", "cy", "z_top",
+                                       "x", "y"):
             errors.append(f"{op}.{name}: must be > 0, got {value}")
             continue
         resolved[name] = value
