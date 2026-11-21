@@ -59,13 +59,15 @@ PLATE = {**_box_mesh(20, 20, 2), "process": "cnc", "material": "aluminium"}
 BLOCK = {**_box_mesh(40, 20, 10), "process": "fdm", "material": "pla"}
 
 register(SolverSpec(
-    name="dfm_part", version="1.0.0", domain="manufacturing", fidelity="L2",
-    summary="Manufacturability of any part from its triangle mesh: measured wall thickness (ray cast), FDM "
-            "overhang, cast draft, declared hole diameters against the drill series, each with the rule's "
-            "source and source status.",
-    method="Voxel ray casting from every sampled surface triangle along its inward normal for wall thickness; "
-           "face-normal angles for FDM overhang and cast draft; limits from physics/dfm_rules.py (AWS D1.1 "
-           "Table 7.7, DIN 338 / ISO 235 series, workshop guidelines marked as such)",
+    name="dfm_part", version="1.1.0", domain="manufacturing", fidelity="L2",
+    summary="Manufacturability of any part from its triangle mesh: measured wall thickness (exact ray-triangle "
+            "cast), FDM overhang, cast draft, declared hole diameters against the drill series, each with the "
+            "rule's source and source status.",
+    method="Exact Moller-Trumbore ray casting from every sampled surface triangle along its inward normal, "
+           "accelerated by a uniform triangle grid, for wall thickness (a voxel fallback reports its cell size "
+           "above 150k triangles); face-normal angles for FDM overhang and cast draft; limits from "
+           "physics/dfm_rules.py (AWS D1.1 Table 7.7, DIN 338 / ISO 235 series, workshop guidelines marked as "
+           "such)",
     schema={
         "stl_base64": {"type": "string", "max_len": 30_000_000},
         "positions": {"type": "array", "items_type": "number", "max_items": 3_000_000},
@@ -81,16 +83,19 @@ register(SolverSpec(
     run=_run, progress=True,
     benchmarks=[
         Benchmark("plate-20x20x2-wall",
-                  "Geometry self-check, not a published benchmark: a 20 x 20 x 2 mm plate has a 2 mm wall, so "
-                  "the measured 5th-percentile thickness must be 2 mm within the grid resolution",
+                  "Geometry self-check, not a published benchmark: a 20 x 20 x 2 mm plate has a 2 mm wall, and "
+                  "the exact ray cast must return 2 mm within 0.25 mm",
                   PLATE, {"outputs.wall.p5_mm": 2.0}, 0.25),
         Benchmark("block-40x20x10-wall",
                   "Geometry self-check, not a published benchmark: a 40 x 20 x 10 mm block has a 10 mm wall",
                   BLOCK, {"outputs.wall.min_mm": 10.0}, 0.15),
     ],
     limitations=[
-        "wall thickness is quantised by the voxel resolution it reports (±1 voxel); a wall thinner than one "
-        "voxel is reported as one voxel",
+        "wall thickness comes from an exact ray-triangle cast, so it is as accurate as the mesh; a wall the ray "
+        "leaves through an opening in an unclosed mesh cannot be measured and is counted as unresolved, never "
+        "reported as a thick wall",
+        "above 150k triangles the voxel fallback is used and reports its cell as resolution_mm; a limit finer "
+        "than a quarter of that cell is not_checked instead of pass/fail",
         "holes, undercuts, tool access and inside corner radius are not recognised in a triangle mesh; holes "
         "are only checked when the caller declares them",
         "overhang and draft limits are workshop guidelines, not clauses in a standard, so they are warnings",

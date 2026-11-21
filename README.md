@@ -313,6 +313,11 @@ buyer can be given instead:
   units stated in the geometric context, and an assembly tree: one `NEXT_ASSEMBLY_USAGE_OCCURRENCE` plus a
   `REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION` per instance, so each part lands at its own rotation and
   translation. Faces stay planar polygons — a bore is a polygon, not an analytic cylinder.
+  The writer does not trust the client's vertex sharing: before a shell is built, coincident vertices are welded
+  with a relative tolerance (1e-6 × the diagonal, at least 1e-4 mm), degenerate triangles are dropped, and every
+  edge has to be shared by exactly two triangles. A triangle soup that used to become nine solids for one part
+  now becomes one (v0.39.1); `solids_per_part` and `warnings` are returned, and a mesh with open edges is refused
+  with the number of open edges rather than written silently.
   Self-check: every `#id` reference resolves, every edge is used once per direction, and the file is read back
   (products, solid count, volumes by the divergence theorem) before it is returned. Reading it with OpenCascade
   could not be done here: `OCP` is not installed in this environment, so that check is reported as not run.
@@ -335,10 +340,16 @@ DWG is still not written: the drawing export is DXF (see the Drawing route).
 `POST /dfm/part` takes the same triangle mesh as `POST /part-check` plus `process` (cnc, fdm, sls, sheet, weld,
 cast) and `material`, and answers with findings that each carry a number, a limit and the limit's source:
 
-- **wall thickness** — measured, not read from a parameter list: rays are cast from the surface along the inward
-  face normal through a voxel grid until the solid ends. The answer carries `resolution_mm` (one voxel) next to
-  the numbers, because that is the measurement's own uncertainty; a wall the ray never leaves is reported as *at
-  least* so long. Statistics: min, 5th percentile (what the limit is compared with), median, max.
+- **wall thickness** — measured, not read from a parameter list: an exact ray-triangle cast (Möller–Trumbore) is
+  fired from sampled surface triangles along the inward face normal to the first other surface of the part, so
+  the value is as accurate as the mesh rather than one voxel wide. (v0.39.1: the cast used to run through a voxel
+  grid whose edge came from the shortest side of the bounding box — an 80 × 60 × 60 bracket with 5 mm walls read
+  "7.5 ± 5 mm", because its cell was 7.5 mm. It is now 5.0 mm.) Above 150k triangles the voxel fallback is used
+  and reports its cell as `resolution_mm`; a limit finer than a quarter of that cell makes the check
+  `not_checked` with that reason, never pass/fail. `method` and `resolution_mm` travel with the numbers.
+  Statistics: min, 5th percentile (what the limit is compared with), median, max.
+- **units** — every finding states the unit of what it measured: `mm` for a length, `count` for a number of
+  holes, `fraction` for a share of the surface. A count is never labelled millimetres (v0.39.1).
 - **hole diameters** — checked against the DIN 338 / ISO 235 twist-drill series *when the caller declares the
   holes*. A hole cannot be recognised reliably in a faceted mesh (a bore, a slot and a tessellation artefact look
   alike), so an undeclared hole is `not_checked`, never a pass.
