@@ -38,6 +38,7 @@ Setiap stage baru di backend otomatis muncul di UI — tidak perlu kerja UI tamb
 |---|---|---|
 | `GET /health` | status `Engine: connected / connecting…` | main.py:169 |
 | `POST /chat` | percakapan AI → requirements / `cad` JSON | main.py:638 |
+| `POST /chat` route `brief` (v0.40) | permintaan desain yang belum lengkap → `questions` + `suggestions` + `brief` (ingatan percakapan, dikirim balik sebagai `context.brief`); tidak ada codegen/planner sampai `ready` dan engineer mulai | brief.py |
 | `POST /fea` + `GET /fea/<id>` | tab Simulate (analisis housing per varian) | main.py:152, analysis.py:3 |
 | `POST /modal` + polling | frekuensi alami | main.py:152 |
 | `POST /cfd` + polling | analisis termal | main.py:152 |

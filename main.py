@@ -709,6 +709,50 @@ class Handler(BaseHTTPRequestHandler):
         ai = (lambda m: llm.parse_part(m, provider)) if llm.provider_order() else None
         return design_from_message(message, OUTPUT_DIR, uuid.uuid4().hex[:8], ai, self._base_url())
 
+    def _chat_brief(self, msg: str, ctx, routed, provider=None, reply_language=None) -> dict:
+        """v0.40 design brief: ask like an engineer until the sentence says enough, then ask how many concepts.
+
+        -> {"continue": True, "brief", "message", "kind"} when the design path may go on (the brief says enough and
+        the engineer said start, or the AI is away and the old path is the honest fallback), or
+        {"continue": False, "out"} with the brief reply. No codegen and no assembly planner runs in this method.
+        """
+        import brief as B
+        prev = B.from_context(ctx)
+        b = B.merge(prev or B.blank(routed.get("kind")), routed.get("brief") or {}, msg)
+        kind = (b.get("kind") if b.get("kind") in ("part", "assembly") else (routed.get("kind") or "part"))
+        b["kind"] = kind
+        lang = B.language(msg, reply_language)
+        # "just design it with your assumptions": continue now, and every gap is written down as assumed
+        if B.wants_assumptions(msg) and any(b.get(k) for k in ("object", "purpose", "key_sizes", "envelope")):
+            b = B.with_assumptions(b)
+            return {"continue": True, "brief": b, "message": B.as_request(b), "kind": kind}
+        miss = B.missing(b)
+        # a sentence that is already complete is never asked about (the router normally sends it straight to design)
+        if not miss and not prev:
+            return {"continue": True, "brief": b, "message": msg, "kind": kind}
+        if not miss and kind == "assembly":
+            return {"continue": True, "brief": b, "message": B.as_request(b), "kind": kind}
+        if not miss:
+            b = {**b, "ready": True, "asked": True}
+            return {"continue": False, "brief": b, "out": B.ready_answer(b, kind, lang)}
+        w = B.write(msg, b, miss, provider, lang)
+        if w is None:
+            # the AI could not write the questions: keep the old path instead of pretending to have asked
+            return {"continue": True, "brief": b, "message": msg, "kind": kind}
+        b = B.merge(b, w.get("brief") or {}, msg)
+        miss = B.missing(b)
+        if not miss and kind == "assembly":
+            b = {**b, "ready": True}
+            return {"continue": True, "brief": b, "message": B.as_request(b), "kind": kind}
+        if not miss:
+            b = {**b, "ready": True, "asked": True}
+            return {"continue": False, "brief": b, "out": B.ready_answer(b, kind, lang)}
+        if not w.get("questions"):
+            # the reader filled some fields but asked nothing: do not show an empty question, keep the old path
+            return {"continue": True, "brief": b, "message": msg, "kind": kind}
+        b = {**b, "asked": True}
+        return {"continue": False, "brief": b, "out": B.brief_answer(b, w, kind, lang)}
+
     def _chat_assembly(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
         """Bagian E in /chat: "design whole bicycle" -> a plan of parts, then one job that designs the parts.
 
@@ -1082,15 +1126,48 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(200, self._chat_assembly(msg, ctx, params.get("provider"), rl))
                     return
                 hit = None
+                # v0.40: a brief that is ready and an explicit "start" wins over the router: the design path gets the
+                # decided brief, not a fresh reading of the sentence "3" or "ya".
+                import brief as _BRIEF
+                resumed = None
+                if not (gear_ctx or cad_ctx or eng_ctx):
+                    try:
+                        resumed = _BRIEF.resume(ctx, msg, concept_count)
+                    except Exception:
+                        traceback.print_exc()
+                        resumed = None
                 # v0.34: for a fresh sentence the AI reads first and picks the route; keyword rules are the fallback
                 routed = None
-                if not (gear_ctx or cad_ctx or eng_ctx):
+                if resumed:
+                    concept_count = resumed.get("concept_count") or concept_count
+                    msg = resumed["message"]
+                    ctx = dict(ctx or {})
+                    ctx["brief"] = resumed["brief"]
+                    routed = {"route": "assembly" if resumed["kind"] == "assembly" else "free_design",
+                              "kind": resumed["kind"], "library_id": None, "query": {}, "concepts": [],
+                              "reason": "design brief", "read_by": "design brief"}
+                elif not (gear_ctx or cad_ctx or eng_ctx):
                     try:
                         import cad_router
                         routed = cad_router.route(msg, has_gearbox, params.get("provider"))
                     except Exception:
                         traceback.print_exc()
                         routed = None
+                # Bagian 1.1 (v0.40): the router said the sentence is not enough to start. The brief is written by
+                # the engineer's next answers; no code, no planner, no job is started here.
+                if routed and routed.get("route") == "brief":
+                    br = self._chat_brief(msg, ctx, routed, params.get("provider"), rl)
+                    if not br.get("continue"):
+                        self._send_json(200, br["out"])
+                        return
+                    ctx = dict(ctx or {})
+                    ctx["brief"] = br["brief"]
+                    msg = br["message"]
+                    kind = br.get("kind") or "part"
+                    concept_count = br.get("concept_count") or concept_count
+                    routed = {"route": "assembly" if kind == "assembly" else "free_design", "kind": kind,
+                              "library_id": None, "query": {}, "concepts": [], "reason": "design brief",
+                              "read_by": "design brief"}
                 # Bagian E: the router read a whole product ("whole bicycle", "seluruh sepeda") -- the fat
                 # single-solid path is never taken for it. The reply is the plan and the question "Start?".
                 if routed and routed.get("route") == "assembly":
@@ -1161,7 +1238,10 @@ class Handler(BaseHTTPRequestHandler):
                     concepts = (routed or {}).get("concepts") or []
                     decision = _concept_decision(routed, ctx, concept_count)      # UI v66 B
                     if decision == "ask":
-                        self._send_json(200, _ask_concept_count(routed))
+                        ask = _ask_concept_count(routed)
+                        if ctx and isinstance(ctx.get("brief"), dict):
+                            ask["brief"] = ctx["brief"]
+                        self._send_json(200, ask)
                         return
                     if decision == "job":
                         import design_job as _dj
@@ -1186,6 +1266,8 @@ class Handler(BaseHTTPRequestHandler):
                         out = self._chat_cad(msg, ctx, params.get("provider"), rl)
                     if routed:
                         out["route"] = routed
+                    if ctx and isinstance(ctx.get("brief"), dict):
+                        out["brief"] = ctx["brief"]
                     self._send_json(200, out)
                     return
                 if not gear_ctx and not eng_ctx and is_prim:

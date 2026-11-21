@@ -6,7 +6,7 @@ thermal analyses. Every solver ships benchmarks with a published source and stat
 limitations; physics is never delegated to an LLM.
 
 - Live: <https://idris-ai-rwd6.onrender.com> (`GET /health` lists every route)
-- Solver version: **0.37.0** · **27** registered solvers · contract **1.0**
+- Solver version: **0.40.0** · **27** registered solvers · contract **1.0**
 - Frontend: [`Idris-studio`](https://github.com/praditya0830-ai/Idris-studio) (separate repo)
 - API contract: [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md)
 
@@ -247,6 +247,44 @@ runs the strength check. `GET /design/job/<job_id>` therefore says not only that
   parameters a repair really changed (`{param, from, to, why}`, `why` being the failed check or FEA number that
   caused it). The full code of old rounds is not repeated; only the round being waited for and the final
   `result.cad` carry code, so a status polled every second stays small.
+
+### Before the design: the brief (v0.40)
+
+A new design — a single part **or** a whole product — is judged for completeness before anything is written. The
+minimum is: (a) what the object is **and** what it is for, (b) its key sizes or the space it must fit, and (c) when
+strength matters, the load or service condition. If one is missing, `POST /chat` returns route **`brief`** and starts
+no code generator and no assembly planner. The reply is an engineer talking, not a form:
+
+```json
+{"route": {"route": "brief", "of": "free_design"}, "answer": "…",
+ "brief": {"object": "drone", "purpose": "", "kind": "part", "envelope": "", "key_sizes": "", "loads": "",
+           "assumptions": [], "decided": [], "open": [], "ready": false},
+ "questions": [{"id": "q1", "text": "What should it carry?", "options": [{"label": "FPV 5-inch", "note": "fast, agile"}],
+                "allow_free_text": true}],
+ "suggestions": [{"id": "s1", "text": "Folding landing gear", "why": "fits in a backpack"}],
+ "ready": false}
+```
+
+- **at most three questions**, each with 2–4 real options and a short qualitative trade-off. A performance number is
+  never invented and is stripped from AI prose (`flies 25 minutes` cannot leave the module); a size class written as
+  the option itself (`5-inch`, `450 mm`) is allowed.
+- **`brief` is the memory of the conversation.** The Studio sends it back as `context.brief` every turn; `merge` only
+  accepts a digit the engineer actually wrote (mm, or cm / m / inch written with that unit), so a reader can fill
+  words but cannot smuggle in a size.
+- **ready**: the reply repeats the brief in one engineer sentence and ends with `Shall I start? How many concepts:
+  3 / 5 / 7 / 10?` plus `ask: {k: "concept_count", …}` — the same question UI v66 B already understands, still with
+  no code written. For an assembly the next turn goes to the existing plan (`POST /assembly/plan`), which still needs
+  its own Start.
+- **just design it with your assumptions**: `langsung aja desain`, `just design it`, `go ahead`, … continues the same
+  turn, and every gap is written into `brief.assumptions` as `{what, value, why, assumed: true}`; the request handed
+  to the code writer carries them, marked assumed.
+- a sentence that is complete from the start never sees the brief: the router sends it to the design path as before.
+  A question in the middle of a brief is answered by the engineer chat; the brief stays.
+- one AI call per brief turn (max_tokens 800) through `ai_budget`. With no AI reachable the route falls back to the
+  old path instead of showing questions nobody wrote. `IDRIS_BRIEF_TIMEOUT_S` (20 s) bounds that call.
+
+The language follows the message (`reply_language` wins when it is set): an Indonesian sentence is answered in
+Indonesian, and technical terms may stay English.
 
 ### How many concepts? (UI v66 B)
 

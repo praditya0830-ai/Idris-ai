@@ -20,7 +20,7 @@ import re
 import llm
 from physics import parts_library as plib
 
-ROUTES = ("library", "primitive", "gearbox", "assembly", "free_design", "other")
+ROUTES = ("library", "primitive", "gearbox", "assembly", "free_design", "other", "brief")
 
 
 def enabled() -> bool:
@@ -39,21 +39,28 @@ def _system(concept_count: int | None = None) -> str:
     n_concepts = max(1, min(10, int(concept_count or 3)))
     text = ("""You are the first reader in IDRIS, an engineering design tool. Read ONE sentence from an engineer and decide
 who handles it. Output ONE JSON object only, no prose:
-{"route": "library"|"primitive"|"gearbox"|"assembly"|"free_design"|"other", "library_id": string|null, "query": {},
- "concepts": [], "reason": "max 12 words"}
+{"route": "brief"|"library"|"primitive"|"gearbox"|"assembly"|"free_design"|"other", "library_id": string|null,
+ "query": {}, "concepts": [], "kind": "part"|"assembly", "brief": {}, "reason": "max 12 words"}
 
 Routes:
+- "brief": a new design (a part OR a whole product) that does not yet say enough to start. Judge this BEFORE the design
+  routes: (a) what the object is AND what it is for, (b) its key sizes or the space/envelope it must fit, (c) when
+  strength matters, the load or service condition. If any of these is missing, return "brief" — never free_design or
+  assembly. Add "kind" ("part" or "assembly") and a "brief" object holding only what the sentence itself says:
+  object, purpose, envelope, key_sizes, loads, material, process, quantity, standards, constraints, features.
+  NEVER put a number in "brief" that the sentence does not contain: a missing size stays out, never a guess.
+  A standard part, a gearbox, a primitive, a question or a change to the open design is never brief.
 - "library": the request IS one standard part from the list below, as a part on its own. NOT a part designed for or
   around a standard part ("bushing for bearing 6205", "holder for an M6 nut", "pillow block for a 6205" are free_design).
 - "primitive": ONLY a plain box/cube, solid cylinder, tube/ring, or flat plate with a simple hole pattern, and
   nothing else in the sentence. Any frame, weldment, slot, step, thread grid, pocket, rib or named product is free_design.
 - "gearbox": design, size or change a gearbox / reducer / gear pair by power, ratio, speed or torque.
-- "assembly": a whole product built from several separate parts that have to fit each other (a bicycle, a cart, a
+- "assembly": a whole product (enough information to start) built from several separate parts that have to fit each other (a bicycle, a cart, a
   robot arm, a test stand, a machine frame with wheels and drive). Use this for "whole ..." / "complete ..." /
   "entire ..." / "seluruh ..." and for any product name that is clearly more than one part. NOT for one part of a
   product: "bicycle frame 540 mm" is free_design, and a gearbox is gearbox.
 - "free_design": any other single physical part to design (bracket, housing, frame, fixture, jaw, hook, stand,
-  enclosure, impeller, ...), in any language.
+  enclosure, impeller, ...), in any language, when the sentence already says what it is for and its key size.
 - "other": a question, a greeting, or a change to the design that is already open ("make it lighter").
 
 "concepts" (free_design only): @N_CONCEPTS@ design concepts that an experienced engineer would compare for this
@@ -140,7 +147,11 @@ def route(message: str, has_gearbox: bool = False, provider=None, concepts_wante
     if not isinstance(raw, dict) or raw.get("route") not in ROUTES:
         return None
     out = {"route": raw["route"], "library_id": None, "query": {}, "reason": str(raw.get("reason") or "")[:120],
-           "read_by": f"{order[0]} ({used})", "concepts": []}
+           "read_by": f"{order[0]} ({used})", "concepts": [], "kind": None, "brief": {}}
+    if out["route"] == "brief":
+        out["kind"] = "assembly" if raw.get("kind") == "assembly" else "part"
+        out["brief"] = raw.get("brief") if isinstance(raw.get("brief"), dict) else {}
+        return out
     if out["route"] == "free_design":
         out["concepts"] = _clean_concepts(raw.get("concepts"), concepts_wanted or 3)
     if out["route"] == "library":
