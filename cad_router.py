@@ -124,6 +124,101 @@ def _clean_query(tid: str, q, message: str) -> dict:
     return out
 
 
+# --------------------------------------------------------------------------- whole products, not one solid
+# A bicycle, a drone or a plane is a product of several parts. The router must never send one to the single-solid
+# free_design path, and a new sentence about a different product must not read the previous design's context.
+_PRODUCTS = (
+    ("bicycle", r"sepeda|bicycle|bike|pushbike"),
+    ("drone", r"drone|quadcopter|uav"),
+    ("airplane", r"airplane|aircraft|aeroplane|aero plane|\bplane\b|pesawat(?: terbang)?"),
+    ("car", r"\bmobil\b|\bcar\b|passenger car|kendaraan penumpang"),
+    ("motorcycle", r"motorcycle|motorbike|\bmotor\b"),
+    ("chair", r"\bkursi\b|\bchair\b"),
+    ("table", r"\bmeja\b|\btable\b"),
+    ("robot", r"\brobot\b|robot arm|lengan robot"),
+    ("cart", r"\bcart\b|trolley|gerobak|kereta dorong"),
+    ("boat", r"\bboat\b|\bkapal\b|perahu"),
+    ("scooter", r"scooter|skuter"),
+)
+_PLANE_OFF = re.compile(r"reference plane|plane strain|plane stress|section plane|datum plane|plane of", re.I)
+_ENOUGH = re.compile(r"\b(?:complete|whole|entire|full|seluruh|lengkap|utuh)\b", re.I)
+_SIZE = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)?\s*(mm|cm|\bm\b|inch|in|\"|kg|n\b|km/h)", re.I)
+
+
+def product_of(message: str) -> str | None:
+    """The whole product the sentence names (bicycle, drone, airplane…), or None when it names no product."""
+    low = str(message or "").lower()
+    if not low.strip():
+        return None
+    for name, pat in _PRODUCTS:
+        if name == "airplane" and _PLANE_OFF.search(low):
+            low_wo = _PLANE_OFF.sub(" ", low)
+        else:
+            low_wo = low
+        if re.search(pat, low_wo):
+            if name == "table" and re.search(r"table (?:frame|top|leg|base)|meja (?:kerja|lipat) frame", low):
+                continue                      # one part OF a table, not the product
+            if name == "car" and re.search(r"car(?:t|go)|box car", low):
+                continue
+            # one part OF the product is a part, not the product: "bicycle frame 540 mm", "sepeda roda 26 inci"
+            one_of = (r"frame|wheel|handlebar|saddle|fork|chain|brake|pedal|stem|seat ?post|basket|rack|mudguard|"
+                      r"rangka|roda|setang|sadel|garpu|rantai|rem|sadel|keranjang")
+            if re.search(r"(?:bicycle|bike|sepeda|airplane|aircraft|pesawat|car|mobil|drone|robot|chair|kursi|table|meja)\s+(?:\w+\s+)?(?:" + one_of + r")\b", low):
+                continue
+            return name
+    return None
+
+
+def enough_info(message: str) -> bool:
+    """Does the sentence already say enough to plan a product? It must name the product and give a size, a load or an
+    envelope, or say the product is complete/whole. A bare "design a bicycle" is not enough: it is a brief."""
+    low = str(message or "")
+    return bool(_ENOUGH.search(low) or _SIZE.search(low))
+
+
+def product_route(message: str, route_name: str | None) -> dict | None:
+    """A whole product never goes to free_design/primitive/other: -> route dict for brief or assembly, else None."""
+    if route_name not in (None, "free_design", "primitive", "other"):
+        return None
+    name = product_of(message)
+    if not name:
+        return None
+    enough = enough_info(message)
+    return {"route": "assembly" if enough else "brief", "kind": "assembly", "library_id": None, "query": {},
+            "concepts": [], "brief": {"object": name, "kind": "assembly"},
+            "reason": f"whole product ({name})" + ("" if enough else ", details missing"),
+            "read_by": "product rule (whole product, not one solid)"}
+
+
+def topic_reset(message: str, ctx) -> dict | None:
+    """A NEW sentence about a different product must not inherit the open design.
+
+    -> {"reason": str, "from": str|None, "to": str} when the context must be dropped, else None. Only a sentence that
+    names a product can reset: "make it lighter" and "80 mm" are about the design that is open.
+    """
+    if not isinstance(ctx, dict):
+        return None
+    new = product_of(message)
+    if not new:
+        return None
+    old, old_kind = None, None
+    for key, field in (("pending_cad", "request"), ("current_cad", "request"), ("brief", "object")):
+        blk = ctx.get(key)
+        if not isinstance(blk, dict):
+            continue
+        old = str(blk.get(field) or blk.get("object") or blk.get("title") or "") or None
+        if old:
+            old_kind = key
+            break
+    old_p = product_of(old or "")
+    if not old_p:
+        return {"reason": f"new request names a whole product ({new}); the open context was not a product",
+                "from": old, "to": new} if old else None
+    if old_p == new:
+        return None
+    return {"reason": f"new request is a different product ({new}, the open context was {old_p})", "from": old, "to": new}
+
+
 def route(message: str, has_gearbox: bool = False, provider=None, concepts_wanted: int | None = None):
     """-> {"route", "library_id", "query", "reason", "read_by"} or None (AI off, unreachable or unusable answer).
 
@@ -148,6 +243,11 @@ def route(message: str, has_gearbox: bool = False, provider=None, concepts_wante
         return None
     out = {"route": raw["route"], "library_id": None, "query": {}, "reason": str(raw.get("reason") or "")[:120],
            "read_by": f"{order[0]} ({used})", "concepts": [], "kind": None, "brief": {}}
+    # a whole product is never designed as one solid, whatever the reader said (bicycle, drone, airplane, car…)
+    prod = product_route(message, out["route"])
+    if prod:
+        prod["read_by"] = prod["read_by"] + " · " + out["read_by"]
+        return prod
     if out["route"] == "brief":
         out["kind"] = "assembly" if raw.get("kind") == "assembly" else "part"
         out["brief"] = raw.get("brief") if isinstance(raw.get("brief"), dict) else {}
