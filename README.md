@@ -323,6 +323,39 @@ buyer can be given instead:
   written into the macro as `' NOT TRANSLATED` comments and into the export report. A part written by the AI as
   code has no feature tree at all: for that, only STEP is offered, and the endpoint says so.
 
+  v0.39.2 (X2) adds the features a classic Studio part uses and the macro used to refuse:
+
+  | IDRIS feature | parameter | SolidWorks call |
+  |---|---|---|
+  | `sketch` off centre | `cx`, `cy` (mm) | the profile is drawn at its centre: `CreateCornerRectangle` / `CreateCircleByRadius` / `CreatePolygon` |
+  | `extrude` cut | `op: "cut"` | `FeatureCut4`, with `distance`, `direction` (+normal / -normal / symmetric) or `through: true` |
+  | `hole` blind | `depth`, `through: false` | `FeatureCut4` to `depth` instead of through all |
+  | `hole` from the top | `from: "top"`, `z_top` | a reference plane at `z_top` (`InsertRefPlane`, 8 = `swRefPlaneReferenceConstraint_Distance`), then the cut from there |
+  | `hole` counterbore | `cbore_d`, `cbore_depth` | two cuts (the bore, then the wider counterbore); a Hole Wizard hole needs a standard-table selection a macro cannot make, and the report says so |
+  | `chamfer` | `distance`, `edges` | `InsertFeatureChamfer` in equal-distance mode (18 = `swChamferDistanceDistance Or swChamferEqualDistance`) |
+  | `mirror` | `plane` (XY / XZ / YZ) | `InsertMirrorFeature2(False, False, False, False, 0)`, the last feature marked 1 and the plane marked 2 |
+
+  Example (a plate with an off-centre pocket, a blind hole from the top, a counterbored hole, a chamfer and a
+  mirror — the model S3 sends):
+
+  ```json
+  {"model_id": "plate", "features": [
+    {"id": "f1", "op": "sketch", "params": {"plane": "XY", "profile": "rectangle", "w": 80, "h": 50}},
+    {"id": "f2", "op": "extrude", "deps": ["f1"], "params": {"distance": 10}},
+    {"id": "f3", "op": "sketch", "deps": ["f2"], "params": {"plane": "XY", "profile": "circle", "w": 20, "cx": 20, "cy": 5}},
+    {"id": "f4", "op": "extrude", "deps": ["f3"], "params": {"distance": 3, "op": "cut"}},
+    {"id": "f5", "op": "hole", "deps": ["f4"], "params": {"x": -20, "y": 0, "d": 6, "through": false, "depth": 8, "from": "top", "z_top": 10}},
+    {"id": "f6", "op": "hole", "deps": ["f5"], "params": {"x": 30, "y": -10, "d": 5, "through": true, "cbore_d": 9, "cbore_depth": 4}},
+    {"id": "f7", "op": "chamfer", "deps": ["f6"], "params": {"distance": 1}},
+    {"id": "f8", "op": "mirror", "deps": ["f7"], "params": {"plane": "YZ"}}
+  ]}
+  ```
+
+  Still not translated, and still stated as such in the macro and the report: tube, sphere, slot and free-line
+  sketches, a hole from the top without `z_top`, and anything the Studio sends with `op: "not_translated"`.
+  `chamfer` and `mirror` are carried by the exchange path (macro and `/model/validate`); the server-side kernel
+  builder answers with a named `BuildError` rather than guessing geometry it cannot build.
+
 **Not tested in SolidWorks.** There is no SolidWorks in this environment, so the macro is checked only for VBA
 structure (balanced blocks, only VBA statements, `Application.SldWorks` present) and for content (every feature is
 either an API call or a stated skip). Someone with SolidWorks has to run it once and confirm the rebuild. The

@@ -37,11 +37,17 @@ SCHEMAS = {
               "desc": "sides of a polygon (triangle ignores it)"},
         "thickness": _e(False, desc="leg thickness of an lshape (default min(w,h)/3)"),
         "offset": _e(False, desc="distance from the plane along its normal: lets a sketch sit inside the model"),
+        "cx": _e(False, desc="profile centre along the plane's first axis (X2); absent = on the plane origin"),
+        "cy": _e(False, desc="profile centre along the plane's second axis (X2)"),
     },
     "extrude": {
         "distance": _e(True),
         "direction": {"type": "string", "enum": ["+normal", "-normal", "symmetric"], "default": "+normal"},
         "draft_deg": _e(False, 0.0),
+        "op": {"type": "string", "enum": ["add", "cut"], "default": "add",
+               "desc": "add = boss, cut = remove material (X2: a FeatureCut4, not only a boss)"},
+        "through": {"type": "boolean", "default": False,
+                    "desc": "a cut that goes through the whole body, instead of `distance` deep (X2)"},
     },
     "revolve": {
         "angle_deg": _e(False, 360.0),
@@ -52,6 +58,11 @@ SCHEMAS = {
         "x": _e(True), "y": _e(True),
         "through": {"type": "boolean", "default": True},
         "depth": _e(False),
+        "from": {"type": "string", "enum": ["sketch", "top"], "default": "sketch",
+                 "desc": "where the bore starts: the sketch plane, or the top face at `z_top` (X2)"},
+        "z_top": _e(False, desc="height of the face a hole from 'top' starts on (X2, needed by from: 'top')"),
+        "cbore_d": _e(False, desc="counterbore diameter (X2); needs cbore_depth as well"),
+        "cbore_depth": _e(False, desc="counterbore depth (X2)"),
     },
     "fillet": {
         "radius": _e(True),
@@ -61,6 +72,20 @@ SCHEMAS = {
         "mode": {"type": "string", "enum": ["linear", "circular"], "default": "linear"},
         "count": {"type": "integer", "min": 1, "max": 500, "default": 2},
         "dx": _e(False, 0.0), "dy": _e(False, 0.0), "angle_deg": _e(False, 0.0),
+    },
+    # X2: the two features the SolidWorks macro could not rebuild before
+    "chamfer": {
+        "distance": _e(True, desc="equal-distance chamfer leg"),
+        "edges": {"type": "string", "enum": ["all", "vertical", "horizontal", "top", "bottom"], "default": "all"},
+    },
+    "mirror": {
+        "plane": {"type": "string", "enum": PLANES, "default": "XY", "desc": "mirror plane"},
+        "feature": {"type": "string", "desc": "id of the feature to mirror; the one before it by default"},
+    },
+    # a note the Studio sends for a feature it knows the macro cannot rebuild: validation must accept it
+    "not_translated": {
+        "what": {"type": "string", "desc": "the feature as the engineer sees it"},
+        "why": {"type": "string", "desc": "why the macro cannot rebuild it"},
     },
     "import": {
         "path": {"type": "string", "required": True},
@@ -113,7 +138,7 @@ def validate_params(op: str, params, dims: dict):
         except E.ExprError as exc:
             errors.append(f"{op}.{name}: {exc}")
             continue
-        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg", "offset"):
+        if value <= 0 and name not in ("draft_deg", "dx", "dy", "angle_deg", "offset", "cx", "cy", "z_top"):
             errors.append(f"{op}.{name}: must be > 0, got {value}")
             continue
         resolved[name] = value
@@ -122,6 +147,11 @@ def validate_params(op: str, params, dims: dict):
 
     merged = dict(clean)
     merged.update(resolved)
+    # X2: a field that only makes sense with another one is an error, not a silent default
+    if op == "hole" and merged.get("from") == "top" and "z_top" not in merged:
+        errors.append("hole.z_top: a hole from 'top' needs z_top, the height of the face it starts on")
+    if op == "hole" and (("cbore_d" in merged) != ("cbore_depth" in merged)):
+        errors.append("hole: a counterbore needs both cbore_d and cbore_depth")
     if texts:
         merged["exprs"] = texts
     if "path" in schema and params.get("path") is not None:
