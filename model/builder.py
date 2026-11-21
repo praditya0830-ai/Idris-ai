@@ -29,7 +29,7 @@ from geometry import kernel as _kernel
 
 from . import graph as G
 
-SOLID_OPS = ("extrude", "revolve", "hole", "fillet", "pattern", "import")
+SOLID_OPS = ("extrude", "revolve", "hole", "fillet", "pattern", "import", "chamfer", "mirror")
 
 
 @dataclass(frozen=True)
@@ -312,6 +312,11 @@ def evaluate(feature, deps: dict, k=None, parts_dir: str = ".") -> Part:
         return _fillet(k, parent, p, op)
     if op == "pattern":
         return _pattern(k, parent, p, op)
+    if op == "not_translated":
+        raise BuildError("not_translated: this feature is a note for the SolidWorks macro, not geometry")
+    if op in ("chamfer", "mirror"):
+        raise BuildError(f"{op}: the exchange path (macro and /model/validate) carries it, but the server-side "
+                         f"kernel builder does not build it; nothing is guessed")
     raise BuildError(f"unknown op {op!r}")
 
 
