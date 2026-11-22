@@ -40,8 +40,9 @@ def _run(p, progress):
         warnings.append(f"{len(m['failed'])} rule(s) failed: "
                         + "; ".join(f"{c['check']}: {c['message']}" for c in m["failed"]))
     out = {k: v for k, v in m.items() if k not in ("checks", "failed", "warned", "not_checked")}
-    out["findings"] = [{k: c.get(k) for k in ("id", "check", "status", "value", "limit", "unit", "source",
-                                              "source_status", "message")} for c in m["checks"]]
+    # every field of a check is passed on, not a fixed list: X1b put `diameters_mm` on the drill finding and
+    # a fixed whitelist here silently dropped it, so the route could never answer with the table it built.
+    out["findings"] = [dict(c) for c in m["checks"]]
     out["not_checked"] = len(m["not_checked"])
     out["summary"] = dp.summary(m)
     progress("Done", 1.0)
