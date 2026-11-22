@@ -41,10 +41,26 @@ def test_product_of_names_the_product(sentence, product):
     "reference plane at 20 mm",
     "plane strain block",
     "table frame 900 mm",
+    "design a plane wing",
+    "airplane wing 1200 mm",
+    "robot arm gripper",
     "",
 ])
 def test_product_of_ignores_parts_and_follow_ups(sentence):
     assert cad_router.product_of(sentence) is None
+
+
+def test_a_part_of_a_product_is_a_part_in_both_word_orders():
+    """
+    Found in review (22 Nov): "design a plane wing" was read as an airplane and "robot arm gripper" as a robot.
+    A wing and a gripper are parts, so the product guard must let them through to the part routes.
+    """
+    for sentence in ("design a plane wing", "airplane wing 1200 mm", "sayap pesawat",
+                     "robot arm gripper", "gripper for a robot arm"):
+        assert cad_router.product_of(sentence) is None, sentence
+    # and the whole products they belong to still read as products
+    assert cad_router.product_of("design a plane") == "airplane"
+    assert cad_router.product_of("robot arm 600 mm") == "robot"
 
 
 def test_product_route_sends_a_bare_product_to_brief():
@@ -205,5 +221,5 @@ def test_a_real_cad_with_code_keeps_its_fidelity(monkeypatch):
     assert out["fidelity"] == "full" and out["cad"]["code"]
 
 
-def test_version_is_0_40_2():
-    assert ace_core.SOLVER_VERSION == "0.40.2"
+def test_version_is_0_40_5():
+    assert ace_core.SOLVER_VERSION == "0.40.5"
