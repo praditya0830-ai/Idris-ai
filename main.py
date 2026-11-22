@@ -1220,6 +1220,26 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     traceback.print_exc()
                     refs, _ref = None, None
+                # v0.41: a message that asks no solver is answered by the colleague layer, with the session history
+                # and the open project in hand. Before this, route "other" fell through to the gearbox language
+                # template, so "cuy" on a snow plow project asked for power, input RPM and gear ratio.
+                _prim_chk = looks_like_part_request(msg)
+                _obj_chk = cad_codegen.looks_like_object_request(msg, has_gearbox=has_gearbox)
+                if (not (gear_ctx or cad_ctx or eng_ctx) and not _prim_chk and not _obj_chk
+                        and params.get("message") and (routed is None or routed.get("route") == "other")):
+                    try:
+                        import colleague
+                        out = colleague.answer(params.get("provider"), str(params.get("message") or ""),
+                                               params.get("history"), ctx, params.get("current"),
+                                               params.get("variants"), params.get("selected"), rl)
+                        if routed:
+                            out["route"] = routed
+                        if ctx and isinstance(ctx.get("brief"), dict):
+                            out["brief"] = ctx["brief"]
+                        self._send_json(200, out)
+                        return
+                    except Exception:
+                        traceback.print_exc()
                 if routed and routed["route"] == "library":
                     hit = (routed["library_id"], routed["query"])
                 elif routed and routed["route"] in ("free_design", "gearbox", "primitive"):

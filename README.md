@@ -436,6 +436,40 @@ vertex is returned for the Studio's colour map.
 
 What it is not: no cost, no cycle time, no tolerance stack-up, and no feature recognition.
 
+## The chat is a colleague, not a form (v0.41)
+
+Arya, 21 Nov: the same "cuy" that Zookeeper answered with "mau lanjut snow plow-nya?" made IDRIS reply "tell me
+the power, input RPM and gear ratio to start a gearbox design" — it forgot the topic and read like a form. The router
+still decides *who* designs a sentence, but a message that asks no solver is now answered by `colleague.py`, with the
+session history (the last 20 messages, older ones as one line) and the open project in hand:
+
+```json
+POST /chat {"message": "cuy", "history": [{"role": "user", "text": "…"}], "context": {"brief": {…}}}
+→ {"reply": "Snow plow-nya masih di tahap konsep. Dudukan ke pikap belum kita tentukan.", "language": "id",
+   "suggestions": [{"label": "Sesuaikan dudukan ke kendaraanmu", "action": {"route": "continue", "params": {}}}],
+   "questions": [{"id": "q1", "text": "Kendaraannya apa?", "stage": 1,
+                  "options": [{"label": "Pikap", "note": "", "recommended": true}]}],
+   "action": null, "stage": 3, "stage_name": "Concept & layout", "numbers_verified": true}
+```
+
+- **Language** follows the message being answered (Indonesian → Indonesian, 中文 → 中文, unclear → the previous clear
+  language → English). UI labels, part names, units, reports, BOM and drawings stay English.
+- **Questions per stage**: at most three on stage 1 and two on any later stage, each with a `recommended` option and
+  "Not sure — you choose"; a question of a later stage is not asked before its stage, and a question that is already
+  answered is not asked again. The brief's own questions carry `stage: 1`.
+- **Numbers** may only be quoted from the project status; `llm.unverified_numbers` checks the reply and an invented
+  figure is called out in the reply itself (`numbers_verified: false`).
+- **A gearbox is only mentioned when the project is a gearbox.** With the AI away the layer answers from the stage
+  (`provider: "IDRIS colleague (rules)"`) — status line plus two or three next steps, never a template.
+- **Stage 2 references**: `POST /references/design {brief, project_id}` → 3-6 cards cut from real search snippets
+  (`title`, `source_url`, `thumbnail_url`, `what_it_is`, `key_features`, `numbers_found` — every number labelled
+  `web — not verified`), the patterns the sources share and one proposal. No AI call, so nothing is spent from
+  `ai_budget`; results are cached per query for 24 h (`IDRIS_REF_CACHE_S`), at most three queries per stage, and a
+  missing key or a 402 is reported as one honest line (`ok: false`).
+
+What it is not: the layer never computes a number, never starts a design on its own, and never copies a branded
+product — references are for the pattern, not for a copy.
+
 ## Fidelity, honestly
 
 Solvers declare a fidelity level (`L0` closed-form handbook/ISO, `L1` 1D numerical, `L2`
