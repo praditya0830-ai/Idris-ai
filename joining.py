@@ -9,14 +9,18 @@ module answers the questions a workshop asks, and every answer is either measure
     process: a part without one says so and is asked for.
   * `analyse` checks the assembly geometry: overlap volume between parts (must be 0 inside the mesh tolerance),
     contact gap at every welded joint (must fit up), bolt holes on the same axis, and a part that hangs in the air
-    with no joint.
+    with no joint. The overlap is measured from each part's DECLARED bounding box, so it is labelled an estimate,
+    never "kernel geometry"; and a shift that would clear it is a PROPOSAL the engineer accepts (`fix=False`), so
+    a tube is never quietly moved away from the blade it was meant to touch.
   * `joints_for` writes one joint per interface: a fillet weld whose minimum leg comes from AWS D1.1 Table 7.7 as
     already implemented in `physics.dfm_rules`, a bolted joint with the ISO 273 clearance hole from the catalogue,
     a pin, a press fit or a slot-tab — each with its reason and the features the parts still need.
   * `outputs` writes the BOM, the cut list, the weld list, the bolt list and the assembly order.
 
 Truth rules carried from the rest of IDRIS: a weld leg, a clearance hole and a bolt length come from a table with its
-source; a load is never assumed, so a joint strength is "Not checked by IDRIS" until the engineer gives one.
+source; a load is never assumed, so a joint strength is "Not checked by IDRIS" until the engineer gives one; and a
+bolt size nobody stated is M8 as an ASSUMPTION in `assumptions`, with the Stage-5 question that asks for the real one
+(ISO 273 is the source of the clearance hole, never of the M8 choice).
 Geometry here is the part's declared shape (a box or a cylinder with its position). A curved blade is approximated by
 its bounding box, so an overlap volume on a cylinder is a conservative bound, not the exact intersection — the note in
 the answer says so.
@@ -29,6 +33,14 @@ from physics import dfm_rules
 FIT_TOL_MM = 0.5                 # fit-up tolerance at a welded joint (0..0.5 mm gap)
 OVERLAP_TOL_MM3 = 1.0            # mesh/decimal tolerance: below this an overlap counts as none
 BOLT_AXIS_TOL_MM = 0.5
+ASSUMED_BOLT = "M8"              # only when neither the engineer nor the plan gives a size, and it says so
+ASSUMED_BOLT_NOTE = "assumed M8 — no load given, change anytime"
+OVERLAP_SOURCE = "bounding-box estimate (not kernel geometry)"
+BOLT_QUESTION = {"id": "q_bolt_size", "text": "Bolt size?", "stage": 5,
+                 "options": [{"label": "M8 — recommended", "recommended": True,
+                              "note": "ISO 273 medium clearance 9 mm; move up if the load says so"},
+                             {"label": "M10", "note": "ISO 273 medium clearance 11 mm"},
+                             {"label": "Not sure — you choose", "assumed": True}]}
 
 # Standard mill plate thicknesses (mm). A workshop stock list replaces this one; the answer says which was used.
 PLATE_MM = (1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0)
@@ -179,9 +191,11 @@ def stock_for(part: dict) -> dict:
                 "stock": {"kind": "plate", "thickness_mm": chosen, "source": PLATE_SOURCE},
                 "source": PLATE_SOURCE,
                 "needs": "" if declared else "the workshop process was not stated (laser, plasma, press brake?)"}
+    # no table stock matches the shape: a machined block is ASSUMED, and the answer carries that as an assumption
+    # (it used to be written only in the source line, where nobody reads it)
+    assumed = "no plate/tube stock matches this shape; a machined block is assumed"
     return {"part": name, "process": declared or "machined",
-            "stock": {"kind": "block", "source": "no plate/tube stock matches this shape; a machined block is assumed"},
-            "source": "no plate/tube stock matches this shape; a machined block is assumed",
+            "stock": {"kind": "block", "source": assumed}, "source": assumed, "assumed": assumed,
             "needs": "" if declared else "the workshop process was not stated"}
 
 
@@ -222,18 +236,33 @@ def clearance_hole_mm(size: str) -> tuple:
     return (med, f.get("d"))
 
 
-def bolted_joint(a: dict, b: dict, size: str = "M8") -> dict:
+def bolted_joint(a: dict, b: dict, size: str | None = None) -> dict:
+    """A bolted joint. `size` is the engineer's (or the plan's) bolt; without one the joint says M8 is assumed.
+
+    ISO 273 is the source of the CLEARANCE HOLE, never of the M8 choice: that choice is an assumption until the
+    engineer gives a size or a load, and it is listed as one (v0.42 review, item c).
+    """
+    given = bool(str(size or "").strip())
+    size = str(size or ASSUMED_BOLT).strip()
     hole, d = clearance_hole_mm(size)
     clamp = _thickness(a) + _thickness(b)
-    return {"between": [a.get("name"), b.get("name")], "kind": "bolted",
-            "reason": "the two parts are assembled on site, so the joint can be taken apart",
-            "features_required": [f"a {hole} mm clearance hole (ISO 273 medium) through both parts, on one axis",
-                                  "edge distance at least 1.5 d from the hole centre to the part edge"],
-            "size": {"value": hole, "unit": "mm", "what": f"clearance hole for {size}",
-                     "source": "ISO 273 medium series, physics.catalog"},
-            "bolt": {"size": size, "d_mm": d, "clamp_mm": round(clamp, 1),
-                     "length_mm": _bolt_length(size, clamp),
-                     "source": "ISO 273 clearance + catalogue bolt length above the clamp thickness"}}
+    out = {"between": [a.get("name"), b.get("name")], "kind": "bolted",
+           "reason": "the two parts are assembled on site, so the joint can be taken apart",
+           "features_required": [f"a {hole} mm clearance hole (ISO 273 medium) through both parts, on one axis",
+                                 "edge distance at least 1.5 d from the hole centre to the part edge"],
+           "size": {"value": hole, "unit": "mm", "what": f"clearance hole for {size}",
+                    "source": "ISO 273 medium series, physics.catalog"},
+           "bolt": {"size": size, "d_mm": d, "clamp_mm": round(clamp, 1),
+                    "length_mm": _bolt_length(size, clamp),
+                    "source": "ISO 273 clearance + catalogue bolt length above the clamp thickness"}}
+    if given:
+        out["bolt_selection"] = {"size": size, "source": "given by the engineer"}
+    else:
+        out["bolt_selection"] = {"size": size, "source": ASSUMED_BOLT_NOTE}
+        out["assumed_size"] = True
+        out["assumptions"] = [{"about": f"{a.get('name')} + {b.get('name')}", "what": f"bolt size {size}",
+                               "source": ASSUMED_BOLT_NOTE}]
+    return out
 
 
 def _bolt_length(size: str, clamp: float) -> float | None:
@@ -266,7 +295,7 @@ def _holes_align(a: dict, b: dict) -> bool:
     return False
 
 
-def joints_for(parts: list, interfaces=None, bolt_size: str = "M8") -> list:
+def joints_for(parts: list, interfaces=None, bolt_size: str | None = None) -> list:
     """One joint per touching interface, plus the interfaces the plan already declared."""
     by = {str(p.get("name")): p for p in parts if isinstance(p, dict) and p.get("name")}
     joints, seen = [], set()
@@ -286,7 +315,7 @@ def joints_for(parts: list, interfaces=None, bolt_size: str = "M8") -> list:
         a, b = by[pair[0]], by[pair[1]]
         kind = str(i.get("kind") or "contact")
         if kind in ("bolt", "bolted"):
-            add(bolted_joint(a, b, str((i.get("params") or {}).get("size") or bolt_size)))
+            add(bolted_joint(a, b, (i.get("params") or {}).get("size") or bolt_size))
         elif kind in ("weld", "fillet_weld", "las"):
             add(weld_joint(a, b, contact_area(a, b)))
         elif kind in ("press", "press_fit", "pinned", "pin", "slot_tab", "contact"):
@@ -320,15 +349,18 @@ def _shift(part: dict, axis: int, by: float) -> dict:
 
 
 def _fix_overlap(a: dict, b: dict) -> tuple:
-    """Move the smaller part out along the axis with the least penetration. -> (fixed_b, shift_description)."""
+    """The shift that would clear the overlap of b out of a. -> (shifted_b, proposal dict or None).
+
+    Nothing is moved here: `analyse` reports the proposal and only applies it when the engineer accepts it.
+    """
     ba, bb = _aabb(a), _aabb(b)
     if not ba or not bb:
-        return b, ""
+        return b, None
     lo, hi = _inter(ba, bb)
     pen = [hi[i] - lo[i] for i in range(3)]
     axis = min(range(3), key=lambda i: pen[i])
     if pen[axis] <= 0:
-        return b, ""
+        return b, None
     # push b clear of a on that axis: a part that sits INSIDE the other needs more than the penetration depth,
     # so the shift is measured to the far face and the two then touch instead of passing through
     a_c = (ba[0][axis] + ba[1][axis]) / 2
@@ -337,33 +369,49 @@ def _fix_overlap(a: dict, b: dict) -> tuple:
         by = ba[1][axis] - bb[0][axis] + 1e-6
     else:
         by = -(bb[1][axis] - ba[0][axis] + 1e-6)
-    return _shift(b, axis, by), f"{b.get('name')} moved {'+' if by > 0 else ''}{by:.1f} mm on {'xyz'[axis]}"
+    why = (f"{b.get('name')} moved {'+' if by > 0 else ''}{by:.1f} mm on {'xyz'[axis]} would clear it "
+           f"(only if the engineer accepts — the parts may be meant to touch)")
+    return _shift(b, axis, by), {"part": b.get("name"), "with": a.get("name"), "axis": "xyz"[axis],
+                                 "shift_mm": round(by, 3), "why": why}
 
 
-def analyse(parts: list, joints=None, fix: bool = True) -> dict:
-    """Overlap 0, contact at every welded joint, aligned bolt holes, no floating part. -> checks + fixed parts."""
+def analyse(parts: list, joints=None, fix: bool = False) -> dict:
+    """Overlap, contact at every welded joint, aligned bolt holes, no floating part. -> checks + proposals.
+
+    `fix=False` (the default) is the honest one: an overlap becomes a `proposed_fixes` entry the engineer accepts,
+    because shifting a part on our own can pull a tube away from the curved blade it was designed to meet. `fix=True`
+    applies those shifts and reports them in `fixes`.
+    """
     parts = [p for p in (parts or []) if isinstance(p, dict) and p.get("name")]
     by = {str(p["name"]): p for p in parts}
-    issues, fixes = [], []
-    if fix:
-        names = list(by)
-        for _pass in range(6):                              # moving one part can bring it near another
-            moved = False
-            for i, na in enumerate(names):
-                for nb in names[i + 1:]:
-                    v = overlap_volume(by[na], by[nb])
-                    if v <= OVERLAP_TOL_MM3:
-                        continue
-                    new_b, what = _fix_overlap(by[na], by[nb])
-                    if not what:
-                        continue
-                    by[nb] = new_b
-                    moved = True
-                    fixes.append(f"{what}; overlap {v:.0f} mm3 removed")
-                    issues.append({"level": "fixed", "code": "overlap",
-                                   "parts": [na, nb], "volume_mm3": round(v, 1), "fix": what})
-            if not moved:
-                break
+    issues, fixes, proposals = [], [], []
+    names = list(by)
+    for _pass in range(6 if fix else 1):                     # moving one part can bring it near another
+        moved = False
+        for i, na in enumerate(names):
+            for nb in names[i + 1:]:
+                v = overlap_volume(by[na], by[nb])
+                if v <= OVERLAP_TOL_MM3:
+                    continue
+                new_b, prop = _fix_overlap(by[na], by[nb])
+                if not prop:
+                    continue
+                prop = {**prop, "overlap_mm3": round(v, 1), "accepted": bool(fix)}
+                proposals.append(prop)
+                if not fix:
+                    continue
+                by[nb] = new_b
+                moved = True
+                what = (f"{prop['part']} moved {'+' if prop['shift_mm'] > 0 else ''}{prop['shift_mm']:.1f} mm "
+                        f"on {prop['axis']}")
+                fixes.append(f"{what}; overlap {v:.0f} mm3 removed")
+                issues.append({"level": "fixed", "code": "overlap",
+                               "parts": [na, nb], "volume_mm3": round(v, 1), "fix": what})
+        if not moved:
+            break
+    if not fix:
+        issues = [{"level": "proposed", "code": "overlap", "parts": [x["with"], x["part"]],
+                   "volume_mm3": x["overlap_mm3"], "fix": x["why"]} for x in proposals]
     checks = []
     names = list(by)
     for i, na in enumerate(names):
@@ -371,7 +419,7 @@ def analyse(parts: list, joints=None, fix: bool = True) -> dict:
             v = overlap_volume(by[na], by[nb])
             checks.append({"check": "overlap", "parts": [na, nb], "value_mm3": round(v, 1),
                            "status": "pass" if v <= OVERLAP_TOL_MM3 else "fail",
-                           "source": "kernel geometry: intersection volume of the declared part volumes"})
+                           "source": OVERLAP_SOURCE, "fidelity": "estimate"})
     floating = [n for n in names
                 if not any(j for j in (joints or []) if n in (j.get("between") or []))]
     checks.append({"check": "every part is joined", "value": len(floating), "status": "pass" if not floating else "fail",
@@ -397,7 +445,7 @@ def analyse(parts: list, joints=None, fix: bool = True) -> dict:
                        "source": "the two hole centres must coincide within 0.5 mm and share an axis"})
     failed = [c for c in checks if c["status"] == "fail"]
     return {"parts": [by[n] for n in names], "checks": checks, "fixes": fixes, "issues": issues,
-            "ok": not failed, "failed": failed, "floating": floating}
+            "proposed_fixes": proposals, "ok": not failed, "failed": failed, "floating": floating}
 
 
 # ------------------------------------------------------------------ production outputs (A4)
@@ -442,21 +490,36 @@ def outputs(parts: list, joints: list) -> dict:
             "mass_total_kg": round(sum(b["mass_kg"] * b["qty"] for b in bom), 3)}
 
 
-def plan(parts: list, interfaces=None, bolt_size: str = "M8", fix: bool = True) -> dict:
-    """The whole stage: joints, geometry check (with the fix it made), then the workshop documents."""
-    # geometry first, joints second: a tube that passed through a plate only touches it after the fix, and a joint
-    # list written before that would say the part hangs in the air
+def plan(parts: list, interfaces=None, bolt_size: str | None = None, fix: bool = False) -> dict:
+    """The whole stage: joints, geometry check (with the shifts it proposes), then the workshop documents.
+
+    `fix=False` is the default: an overlap is reported with the shift that would clear it, and the engineer decides.
+    A bolt size that neither the engineer nor the plan gives is M8 AS AN ASSUMPTION, listed in `assumptions` with
+    the Stage-5 question that asks for the real one (v0.42 review, items b and c).
+    """
+    # geometry first, joints second: a tube that passed through a plate only touches it after the shift is accepted,
+    # and a joint list written before that would say the part hangs in the air
     first = analyse(parts, [], fix)
     fixed = first["parts"]
     joints = joints_for(fixed, interfaces, bolt_size)
     chk = analyse(fixed, joints, fix=False)
     chk["fixes"], chk["issues"] = first["fixes"], first["issues"]
+    chk["proposed_fixes"] = first["proposed_fixes"]
     out = outputs(chk["parts"], joints)
+    assumptions = []
+    for p in chk["parts"]:
+        st = stock_for(p)
+        if st.get("assumed"):
+            assumptions.append({"about": p.get("name"), "what": st["assumed"], "source": st["source"]})
+    for j in joints:
+        assumptions.extend(j.get("assumptions") or [])
     strength = [{"joint": j["between"], "status": "not_checked",
                  "why": "no load was given by the engineer, so IDRIS does not claim a joint strength"}
                 for j in joints if j.get("kind") in ("fillet_weld", "bolted")]
     return {"ok": chk["ok"], "joints": joints, "checks": chk["checks"], "fixes": chk["fixes"],
-            "issues": chk["issues"], "failed": chk["failed"],
+            "proposed_fixes": chk["proposed_fixes"], "issues": chk["issues"], "failed": chk["failed"],
+            "assumptions": assumptions,
+            "questions": [BOLT_QUESTION] if any(j.get("assumed_size") for j in joints) else [],
             "parts": [{"name": p.get("name"), "process": stock_for(p)["process"],
                        "mass_kg": round(mass_kg(p), 3)} for p in chk["parts"]],
             **out, "joint_strength": strength,

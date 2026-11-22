@@ -29,11 +29,14 @@ def handle_get(path: str):
 
 
 def handle_post(base: str, params: dict):
-    """POST /join/plan {parts, interfaces, bolt_size} -> joints, geometry check, BOM/cut list/welds/bolts (v0.42)."""
+    """POST /join/plan {parts, interfaces, bolt_size, fix} -> joints, geometry check, BOM/cut list/welds/bolts (v0.42).
+
+    No `bolt_size` means the joint says M8 is assumed; no `fix` means the overlap shift is a proposal, not an edit.
+    """
     if str(base or "").split("?")[0].rstrip("/") != "/join/plan":
         return None
     import joining
     parts = params.get("parts") if isinstance(params.get("parts"), list) else []
     return 200, {"success": True, **joining.plan(parts, params.get("interfaces"),
-                                                  str(params.get("bolt_size") or "M8"),
-                                                  bool(params.get("fix", True)))}
+                                                  params.get("bolt_size") or None,
+                                                  bool(params.get("fix", False)))}
