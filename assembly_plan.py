@@ -139,10 +139,15 @@ def validate(raw: dict) -> tuple:
             continue
         ids.add(pid)
         qty = _num(p.get("qty"))
+        # v0.43 (design ladder 1b): the shape class travels with the part, so the assembly designer reads the
+        # plan's own classification instead of guessing it from the name. Unknown text -> None (classified later).
+        shape_class = str(p.get("shape_class") or "").strip().lower()
         parts.append({"id": pid, "name": str(p.get("name") or pid)[:80],
                       "role": str(p.get("role") or "")[:200],
                       "qty": int(qty) if qty and qty >= 1 else 1,
                       "needs": [str(n)[:80] for n in (p.get("needs") or [])][:8],
+                      "shape_class": shape_class if shape_class in ("prismatic", "freeform", "revolve", "sheet",
+                                                                  "frame") else None,
                       "standard": bool(p.get("standard"))})
     if not parts:
         errs.append("the plan has no usable part")
