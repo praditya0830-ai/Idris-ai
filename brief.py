@@ -32,7 +32,7 @@ FIELDS = ("object", "purpose", "kind", "envelope", "key_sizes", "loads", "materi
           "standards", "features", "constraints", "assumptions", "decided", "open", "needs")
 SCALARS = ("object", "purpose", "kind", "envelope", "key_sizes", "loads", "material", "process", "quantity",
            "standards", "constraints")
-LISTS = ("features", "assumptions", "decided", "open", "needs")
+LISTS = ("features", "assumptions", "decided", "open", "needs", "declined", "suggested")
 CONCEPT_OPTIONS = (3, 5, 7, 10)
 
 # "just design it with your assumptions" in the languages engineers actually type
@@ -237,8 +237,10 @@ def _clean_questions(raw, lang: str) -> list:
             if label:
                 opts.append({"label": label, "note": note})
         if text and len(opts) >= 2:
+            # A4b: every question carries the stage it belongs to, so the Studio shows it with the stage and the
+            # colleague layer never asks a stage-5 question during the brief
             out.append({"id": str(q.get("id") or f"q{len(out) + 1}")[:24], "text": text, "options": opts,
-                        "allow_free_text": True})
+                        "allow_free_text": True, "stage": 1})
     return out
 
 
@@ -452,7 +454,7 @@ def fallback_questions(b: dict, miss: list = None, lang: str = "en") -> dict:
     for k in list(miss if miss is not None else missing(b))[:3]:
         text, opts = table.get(k, table["purpose"])
         out.append({"id": f"fallback_{k}", "text": text, "options": [{"label": a, "note": n} for a, n in opts],
-                    "allow_free_text": True, "fallback": True})
+                    "allow_free_text": True, "fallback": True, "stage": 1})
     return {"understanding": "", "brief": {}, "questions": out, "suggestions": [],
             "read_by": "fallback questions (no AI)"}
 
@@ -545,6 +547,79 @@ def as_request(b: dict) -> str:
 
 def wants_assumptions(message: str) -> bool:
     return bool(PROCEED.search(str(message or "")))
+
+
+# --------------------------------------------------------------------------- brief continuity (v0.40.3)
+# Arya, 21 Nov evening: "design snow plow" -> the brief asked. Then the chip "+ add" sent
+# "add: Use a replaceable cutting edge on the bottom of the blade" and IDRIS answered that a cutting edge is not a
+# gearbox design parameter: the brief was dropped, the message was routed from scratch and the old gearbox reader took
+# the conversation over. While a brief is open and its design has not started, EVERY message is read as a brief answer
+# first. The router is not asked at all, so a free answer ("pick up truck, electric actuator, straight blade") can only
+# go into the brief. Two exceptions keep the conversation usable:
+#   * a Studio chip ("add: …" / "no thanks: …") fills `features` / `declined` here, with no AI and no routing;
+#   * a general engineering question ("why is a replaceable edge better?") is answered as chat, and the brief travels
+#     back untouched.
+CHIP_ADD = re.compile(r"^\s*(?:add|tambah(?:kan)?)\s*[:\-]\s*(.+)$", re.I)
+CHIP_DECLINE = re.compile(r"^\s*(?:no thanks|no thank you|not now|tidak(?: usah)?|jangan|skip|lewati)\s*[:\-]\s*(.+)$", re.I)
+_QUESTION_START = re.compile(r"^\s*(?:kenapa|mengapa|apa(?:kah)?|bagaimana|gimana|berapa|bisakah|apakah|what|why|how"
+                             r"|which|when|where|who|is|are|does|do|can|could|should)\b", re.I)
+
+
+def chip_answer(message: str) -> dict | None:
+    """A Studio suggestion chip -> the brief field it fills: {features:[…]} for "add:", {declined:[…]} otherwise.
+
+    Nothing is routed and no AI is called: the chip's own sentence is the text, so there is no chance to read it as
+    a requirement of some other product.
+    """
+    text = str(message or "").strip()
+    m = CHIP_ADD.match(text)
+    if m:
+        t = _clean_text(m.group(1), 200)
+        return {"features": [{"text": t, "from": "suggested"}]} if t else None
+    m = CHIP_DECLINE.match(text)
+    if m:
+        t = _clean_text(m.group(1), 200)
+        return {"declined": [{"text": t, "from": "suggested"}]} if t else None
+    return None
+
+
+def general_question(message: str) -> bool:
+    """Is this a question to answer as an engineer, not a fact for the brief? The brief is kept either way."""
+    return bool(_QUESTION_START.match(str(message or "")))
+
+
+def is_open(ctx) -> dict | None:
+    """The brief that still owns the conversation: it exists and the design has not started."""
+    b = from_context(ctx)
+    if not b or b.get("ready") or b.get("started"):
+        return None
+    return b
+
+
+def turn(b: dict | None, message: str, ctx=None) -> dict:
+    """What an open brief does with this message -> {action: none|chip|chat|answer, merge: {}}.
+
+    `chip` carries the brief field the chip fills; `chat` means the message is a question to answer as an engineer;
+    `answer` means the message is a fact for the brief (routed nowhere, merged and asked about).
+    """
+    if not b:
+        return {"action": "none"}
+    chip = chip_answer(message)
+    if chip is not None:
+        return {"action": "chip", "merge": chip}
+    ans = (ctx or {}).get("brief_answer") if isinstance(ctx, dict) else None
+    if isinstance(ans, dict) and str(ans.get("type") or "").lower() in ("add", "decline"):
+        # the Studio sends the chip's id as well as its text; the id is matched against the suggestions IDRIS itself
+        # made, so no text from the browser can stand in for a feature IDRIS never suggested
+        sid = str(ans.get("suggestion_id") or "")
+        pick = next((s for s in (b.get("suggested") or []) if isinstance(s, dict) and str(s.get("id")) == sid), None)
+        text = str((pick or {}).get("text") or "").strip()
+        if text:
+            field = "features" if str(ans.get("type")).lower() == "add" else "declined"
+            return {"action": "chip", "merge": {field: [{"text": text, "from": "suggested"}]}}
+    if general_question(message):
+        return {"action": "chat"}
+    return {"action": "answer"}
 
 
 def resume(ctx, message: str, concept_count=None) -> dict | None:

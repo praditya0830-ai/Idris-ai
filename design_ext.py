@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 import cad_fallback
 
-POST_ROUTES: tuple = ("/join/plan",)
+POST_ROUTES: tuple = ("/join/plan", "/references/design")
 
 
 def handle_get(path: str):
@@ -29,14 +29,32 @@ def handle_get(path: str):
 
 
 def handle_post(base: str, params: dict):
-    """POST /join/plan {parts, interfaces, bolt_size, fix} -> joints, geometry check, BOM/cut list/welds/bolts (v0.42).
+    """POST /join/plan (v0.42) and POST /references/design (v0.41).
 
+    /join/plan {parts, interfaces, bolt_size, fix} -> joints, geometry check, BOM/cut list/welds/bolts.
     No `bolt_size` means the joint says M8 is assumed; no `fix` means the overlap shift is a proposal, not an edit.
+
+    /references/design {brief, project_id} -> 3-6 reference cards for stage 2 (doc A8). No AI call: the cards are cut
+    from the search snippets, so the step spends nothing from ai_budget. A missing provider, a 402 or an empty answer
+    comes back as one honest line with `ok: false`, never as a silent success.
     """
-    if str(base or "").split("?")[0].rstrip("/") != "/join/plan":
-        return None
-    import joining
-    parts = params.get("parts") if isinstance(params.get("parts"), list) else []
-    return 200, {"success": True, **joining.plan(parts, params.get("interfaces"),
-                                                  params.get("bolt_size") or None,
-                                                  bool(params.get("fix", False)))}
+    path = str(base or "").split("?")[0].rstrip("/")
+    if path == "/join/plan":
+        import joining
+        parts = params.get("parts") if isinstance(params.get("parts"), list) else []
+        return 200, {"success": True, **joining.plan(parts, params.get("interfaces"),
+                                                     params.get("bolt_size") or None,
+                                                     bool(params.get("fix", False)))}
+    if path == "/references/design":
+        from research import design_refs
+        brief_in = params.get("brief") if isinstance(params.get("brief"), dict) else {}
+        if not brief_in and isinstance(params.get("message"), str):
+            brief_in = {"object": params["message"][:120]}
+        try:
+            r = design_refs.run(brief_in, params.get("project_id"))
+        except Exception as e:                  # a search outage must never break the design path
+            return 200, {"success": False, "ok": False, "cards": [], "queries": [], "patterns": [],
+                         "proposal": "", "steps": [], "mode": "none",
+                         "error": f"reference search failed: {type(e).__name__}: {e}"[:200]}
+        return 200, {"success": True, **r}
+    return None
