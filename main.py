@@ -180,6 +180,20 @@ def _shape_family_reply(ctx):
 CONCEPT_OPTIONS = (3, 5, 7, 10)
 
 
+def _gearbox_sentence(text) -> bool:
+    """Does the sentence ask for a gearbox? Then the requirements reader reads it and the colleague layer never does.
+
+    v0.41 fix: while the AI router was away, "15 kW gearbox ratio 8" was answered by the colleague ("No project is
+    open yet … What should we start with?"), so power and ratio were never read and the design never started.
+    """
+    try:
+        import colleague
+        return colleague.is_gearbox_message(text)
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
 def _concepts_on() -> bool:
     """IDRIS_CONCEPTS=0 turns the concept question off for everyone (the one-design path is then used)."""
     return os.environ.get("IDRIS_CONCEPTS", "1").lower() not in ("0", "off", "false", "no")
@@ -1226,7 +1240,8 @@ class Handler(BaseHTTPRequestHandler):
                 _prim_chk = looks_like_part_request(msg)
                 _obj_chk = cad_codegen.looks_like_object_request(msg, has_gearbox=has_gearbox)
                 if (not (gear_ctx or cad_ctx or eng_ctx) and not _prim_chk and not _obj_chk
-                        and params.get("message") and (routed is None or routed.get("route") == "other")):
+                        and params.get("message") and not _gearbox_sentence(params.get("message"))
+                        and (routed is None or routed.get("route") == "other")):
                     try:
                         import colleague
                         out = colleague.answer(params.get("provider"), str(params.get("message") or ""),

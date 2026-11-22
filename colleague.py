@@ -35,6 +35,17 @@ STAGE_MAX = 2
 HISTORY_TURNS = 20                     # the last 20 messages; older turns become one summary line
 HISTORY_CHARS = 6000
 
+# A sentence that names a gearbox, a reducer or a gear ratio (or gives kW/hp with RPM/ratio) belongs to the gearbox
+# requirements reader, never here. Found live: while the AI router was away, "15 kW gearbox ratio 8" was answered with
+# "No project is open yet … What should we start with?" and the design never started. Same words as llm.interpret.
+_GEARBOX = re.compile(r"gear ?box|reducer|reduction gear|speed reducer|gear ratio|rasio gigi|roda gigi|reduksi|planetary"
+                      r"|\bratio\b[^.\n]{0,20}\b(?:kw|hp|rpm)\b|\b(?:kw|hp)\b[^.\n]{0,20}\b(?:rpm|ratio)\b", re.I)
+
+
+def is_gearbox_message(message) -> bool:
+    """Does this sentence ask for a gearbox? Then the requirements reader must read it, not this layer."""
+    return bool(_GEARBOX.search(str(message or "")))
+
 # ------------------------------------------------------------------ language (A3)
 # Script decides first, then Indonesian function words. A message with neither is unclear, and an unclear message
 # takes the language of the last clear message in the session, English when there is none.
@@ -241,6 +252,17 @@ _SUGGEST = {
             "Ketatkan toleransi hanya di bagian penting"],
         9: ["Susun BOM dan cut list", "Buat gambar kerja", "Ekspor STEP dan STL"],
     },
+    "zh": {
+        1: ["说明 {topic} 的用途", "给出关键尺寸或可用空间", "说明车间条件：激光、折弯、焊接？"],
+        2: ["查找 {topic} 的设计参考", "只用 solver 的参考", "跳过参考，直接比较方案"],
+        3: ["为 {topic} 选定布局", "并排比较两个方案", "确定零件之间的接口"],
+        4: ["设计 {topic} 的零件", "对零件做强度校核", "把机架做轻一点"],
+        5: ["给 {topic} 加安装支架", "检查焊缝", "列出螺栓和切割清单"],
+        6: ["检查装配的干涉", "指出未接触的部位", "收紧接头间隙"],
+        7: ["运行强度校核", "给出载荷，让校核有依据", "按安全系数比较方案"],
+        8: ["对选定工艺运行 DFM", "修复未通过的 DFM 检查", "只在关键处收紧公差"],
+        9: ["生成 BOM 和切割清单", "制作车间图纸", "导出 STEP 和 STL"],
+    },
 }
 
 _STAGE_LINE = {
@@ -256,12 +278,17 @@ _STAGE_LINE = {
            6: "rakitan masih perlu cek tumpang tindih dan kontak",
            7: "cek kekuatan belum jalan untuk semua part", 8: "DFM belum jalan untuk proses terpilih",
            9: "gambar kerja, BOM dan cut list berikutnya"},
+    "zh": {1: "brief 还没有确定", 2: "brief 已定，参考还没选", 3: "方案已经列出，还没有设计",
+           4: "零件正在设计中", 5: "零件已有，接下来是接头和车间工序",
+           6: "装配还需要干涉和接触检查", 7: "强度校核还没有覆盖所有零件",
+           8: "选定工艺的 DFM 还没运行", 9: "接下来是图纸、BOM 和切割清单"},
 }
 
 
 def suggestions_for(stage: int, topic: str, lang: str) -> list:
-    table = _SUGGEST["id" if lang == "id" else "en"][max(1, min(9, int(stage or 1)))]
-    name = topic or ("desain baru" if lang == "id" else "a new design")
+    table = _SUGGEST.get(lang) or _SUGGEST["en"]
+    table = table[max(1, min(9, int(stage or 1)))]
+    name = topic or ("desain baru" if lang == "id" else "新的设计" if lang == "zh" else "a new design")
     return [{"label": s.replace("{topic}", name)[:90], "action": {"route": "continue", "params": {"stage": stage}}}
             for s in table[:3]]
 
@@ -298,7 +325,10 @@ def _clean_suggestions(raw, stage: int, topic: str, lang: str) -> list:
     return out[:3]
 
 
-NOT_SURE = {"en": "Not sure — you choose", "id": "Tidak yakin — pilih saja"}
+NOT_SURE = {"en": "Not sure — you choose", "id": "Tidak yakin — pilih saja", "zh": "不太确定 — 你来选"}
+NOT_SURE_NOTE = {"en": "IDRIS uses the recommended value and marks it assumed",
+                 "id": "IDRIS memakai rekomendasi dan menandainya assumed",
+                 "zh": "IDRIS 会使用推荐值并标记为 assumed"}
 
 
 def _clean_questions(raw, stage: int, lang: str, answered: set) -> list:
@@ -332,9 +362,8 @@ def _clean_questions(raw, stage: int, lang: str, answered: set) -> list:
         if not any(o["recommended"] for o in opts):
             opts[0]["recommended"] = True
         if not any(o["label"].lower().startswith(("not sure", "tidak yakin")) for o in opts):
-            opts.append({"label": NOT_SURE["id" if lang == "id" else "en"],
-                         "note": ("IDRIS memakai rekomendasi dan menandainya assumed" if lang == "id"
-                                  else "IDRIS uses the recommended value and marks it assumed"),
+            opts.append({"label": NOT_SURE.get(lang) or NOT_SURE["en"],
+                         "note": NOT_SURE_NOTE.get(lang) or NOT_SURE_NOTE["en"],
                          "recommended": False, "assumed": True})
         out.append({"id": qid, "text": text, "options": opts, "allow_other": True, "stage": stage})
         if len(out) >= cap:
@@ -378,23 +407,32 @@ def _user_block(message: str, history, status: dict) -> str:
             + "\n\nMESSAGE TO ANSWER (data):\n" + str(message or "")[:1200])
 
 
+FALLBACK_LANGS = ("en", "id", "zh")     # the languages these rules can write; any other message gets English
+_NEW_DESIGN = {"en": "a new design", "id": "desain baru", "zh": "新的设计"}
+_NO_PROJECT = {"en": "Hi. No project is open yet, so there is nothing to continue. What should we start with?",
+               "id": "Hai. Belum ada proyek yang terbuka, jadi belum ada yang bisa kulanjutkan. Mau mulai dari apa?",
+               "zh": "你好。目前还没有打开的项目，所以没有可以继续的内容。想从哪里开始？"}
+_TAIL = {"en": "Where do we go next?", "id": "Mau lanjut ke mana?", "zh": "接下来做什么？"}
+
+
 def _fallback(message: str, history, status: dict, lang: str, why: str = "") -> dict:
     """No AI: still a colleague. The status line and the next steps come from the stage, never from a template."""
     stage = int(status.get("stage") or 1)
     topic = status.get("topic") or ""
-    name = topic or ("desain baru" if lang == "id" else "a new design")
-    line = _STAGE_LINE["id" if lang == "id" else "en"][stage]
+    # the rules write English, Indonesian and Chinese only: a message in another script gets an English status line and
+    # `language: "en"`, because a reply that is not in that language must not claim to be (v0.41 fix)
+    said = lang if lang in FALLBACK_LANGS else "en"
+    name = topic or _NEW_DESIGN[said]
+    line = _STAGE_LINE[said][stage]
     if topic:
-        head = (f"Kita masih di {name} — tahap {stage} ({STAGES[stage - 1]}): {line}."
-                if lang == "id" else
+        head = (f"Kita masih di {name} — tahap {stage} ({STAGES[stage - 1]}): {line}." if said == "id" else
+                f"我们还在 {name} — 第 {stage} 阶段（{STAGES[stage - 1]}）：{line}。" if said == "zh" else
                 f"We are still on {name} — stage {stage} ({STAGES[stage - 1]}): {line}.")
     else:
-        head = ("Hai. Belum ada proyek yang terbuka, jadi belum ada yang bisa kulanjutkan. "
-                "Mau mulai dari apa?" if lang == "id" else
-                "Hi. No project is open yet, so there is nothing to continue. What should we start with?")
-    tail = ("Mau lanjut ke mana?" if lang == "id" else "Where do we go next?")
-    return {"reply": f"{head} {tail}", "language": lang, "stage": stage,
-            "suggestions": suggestions_for(stage, topic, lang), "questions": [], "action": None,
+        head = _NO_PROJECT[said]
+    tail = _TAIL[said]
+    return {"reply": f"{head} {tail}", "language": said, "stage": stage,
+            "suggestions": suggestions_for(stage, topic, said), "questions": [], "action": None,
             "provider": "IDRIS colleague (rules)", "model": None, "numbers_verified": True,
             "unverified_numbers": [], "error": why[:300]}
 

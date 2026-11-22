@@ -210,3 +210,56 @@ def test_an_unusable_ai_answer_falls_back_to_the_rules_without_raising(monkeypat
     r = colleague.ask(None, "cuy", ID_HISTORY, SNOW_PLOW, reply_language="id")
     assert "snow plow" in r["reply"].lower()
     assert r["provider"].startswith("IDRIS colleague")
+
+
+# ------------------------------------------------------------------ A2: the gearbox is never taken over (v0.41 fix)
+@pytest.mark.parametrize("message", [
+    "15 kW gearbox ratio 8",
+    "gearbox 5 kW 1500 rpm",
+    "design a speed reducer, 4 kW at 1450 rpm",
+    "desain roda gigi reduksi dua tingkat",
+    "planetary gearbox for a winch",
+])
+def test_a_sentence_that_names_a_gearbox_is_not_answered_by_the_colleague(message):
+    assert colleague.is_gearbox_message(message) is True
+
+
+@pytest.mark.parametrize("message", [
+    "cuy", "design snow plow for pickup", "buatkan kursi lipat dari kayu",
+    "add: replaceable cutting edge", "make the frame lighter", "",
+])
+def test_a_sentence_about_another_object_is_answered_by_the_colleague(message):
+    assert colleague.is_gearbox_message(message) is False
+
+
+def test_the_chat_route_hands_a_gearbox_to_the_reader_before_the_colleague():
+    """The gate lives on the route's colleague branch; without it "15 kW gearbox ratio 8" never starts a design."""
+    import pathlib
+    src = pathlib.Path("main.py").read_text()
+    assert "def _gearbox_sentence(text) -> bool:" in src
+    assert "not _gearbox_sentence(params.get(\"message\"))" in src
+    branch = src.index("colleague.answer(")
+    assert src.index("not _gearbox_sentence(params.get(\"message\"))") < branch
+    assert colleague.is_gearbox_message("15 kW gearbox ratio 8") is True
+
+
+# ------------------------------------------------------------------ A3: the fallback never claims a language it cannot write
+def test_the_rules_answer_a_chinese_message_in_chinese():
+    r = colleague.ask(None, "接着做", [], SNOW_PLOW)          # no provider: the rules write the reply
+    assert r["language"] == "zh"
+    assert "我们还在 snow plow" in r["reply"] and "第 3 阶段" in r["reply"]
+    assert "接下来做什么？" in r["reply"]
+    assert any(s["label"].startswith("为 snow plow 选定布局") for s in r["suggestions"]), r["suggestions"]
+
+
+def test_a_language_the_rules_cannot_write_is_reported_as_english():
+    r = colleague.ask(None, "продолжай", [], SNOW_PLOW)
+    assert r["language"] == "en", "a Russian message must not be answered by an English reply labelled ru"
+    assert r["reply"].startswith("We are still on snow plow")
+    assert r["suggestions"] and r["suggestions"][0]["label"].startswith("Pick a layout")
+
+
+def test_a_chinese_chat_with_no_project_starts_in_chinese():
+    r = colleague.ask(None, "你好", [], None)
+    assert r["language"] == "zh"
+    assert "还没有打开的项目" in r["reply"]
