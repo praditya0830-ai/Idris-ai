@@ -124,6 +124,154 @@ def _clean_query(tid: str, q, message: str) -> dict:
     return out
 
 
+# --------------------------------------------------------------------------- whole products, not one solid
+# A bicycle, a drone or a plane is a product of several parts. The router must never send one to the single-solid
+# free_design path, and a new sentence about a different product must not read the previous design's context.
+# Order matters: "sepeda motor" is a motorcycle, and the loop returns the first product that matches. "motor" alone
+# is never a product: an electric motor, a motor mount and "dudukan motor" are parts of a machine, not a motorbike.
+_PRODUCTS = (
+    ("motorcycle", r"motorcycle|motorbike|sepeda motor|motor bebek|motor sport"),
+    ("bicycle", r"\bsepeda\b|\bbicycle\b|\bbike\b|pushbike"),
+    ("drone", r"\bdrone\b|quadcopter|\buav\b"),
+    ("airplane", r"airplane|aircraft|aeroplane|aero plane|\bpesawat\b"),
+    ("car", r"\bmobil\b|\bcar\b|passenger car|kendaraan penumpang"),
+    ("chair", r"\bkursi\b|\bchair\b"),
+    ("table", r"\bmeja\b"),
+    ("robot", r"\brobot\b|robot arm|lengan robot"),
+    ("cart", r"\bcart\b|trolley|gerobak|kereta dorong"),
+    ("boat", r"\bboat\b|\bkapal\b|perahu"),
+    ("scooter", r"scooter|skuter"),
+)
+# "plane" and "table" are ordinary engineering words (top plane, ISO table) and a product only when the sentence
+# asks for one: "design a plane", "make a table". A bare "table" after a standard or data word is never a product.
+_DESIGN_VERB = (r"(?:design|make|build|create|draw|model|construct|buat(?:kan|lah)?|desain(?:kan|lah)?|"
+                r"rancang(?:lah)?|bikin(?:kan)?)")
+_PLANE_PRODUCT = re.compile(r"\b" + _DESIGN_VERB + r"\b[^.\n]{0,24}?\bplane\b", re.I)
+_TABLE_PRODUCT = re.compile(r"\b" + _DESIGN_VERB + r"\b[^.\n]{0,24}?\btable\b", re.I)
+# One part OF a product is a part, not the product: "cart wheel bracket", "drone arm", "chair leg", "motor mount"
+# and the other word order too: "mount plate for a drone". "arm" is left out for a robot, because a robot arm IS the
+# product (robot arm 600 mm).
+_PART_WORDS = (r"mount(?:ing)?|mount ?plate|bracket|plate|arm|leg|legs|wheel|wheels|housing|cover|frame|handlebar|"
+               r"saddle|fork|chain|brake|pedal|stem|seat ?post|basket|rack|mudguard|blade|axle|hub|panel|dudukan|"
+               r"braket|pelat|plat|lengan|kaki|roda|rangka|setang|sadel|garpu|rantai|rem|keranjang")
+_PART_WORDS_OTHER = (r"mount(?:ing)?|mount ?plate|bracket|plate|leg|legs|wheel|wheels|housing|cover|frame|handlebar|"
+                     r"saddle|fork|chain|brake|pedal|stem|seat ?post|basket|rack|mudguard|blade|axle|hub|panel|"
+                     r"dudukan|braket|pelat|plat|lengan|kaki|roda|rangka|setang|sadel|garpu|rantai|rem|keranjang")
+# A sentence that asks for a gearbox is a new topic even though a gearbox is not a "product": it has its own route
+# with its own requirements, so it must not be answered as a fact inside another object's brief.
+_GEARBOX_REQ = re.compile(r"\b(?:gearbox|gear ?box|reducer|reduser|reduction gear|gear pair)\b", re.I)
+_ENOUGH = re.compile(r"\b(?:complete|whole|entire|full|seluruh|lengkap|utuh)\b", re.I)
+_SIZE = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)?\s*(mm|cm|\bm\b|inch|in|\"|kg|n\b|km/h)", re.I)
+
+
+def _is_a_part(low: str, name: str, pat: str) -> bool:
+    """Is the product word here the whole product, or one part of it? Both word orders, one or two words apart."""
+    parts = _PART_WORDS_OTHER if name == "robot" else _PART_WORDS
+    # "cart wheel bracket", "chair leg", "bicycle frame", "drone arm 200 mm"
+    if re.search(r"(?:" + pat + r")\s+(?:[\w-]+\s+){0,2}?(?:" + parts + r")\b", low):
+        return True
+    # "wheel bracket for a cart", "mount plate on a drone"
+    if re.search(r"\b(?:" + parts + r")\s+(?:[\w-]+\s+){0,1}?(?:" + pat + r")", low):
+        return True
+    return False
+
+
+def product_of(message: str) -> str | None:
+    """The whole product the sentence names (bicycle, drone, airplane…), or None when it names no product.
+
+    Deliberately narrow: it is the guard that stops a part being designed as one solid product, so a false product is
+    worse than no product. "motor" (electric motor), a CAD "top plane" and an "ISO table" are not products.
+    """
+    low = str(message or "").lower()
+    if not low.strip():
+        return None
+    for name, pat in _PRODUCTS:
+        if not re.search(pat, low):
+            continue
+        if _is_a_part(low, name, pat):
+            continue
+        return name
+    if _PLANE_PRODUCT.search(low):                   # "design a plane" -- but never "sketch on the top plane"
+        return "airplane"
+    if _TABLE_PRODUCT.search(low) and not _is_a_part(low, "table", r"\btable\b"):
+        return "table"                                # "design a table" -- but never "ISO table", "table top"
+    return None
+
+
+def enough_info(message: str) -> bool:
+    """Does the sentence already say enough to plan a product? It must name the product and give a size, a load or an
+    envelope, or say the product is complete/whole. A bare "design a bicycle" is not enough: it is a brief."""
+    low = str(message or "")
+    return bool(_ENOUGH.search(low) or _SIZE.search(low))
+
+
+def product_route(message: str, route_name: str | None) -> dict | None:
+    """A whole product never goes to free_design/primitive/other: -> route dict for brief or assembly, else None."""
+    if route_name not in (None, "free_design", "primitive", "other"):
+        return None
+    name = product_of(message)
+    if not name:
+        return None
+    enough = enough_info(message)
+    return {"route": "assembly" if enough else "brief", "kind": "assembly", "library_id": None, "query": {},
+            "concepts": [], "brief": {"object": name, "kind": "assembly"},
+            "reason": f"whole product ({name})" + ("" if enough else ", details missing"),
+            "read_by": "product rule (whole product, not one solid)"}
+
+
+def _saved_project(ctx: dict, key: str) -> dict:
+    """The open project, small enough to travel back in `context_reset` so it is kept, not thrown away."""
+    blk = ctx.get(key)
+    if not isinstance(blk, dict):
+        return {}
+    out = {k: blk[k] for k in ("object", "purpose", "kind", "request", "title", "ready") if blk.get(k)}
+    out["from"] = key
+    if isinstance(blk.get("features"), list):
+        out["features"] = blk["features"][:8]
+    if isinstance(blk.get("missing"), list):
+        out["missing"] = [str((m or {}).get("k") or m) for m in blk["missing"][:3]]
+    return out
+
+
+def topic_reset(message: str, ctx) -> dict | None:
+    """A NEW sentence about a different product must not inherit the open design.
+
+    -> {"reason", "from", "to", "previous"} when the context must be dropped, else None. Only a sentence that names a
+    product can reset: "make it lighter" and "80 mm" are about the design that is open. The open project travels back
+    in `previous` (and the caller keeps gearbox/engineering context), so a reset is a saved project, never a silent
+    deletion. A context that cannot be read as a product is never dropped: a gearbox housing is not "replaced" by a
+    sentence that mentions a part of an electric motor.
+    """
+    if not isinstance(ctx, dict):
+        return None
+    new = product_of(message)
+    if not new and _GEARBOX_REQ.search(str(message or "")):
+        new = "gearbox"
+    if not new:
+        return None
+    old, old_kind = None, None
+    for key, field in (("pending_cad", "request"), ("current_cad", "request"), ("brief", "object"),
+                       ("assembly_plan", "object")):
+        blk = ctx.get(key)
+        if not isinstance(blk, dict):
+            continue
+        old = str(blk.get(field) or blk.get("object") or blk.get("title") or "") or None
+        if old:
+            old_kind = key
+            break
+    if not old_kind:
+        return None                               # nothing open that could be replaced
+    old_p = product_of(old or "")
+    if not old_p and new != "gearbox":
+        return None                               # the open context is not a product: keep it, never drop it
+    if not old_p and _GEARBOX_REQ.search(old or ""):
+        return None                               # a gearbox is open and stays open
+    if old_p == new:
+        return None
+    return {"reason": f"new request is a different product ({new}, the open context was {old_p})",
+            "from": old, "to": new, "previous": _saved_project(ctx, old_kind)}
+
+
 def route(message: str, has_gearbox: bool = False, provider=None, concepts_wanted: int | None = None):
     """-> {"route", "library_id", "query", "reason", "read_by"} or None (AI off, unreachable or unusable answer).
 
@@ -148,6 +296,11 @@ def route(message: str, has_gearbox: bool = False, provider=None, concepts_wante
         return None
     out = {"route": raw["route"], "library_id": None, "query": {}, "reason": str(raw.get("reason") or "")[:120],
            "read_by": f"{order[0]} ({used})", "concepts": [], "kind": None, "brief": {}}
+    # a whole product is never designed as one solid, whatever the reader said (bicycle, drone, airplane, car…)
+    prod = product_route(message, out["route"])
+    if prod:
+        prod["read_by"] = prod["read_by"] + " · " + out["read_by"]
+        return prod
     if out["route"] == "brief":
         out["kind"] = "assembly" if raw.get("kind") == "assembly" else "part"
         out["brief"] = raw.get("brief") if isinstance(raw.get("brief"), dict) else {}
