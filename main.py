@@ -884,13 +884,13 @@ class Handler(BaseHTTPRequestHandler):
                              "eta_s": (est or {}).get("eta_s"), "not_checked": not_checked}}
 
     def _chat_cad(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
-        """Non-gearbox object -> CAD code the browser builds. Bagian F: the ladder full -> simplified ->
-        placeholder, so an answer carries geometry unless the request holds no usable size at all.
+        """Non-gearbox object -> CAD the browser builds. v0.43: the design ladder features -> code -> failed
+        report (design_ladder.py); a failed part says what went wrong instead of showing an unlabelled box.
 
         UI v65: `context.shape_family` is checked here too, so every door that writes CAD code with a context
         (`/chat`, `/cad/try`) reads the same contract and the answer always says what happened to the hint.
         """
-        import cad_fallback
+        import design_ladder
         ctx, _sf = _clean_shape_family(ctx)
         base = {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None}
@@ -900,14 +900,17 @@ class Handler(BaseHTTPRequestHandler):
             budget = 85.0
         # Review item 1: the ladder shares one budget with the HTTP limit. Without a deadline a full design
         # (~85 s) plus the simplified one could reach ~170 s and the Studio showed "chat failed".
-        r = cad_fallback.design(msg, ctx, provider, reply_language, deadline=time.time() + budget)
+        # v0.43 (design ladder): features -> code -> an honest failure report. A failed part carries NO design
+        # geometry; the old envelope is only `preview_cad`, labelled "failed preview", and never a result.
+        r = design_ladder.design(msg, ctx, provider, reply_language, deadline=time.time() + budget)
         cad = r.get("cad")
-        # fidelity means "there is geometry at this rung". A question about sizes has no geometry, so it carries no
-        # fidelity at all, and the sizes are asked in engineer sentences (never a raw field name).
-        fidelity = r.get("fidelity") if (cad and isinstance(cad, dict) and cad.get("code")) else None
+        has_geom = bool(isinstance(cad, dict) and (cad.get("code") or cad.get("feature_tree")))
+        fidelity = r.get("fidelity") if has_geom else None
         return {**base, "answer": r["answer"], "cad": cad, "provider": r.get("read_by"),
                 "language": "en" if llm.want_english(reply_language) else None,
-                "missing": r.get("missing") or [], "fidelity": fidelity,
+                "missing": r.get("missing") or [], "fidelity": fidelity, "rung": r.get("rung"),
+                "design_report": r.get("report"), "preview_cad": (r.get("preview") or {}).get("cad"),
+                "numbers": r.get("numbers") or [], "design_shape_class": r.get("shape_class"),
                 "cad_attempts": r.get("attempts") or [],
                 "validated": bool(r.get("validated")), "target_check": r.get("target_check"),
                 "shape_family": _shape_family_reply(ctx),          # UI v65: accepted, or why it was dropped
