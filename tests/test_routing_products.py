@@ -223,5 +223,5 @@ def test_a_real_cad_with_code_keeps_its_fidelity(monkeypatch):
 
 # the version assertion follows the branch (main carried 0.40.2 here, which stopped being true at 0.40.3)
 
-def test_version_is_0_41_0():
-    assert ace_core.SOLVER_VERSION == "0.41.0"
+def test_version_is_0_42_0():
+    assert ace_core.SOLVER_VERSION == "0.42.0"

@@ -484,6 +484,50 @@ POST /chat {"message": "cuy", "history": [{"role": "user", "text": "…"}], "con
 What it is not: the layer never computes a number, never starts a design on its own, and never copies a branded
 product — references are for the pattern, not for a copy.
 
+## Joining and manufacturing: a design a workshop can build (v0.42)
+
+Arya, 21 Nov: the parts looked like a product but could not be made — the tube passed through the plate, the tube did
+not reach the blade, nothing said how a part is cut or welded. `POST /join/plan {parts, interfaces, bolt_size}` now
+answers the workshop's questions for a planned assembly:
+
+```json
+{"ok": true,
+ "joints": [{"between": ["blade", "mount plate"], "kind": "fillet_weld", "length_mm": 55.4,
+             "size": {"value": 5.0, "unit": "mm", "what": "minimum fillet leg (thickest base metal)",
+                      "source": "AWS D1.1 Table 7.7 … for 6.0 mm base metal"}}],
+ "checks": [{"check": "overlap", "parts": ["blade", "mount plate"], "value_mm3": 0.0, "status": "pass",
+             "source": "bounding-box estimate (not kernel geometry)", "fidelity": "estimate"}],
+ "proposed_fixes": [{"part": "push tube", "with": "mount plate", "axis": "z", "shift_mm": 6.0,
+                     "overlap_mm3": 9600.0, "accepted": false}], "fixes": [],
+ "bom": [{"part": "mount plate", "process": "laser_cut", "stock": "plate", "mass_kg": 0.564}],
+ "cut_list": [{"part": "mount plate", "stock": "plate 6.0 mm", "length_mm": 120.0, "width_mm": 100.0}],
+ "welds": [], "bolts": [], "assembly_order": [], "joint_strength": [], "notes": []}
+```
+
+- **Process and stock per part**: laser/plasma cut plate of a standard mill thickness (1-25 mm), a tube from the
+  EN 10219-2 SHS table, a machined block, a casting, a print, or a purchased part. A part with no declared process
+  says so in `process_needs` instead of silently choosing one.
+- **Joints per interface**: `fillet_weld` (minimum leg from AWS D1.1 Table 7.7 as already implemented in
+  `physics.dfm_rules`, length from the shared face), `bolted` (ISO 273 medium clearance hole and a catalogue bolt
+  length above the clamp thickness), `pinned`, `press_fit`, `slot_tab`. Each joint carries its reason and the
+  features the parts still need (fit-up, torch access, hole in both parts, edge distance). A bolt size nobody gave
+  is M8 **as an assumption** (`bolt_selection.source: "assumed M8 — no load given, change anytime"`, listed in
+  `assumptions`, with the stage-5 question `Bolt size?`); ISO 273 is the source of the clearance hole, never of
+  that choice.
+- **Geometry check**: overlap volume between parts must be 0 (inside 1 mm3), every welded joint must fit up within
+  0.5 mm, bolt holes must share an axis within 0.5 mm, and a part with no joint is reported as floating. An overlap
+  is reported with the shift that would clear it ("push tube moved +6.0 mm on z") in `proposed_fixes`, and it is
+  applied only when the engineer accepts (`fix: true`): IDRIS never moves a part on its own, because that can pull a
+  tube off the curved blade it was meant to touch. The overlap number itself is an AABB estimate, labelled as one.
+- **Workshop documents**: BOM with process, stock and a kernel mass, cut list (plate outline or tube length), weld
+  list with its size source, bolt list, and an assembly order (weld the sub-assemblies first, then bolt).
+- **Strength**: with no load from the engineer every joint is `not_checked` with that reason; IDRIS does not claim a
+  weld or bolt strength it did not compute.
+
+What it is not: the overlap test uses each part's declared volume, so a curved part is its bounding box (a
+conservative bound, not the exact intersection), the cut list is a length, not a nesting or a cost, there is no weld
+distortion, no sequence simulation and no fixture design, and a joint strength is not computed without a load.
+
 ## Fidelity, honestly
 
 Solvers declare a fidelity level (`L0` closed-form handbook/ISO, `L1` 1D numerical, `L2`

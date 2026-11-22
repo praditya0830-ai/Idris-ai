@@ -240,4 +240,4 @@ def test_the_plan_call_has_more_room_and_a_stricter_retry(monkeypatch):
 
 
 def test_the_solver_reports_the_new_version():
-    assert ace_core.SOLVER_VERSION == "0.41.0"
+    assert ace_core.SOLVER_VERSION == "0.42.0"
