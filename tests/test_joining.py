@@ -161,3 +161,21 @@ def test_the_endpoint_does_not_move_a_part_unless_the_engineer_says_fix():
     assert all(p["accepted"] is False for p in body["proposed_fixes"])
     code, body = design_ext.handle_post("/join/plan", {"parts": [BLADE, PLATE, through], "fix": True})
     assert body["ok"] is True and body["fixes"]
+
+
+# --- solid rods and pins are a full disc, not a box (audit 22 Nov, BUG 1) --------------------------
+def test_a_solid_rod_without_a_wall_is_a_disc_not_a_bounding_box():
+    rod = {"name": "rod", "material": "steel", "shape": {"type": "rod", "d": 20, "l": 100}}
+    assert joining.volume_mm3(rod) == pytest.approx(31416, abs=1)
+    assert joining.mass_kg(rod) == pytest.approx(0.2466, abs=0.001)
+
+
+def test_a_tube_keeps_its_bore():
+    tube = {"name": "tube", "material": "steel", "shape": {"type": "cylinder", "d": 20, "l": 100, "wall": 2}}
+    assert joining.volume_mm3(tube) == pytest.approx(11310, abs=1)
+
+
+def test_a_cylinder_with_wall_zero_is_solid_instead_of_empty():
+    solid = {"name": "pin", "material": "steel", "shape": {"type": "cylinder", "d": 20, "l": 100, "wall": 0}}
+    assert joining.volume_mm3(solid) == pytest.approx(31416, abs=1)
+    assert joining.mass_kg(solid) == pytest.approx(0.2466, abs=0.001)

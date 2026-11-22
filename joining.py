@@ -142,7 +142,15 @@ def volume_mm3(part: dict) -> float:
     if str(sh.get("type") or "").lower() in ("cylinder", "tube", "rod", "pipe"):
         try:
             d, l = float(sh.get("d")), float(sh.get("l"))
-            wall = float(sh.get("wall"))
+            if d <= 0 or l <= 0:
+                return 0.0
+            # A rod, pin or shaft has no "wall" at all, and wall 0 means solid too: both are a full disc.
+            # Reading wall as a number first made float(None) raise and fall through to the bounding box
+            # (d*d*l, 27.3 % too heavy), and wall 0 gave d - 2*0 = d, i.e. a volume of zero.
+            wall = sh.get("wall")
+            if wall is None or wall == "" or float(wall) == 0.0:
+                return 3.141592653589793 / 4 * d * d * l
+            wall = float(wall)
             inner = max(0.0, d - 2 * wall)
             return 3.141592653589793 / 4 * (d * d - inner * inner) * l
         except (TypeError, ValueError):
