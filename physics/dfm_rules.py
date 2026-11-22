@@ -95,7 +95,8 @@ INSIDE_CORNER_SOURCE = ("Milling guideline, source not verified: the smallest in
 
 
 def _check(cid: str, name: str, status: str, *, value=None, limit=None, unit: str | None = None,
-           source: str | None = None, source_status: str | None = None, message: str = "") -> dict:
+           source: str | None = None, source_status: str | None = None, message: str = "",
+           extra: dict | None = None) -> dict:
     # v0.39.1: the default used to be "mm", which put millimetres on a hole COUNT. A check now states the unit
     # of what it measured: mm for a length, count for a number of features, none when nothing was measured.
     out = {"id": cid, "check": name, "status": status, "unit": unit, "message": message}
@@ -107,6 +108,8 @@ def _check(cid: str, name: str, status: str, *, value=None, limit=None, unit: st
         out["source"] = source
     if source_status:
         out["source_status"] = source_status
+    if extra:
+        out.update(extra)                       # fields a check carries beyond the shared envelope
     return out
 
 
@@ -163,25 +166,37 @@ def check(cad: dict) -> dict:
     # 2) drilled holes: a hole diameter that is not in the drill series needs a mill or a reamer
     holes = [h for h in (cad.get("holes") or []) if isinstance(h, dict)]
     if holes:
-        odd = []
+        # X1b: the check says which diameters it looked at and which drill covers each, so a pass is not just
+        # the count signed off -- the engineer can see 6.0 mm -> 6.0 mm drill next to the result.
+        checked, by_d = [], {}
         for h in holes:
             try:
-                d = float(h.get("d"))
+                d = round(float(h.get("d")), 3)
             except (TypeError, ValueError):
                 continue
-            if not any(abs(d - x) <= DRILL_TOL_MM for x in DRILL_MM):
-                odd.append(round(d, 2))
+            row = by_d.get(d)
+            if row is None:
+                near = min(DRILL_MM, key=lambda x: abs(x - d))
+                row = {"d_mm": d, "standard_drill_mm": near,
+                       "in_series": bool(abs(d - near) <= DRILL_TOL_MM), "holes": 0}
+                by_d[d] = row
+                checked.append(row)
+            row["holes"] += 1
+        odd = [row["d_mm"] for row in checked if not row["in_series"]]
+        listed = ", ".join(f"{row['d_mm']:g}" for row in checked)
         if odd:
             checks.append(_check("drill_size", "hole diameters in the drill series", "fail",
                                  value=sorted(set(odd)), unit="mm", source=DRILL_SOURCE,
                                  source_status=DRILL_SOURCE_STATUS,
                                  message=f"no standard drill for {', '.join(f'{d:g}' for d in sorted(set(odd)))} mm; "
-                                         f"mill or ream it, or use the nearest drill diameter"))
+                                         f"mill or ream it, or use the nearest drill diameter",
+                                 extra={"diameters_mm": checked}))
         else:
             checks.append(_check("drill_size", "hole diameters in the drill series", "pass",
                                  value=len(holes), unit="count", source=DRILL_SOURCE,
                                  source_status=DRILL_SOURCE_STATUS,
-                                 message=f"{len(holes)} hole(s) take a standard drill diameter"))
+                                 message=f"{len(holes)} hole(s) take a standard drill diameter ({listed} mm)",
+                                 extra={"diameters_mm": checked}))
     else:
         checks.append(_check("drill_size", "hole diameters in the drill series", "not_checked",
                              message="no holes were declared, so there is nothing to check"))

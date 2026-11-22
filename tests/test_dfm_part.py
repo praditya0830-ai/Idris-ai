@@ -271,3 +271,62 @@ def test_the_solver_check_carries_the_unit_too():
     assert code == 200
     units = {f["id"]: f["unit"] for f in body["outputs"]["findings"]}
     assert units["min_wall"] == "mm" and units["overhang"] == "fraction"
+
+
+# ------------------------------------------------------ X1: the three cases the UI team wrote down
+def test_a_60x40x5_plate_measures_5_mm_within_half_a_millimetre():
+    m = dp.measure({**_box_mesh(60, 40, 5), "process": "cnc", "material": "aluminium"})
+    wall = m["wall"]
+    assert wall["method_id"] == "exact-ray-triangle"
+    assert abs(wall["p5_mm"] - 5.0) <= 0.5, wall
+    assert abs(wall["median_mm"] - 5.0) <= 0.5, wall
+
+
+def _l_bracket_60_40_45():
+    """60 x 40 x 45 L-bracket, every wall 5 mm: the bracket from the UI report, at their dimensions."""
+    poly = [(0, 0), (60, 0), (60, 5), (5, 5), (5, 45), (0, 45)]
+    return _extrude(poly, [(3, 4, 5), (3, 5, 0), (3, 0, 1), (3, 1, 2)], 0, 40)
+
+
+def test_an_l_bracket_of_60x40x45_reads_its_5_mm_wall_within_point_6():
+    m = dp.measure({**_l_bracket_60_40_45(), "process": "cnc", "material": "aluminium"})
+    wall = m["wall"]
+    assert abs(wall["p5_mm"] - 5.0) <= 0.6, wall
+    assert abs(wall["median_mm"] - 5.0) <= 0.6, wall
+    assert wall["resolution_mm"] < 1.0 and wall["method_id"] == "exact-ray-triangle"
+
+
+def test_a_100_mm_cube_is_measured_in_under_ten_seconds():
+    t0 = time.perf_counter()
+    m = dp.measure({**_box_mesh(100, 100, 100), "process": "cnc", "material": "aluminium"})
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 10.0, f"{elapsed:.2f} s for a 100 mm cube"
+    assert abs(m["wall"]["p5_mm"] - 100.0) <= 1.0, m["wall"]
+
+
+def test_the_drill_check_lists_each_diameter_and_the_drill_that_makes_it():
+    m = dp.measure(dict(PLATE, holes=[{"d": 6.0}, {"d": 6.0}, {"d": 6.2}]))
+    drill = [c for c in m["checks"] if c["id"] == "drill_size"][0]
+    rows = {r["d_mm"]: r for r in drill["diameters_mm"]}
+    assert rows[6.0]["standard_drill_mm"] == 6.0 and rows[6.0]["in_series"] is True
+    assert rows[6.0]["holes"] == 2                     # the same diameter twice is one row, two holes
+    assert rows[6.2]["in_series"] is False and rows[6.2]["standard_drill_mm"] == 6.0
+    assert drill["status"] == "fail" and drill["unit"] == "mm"
+
+
+def test_the_route_passes_the_table_on_instead_of_a_fixed_key_list():
+    # the adapter used to rebuild each finding from a whitelist, which dropped diameters_mm before the answer
+    code, body = handle_post("/dfm/part", dict(PLATE, process="cnc", material="aluminium",
+                                               holes=[{"d": 6.0}, {"d": 6.2}]))
+    assert code == 200
+    drill = [f for f in body["outputs"]["findings"] if f["id"] == "drill_size"][0]
+    rows = {r["d_mm"]: r for r in drill["diameters_mm"]}
+    assert rows[6.0]["in_series"] is True and rows[6.2]["in_series"] is False
+    assert rows[6.2]["standard_drill_mm"] == 6.0 and drill["unit"] == "mm"
+
+
+def test_a_passing_drill_check_carries_the_same_table():
+    ok = dfm_rules.check({"process": "cnc", "material": "aluminium", "holes": [{"d": 8.0}, {"d": 8.0}]})
+    drill = [c for c in ok["checks"] if c["id"] == "drill_size"][0]
+    assert drill["status"] == "pass" and drill["unit"] == "count"
+    assert drill["diameters_mm"] == [{"d_mm": 8.0, "standard_drill_mm": 8.0, "in_series": True, "holes": 2}]
