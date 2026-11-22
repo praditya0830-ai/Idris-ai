@@ -399,6 +399,18 @@ buyer can be given instead:
   `chamfer` and `mirror` are carried by the exchange path (macro and `/model/validate`); the server-side kernel
   builder answers with a named `BuildError` rather than guessing geometry it cannot build.
 
+**The graph the Studio sends is checked first** (`POST /model/validate`, X3). The answer carries:
+
+- `ok` and `errors` (strings, as before) plus `problems`: one entry per rejected feature with `feature`, `op` and
+  the message, so the editor can put it next to the feature;
+- `dims` with every expression resolved, and the resolved `model` that the macro route can then take unchanged;
+- `exchange_only`: the features the exchange path carries but the server-side kernel does not build
+  (`chamfer`, `mirror`, `not_translated`); they validate, and the builder says so instead of guessing;
+- a dimension that cannot be resolved (a cycle, an unknown name) is an error in the answer, never a 500.
+
+A coordinate is not a length: `x`, `y`, `cx`, `cy` and `z_top` may be 0 or negative (a hole at y = 0 is a hole).
+A diameter, a distance, a radius or a depth may not.
+
 **Not tested in SolidWorks.** There is no SolidWorks in this environment, so the macro is checked only for VBA
 structure (balanced blocks, only VBA statements, `Application.SldWorks` present) and for content (every feature is
 either an API call or a stated skip). Someone with SolidWorks has to run it once and confirm the rebuild. The
@@ -423,7 +435,9 @@ cast) and `material`, and answers with findings that each carry a number, a limi
   holes, `fraction` for a share of the surface. A count is never labelled millimetres (v0.39.1).
 - **hole diameters** — checked against the DIN 338 / ISO 235 twist-drill series *when the caller declares the
   holes*. A hole cannot be recognised reliably in a faceted mesh (a bore, a slot and a tessellation artefact look
-  alike), so an undeclared hole is `not_checked`, never a pass.
+  alike), so an undeclared hole is `not_checked`, never a pass. The finding carries `diameters_mm`, one row per
+  diameter the check looked at (`d_mm`, `in_series`, `standard_drill_mm`), and `/dfm/part` passes every field of a
+  finding on instead of a fixed key list, so the table reaches the answer the Studio shows.
 - **overhang** (FDM) — the share of the surface whose normal leans more than 45 deg from the build direction.
 - **draft** (cast) — the share of the surface within 1 deg of parallel to the pull direction.
 - **undercuts, tool access, inside corner radius** — `not_checked` with the reason: they need the solid and the

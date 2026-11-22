@@ -205,5 +205,5 @@ def test_a_real_cad_with_code_keeps_its_fidelity(monkeypatch):
     assert out["fidelity"] == "full" and out["cad"]["code"]
 
 
-def test_version_is_0_40_3():
-    assert ace_core.SOLVER_VERSION == "0.40.3"
+def test_version_is_0_40_5():
+    assert ace_core.SOLVER_VERSION == "0.40.5"

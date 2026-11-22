@@ -26,7 +26,13 @@ def test_engineering_evidence_goes_to_the_discussion_path(monkeypatch):
     assert res["answer"].startswith("SF 1,49")
 
 
-def test_a_message_without_evidence_still_uses_the_requirements_reader(monkeypatch):
+def test_a_message_without_an_open_gearbox_does_not_get_the_gearbox_reader(monkeypatch):
+    """A bare sentence with nothing open is read by the general reader, not the gearbox one.
+
+    Found live: "buatkan kursi lipat dari kayu" was parsed as a gearbox requirements update,
+    because every message went through the gearbox prompt. That prompt only applies when a
+    gearbox is really open (requirements or variants in the context).
+    """
     seen = {}
 
     def fake_call(provider, system, user, max_tokens=500, timeout=None):
@@ -35,7 +41,21 @@ def test_a_message_without_evidence_still_uses_the_requirements_reader(monkeypat
 
     monkeypatch.setattr(llm, "call_provider", fake_call)
     llm.interpret("claude", "15 kW gearbox ratio 8")
+    assert seen["system"] == llm.GENERAL_SYSTEM
+    assert seen["system"] != llm.SYSTEM
+
+
+def test_an_open_gearbox_still_uses_the_requirements_reader(monkeypatch):
+    seen = {}
+
+    def fake_call(provider, system, user, max_tokens=500, timeout=None):
+        seen["system"] = system
+        return '{"intent": "set_params", "params": {"gear_ratio": 8}, "answer": "ok"}', "stub-model"
+
+    monkeypatch.setattr(llm, "call_provider", fake_call)
+    res = llm.interpret("claude", "ratio 8", current={"power_kw": 15.0})
     assert seen["system"] == llm.SYSTEM
+    assert res["params"]["gear_ratio"] == 8
 
 
 def test_the_bench_route_wins_over_the_library_and_cad_paths():
