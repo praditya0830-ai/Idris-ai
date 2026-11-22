@@ -153,10 +153,12 @@ _TABLE_PRODUCT = re.compile(r"\b" + _DESIGN_VERB + r"\b[^.\n]{0,24}?\btable\b", 
 # product (robot arm 600 mm).
 _PART_WORDS = (r"mount(?:ing)?|mount ?plate|bracket|plate|arm|leg|legs|wheel|wheels|housing|cover|frame|handlebar|"
                r"saddle|fork|chain|brake|pedal|stem|seat ?post|basket|rack|mudguard|blade|axle|hub|panel|dudukan|"
-               r"braket|pelat|plat|lengan|kaki|roda|rangka|setang|sadel|garpu|rantai|rem|keranjang")
+               r"braket|pelat|plat|lengan|kaki|roda|rangka|setang|sadel|garpu|rantai|rem|keranjang|"
+               r"wing|wings|sayap|gripper|fairing")
 _PART_WORDS_OTHER = (r"mount(?:ing)?|mount ?plate|bracket|plate|leg|legs|wheel|wheels|housing|cover|frame|handlebar|"
                      r"saddle|fork|chain|brake|pedal|stem|seat ?post|basket|rack|mudguard|blade|axle|hub|panel|"
-                     r"dudukan|braket|pelat|plat|lengan|kaki|roda|rangka|setang|sadel|garpu|rantai|rem|keranjang")
+                     r"dudukan|braket|pelat|plat|lengan|kaki|roda|rangka|setang|sadel|garpu|rantai|rem|keranjang|"
+                     r"wing|wings|sayap|gripper|fairing")
 # A sentence that asks for a gearbox is a new topic even though a gearbox is not a "product": it has its own route
 # with its own requirements, so it must not be answered as a fact inside another object's brief.
 _GEARBOX_REQ = re.compile(r"\b(?:gearbox|gear ?box|reducer|reduser|reduction gear|gear pair)\b", re.I)
@@ -170,8 +172,8 @@ def _is_a_part(low: str, name: str, pat: str) -> bool:
     # "cart wheel bracket", "chair leg", "bicycle frame", "drone arm 200 mm"
     if re.search(r"(?:" + pat + r")\s+(?:[\w-]+\s+){0,2}?(?:" + parts + r")\b", low):
         return True
-    # "wheel bracket for a cart", "mount plate on a drone"
-    if re.search(r"\b(?:" + parts + r")\s+(?:[\w-]+\s+){0,1}?(?:" + pat + r")", low):
+    # "wheel bracket for a cart", "mount plate on a drone", "gripper for a robot arm"
+    if re.search(r"\b(?:" + parts + r")\s+(?:[\w-]+\s+){0,2}?(?:" + pat + r")", low):
         return True
     return False
 
@@ -191,7 +193,8 @@ def product_of(message: str) -> str | None:
         if _is_a_part(low, name, pat):
             continue
         return name
-    if _PLANE_PRODUCT.search(low):                   # "design a plane" -- but never "sketch on the top plane"
+    # "design a plane" -- but never "sketch on the top plane" and never "a plane wing" (a wing is a part)
+    if _PLANE_PRODUCT.search(low) and not _is_a_part(low, "airplane", r"\bplane\b"):
         return "airplane"
     if _TABLE_PRODUCT.search(low) and not _is_a_part(low, "table", r"\btable\b"):
         return "table"                                # "design a table" -- but never "ISO table", "table top"
