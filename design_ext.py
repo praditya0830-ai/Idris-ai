@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 import cad_fallback
 
-POST_ROUTES: tuple = ()
+POST_ROUTES: tuple = ("/join/plan",)
 
 
 def handle_get(path: str):
@@ -29,4 +29,11 @@ def handle_get(path: str):
 
 
 def handle_post(base: str, params: dict):
-    return None
+    """POST /join/plan {parts, interfaces, bolt_size} -> joints, geometry check, BOM/cut list/welds/bolts (v0.42)."""
+    if str(base or "").split("?")[0].rstrip("/") != "/join/plan":
+        return None
+    import joining
+    parts = params.get("parts") if isinstance(params.get("parts"), list) else []
+    return 200, {"success": True, **joining.plan(parts, params.get("interfaces"),
+                                                  str(params.get("bolt_size") or "M8"),
+                                                  bool(params.get("fix", True)))}
