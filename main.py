@@ -898,9 +898,14 @@ class Handler(BaseHTTPRequestHandler):
         # Review item 1: the ladder shares one budget with the HTTP limit. Without a deadline a full design
         # (~85 s) plus the simplified one could reach ~170 s and the Studio showed "chat failed".
         r = cad_fallback.design(msg, ctx, provider, reply_language, deadline=time.time() + budget)
-        return {**base, "answer": r["answer"], "cad": r.get("cad"), "provider": r.get("read_by"),
+        cad = r.get("cad")
+        # fidelity means "there is geometry at this rung". A question about sizes has no geometry, so it carries no
+        # fidelity at all, and the sizes are asked in engineer sentences (never a raw field name).
+        fidelity = r.get("fidelity") if (cad and isinstance(cad, dict) and cad.get("code")) else None
+        return {**base, "answer": r["answer"], "cad": cad, "provider": r.get("read_by"),
                 "language": "en" if llm.want_english(reply_language) else None,
-                "cad_attempts": r.get("attempts") or [], "fidelity": r.get("fidelity"),
+                "missing": r.get("missing") or [], "fidelity": fidelity,
+                "cad_attempts": r.get("attempts") or [],
                 "validated": bool(r.get("validated")), "target_check": r.get("target_check"),
                 "shape_family": _shape_family_reply(ctx),          # UI v65: accepted, or why it was dropped
                 "not_checked": r.get("not_checked") or []}
@@ -1137,6 +1142,25 @@ class Handler(BaseHTTPRequestHandler):
                 from physics.simple_part import looks_like_part_request
                 import cad_codegen
                 msg = str(params.get("message") or "")[:llm.MAX_MSG]
+                # A new sentence about a different product must not inherit the open design (a table, then a plane).
+                # Only a sentence that NAMES a product can reset; "make it lighter" and "80 mm" are about the design
+                # that is open. The reason travels back as `context_reset` so the Studio can say "New design started".
+                import cad_router as _CR
+                ctx_reset = _CR.topic_reset(msg, ctx)
+                if ctx_reset:
+                    # The old project is kept in `context_reset.previous`, so nothing is thrown away silently; only the
+                    # design blocks are dropped. A gearbox or engineering context runs on its own track and is never
+                    # deleted by a new topic (review of PR #31, item 5).
+                    keep = ("engineering", "advice", "pending_question", "given", "references")
+                    ctx = {k: ctx[k] for k in keep if isinstance(ctx, dict) and k in ctx}
+
+                def _send(code, out):
+                    try:
+                        if code == 200 and isinstance(out, dict) and ctx_reset:
+                            out = {**out, "context_reset": ctx_reset}
+                    except Exception:
+                        pass
+                    self._send_json(code, out)
                 # the bench answers what can be computed; the language layer may only quote those numbers
                 eng, eng_verify = None, None
                 try:
@@ -1163,7 +1187,7 @@ class Handler(BaseHTTPRequestHandler):
                 # part-by-part job never begins on its own.
                 if (isinstance(ctx, dict) and isinstance(ctx.get("assembly_plan"), dict)
                         and _assembly_confirming(msg, ctx.get("assembly_plan"))):
-                    self._send_json(200, self._chat_assembly(msg, ctx, params.get("provider"), rl))
+                    _send(200, self._chat_assembly(msg, ctx, params.get("provider"), rl))
                     return
                 hit = None
                 # v0.40: a brief that is ready and an explicit "start" wins over the router: the design path gets the
@@ -1193,12 +1217,15 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         traceback.print_exc()
                         routed = None
+                # the reader is off or gave nothing usable: a whole product still never becomes one solid
+                if not routed and not (gear_ctx or cad_ctx or eng_ctx):
+                    routed = _CR.product_route(msg, None) or routed
                 # Bagian 1.1 (v0.40): the router said the sentence is not enough to start. The brief is written by
                 # the engineer's next answers; no code, no planner, no job is started here.
                 if routed and routed.get("route") == "brief":
                     br = self._chat_brief(msg, ctx, routed, params.get("provider"), rl)
                     if not br.get("continue"):
-                        self._send_json(200, br["out"])
+                        _send(200, br["out"])
                         return
                     ctx = dict(ctx or {})
                     ctx["brief"] = br["brief"]
@@ -1213,7 +1240,7 @@ class Handler(BaseHTTPRequestHandler):
                 if routed and routed.get("route") == "assembly":
                     out = self._chat_assembly(msg, ctx, params.get("provider"), rl)
                     out["route"] = routed
-                    self._send_json(200, out)
+                    _send(200, out)
                     return
                 # v0.36.2: a formula question is still looked up while a design is open; only a request that
                 # changes or repairs that design (cad_error, or an answer to a missing size) is skipped. A design
@@ -1280,7 +1307,7 @@ class Handler(BaseHTTPRequestHandler):
                                           "suggest": r.get("suggest"), "fallback": "custom_cad"}
                         if out.get("cad"):
                             out["cad"]["kind"] = "functional"
-                        self._send_json(200, out)
+                        _send(200, out)
                         return
                     cad = r.get("cad")
                     if not r.get("ok") and r.get("missing"):
@@ -1288,7 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
                                "material": "steel", "params": [], "code": None, "expect": [], "variants": [],
                                "missing": r["missing"], "holes": [], "read_by": "IDRIS library (standard table)",
                                "library": {"id": tid, "query": q}}
-                    self._send_json(200, {"success": True, "intent": "discuss", "answer": plib.chat_answer(tid, r),
+                    _send(200, {"success": True, "intent": "discuss", "answer": plib.chat_answer(tid, r),
                                           "actions": [], "params": {}, "rejected": [], "select": None, "compare": None,
                                           "cad": cad, "library": {"id": tid, "query": q, "ok": r.get("ok"),
                                                                   "errors": r.get("errors", []),
@@ -1302,7 +1329,7 @@ class Handler(BaseHTTPRequestHandler):
                         ask = _ask_concept_count(routed)
                         if ctx and isinstance(ctx.get("brief"), dict):
                             ask["brief"] = ctx["brief"]
-                        self._send_json(200, ask)
+                        _send(200, ask)
                         return
                     if decision == "job":
                         import design_job as _dj
@@ -1329,11 +1356,11 @@ class Handler(BaseHTTPRequestHandler):
                         out["route"] = routed
                     if ctx and isinstance(ctx.get("brief"), dict):
                         out["brief"] = ctx["brief"]
-                    self._send_json(200, out)
+                    _send(200, out)
                     return
                 if not gear_ctx and not eng_ctx and is_prim:
                     part = self._design_part(str(params.get("message"))[:600], params.get("provider"))
-                    self._send_json(200, {"success": True, "intent": "discuss", "answer": part["answer"], "actions": [],
+                    _send(200, {"success": True, "intent": "discuss", "answer": part["answer"], "actions": [],
                                           "params": {}, "rejected": [], "select": None, "compare": None,
                                           "part": part, "provider": part["read_by"]})
                     return
@@ -1358,7 +1385,7 @@ class Handler(BaseHTTPRequestHandler):
                 # CAD designer, so a greeting or a plain question with no gearbox loaded came back as "IDRIS could
                 # not get valid CAD code" instead of an answer. Only a positive signal may start a design now; when
                 # the AI returns nothing usable, the sanitized reply is the honest answer.
-                self._send_json(200, {"success": True, **res})
+                _send(200, {"success": True, **res})
             except llm.LLMError as e:
                 self._send_json(e.status, {"success": False, "error": str(e), "attempts": e.attempts, "fallback": True})
             except Exception as e:

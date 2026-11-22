@@ -241,6 +241,46 @@ def ask_sizes(reason: str) -> str:
             "No geometry is shown because no usable size was given; IDRIS will not invent one.")
 
 
+# A size the writer asked for, in the engineer's words. Used when the model gave a field name and no sentence, so a
+# reply never shows `body_dimension` or `table_source` to an engineer. Max three questions are ever shown.
+_QUESTION = {
+    "length": "How long is the part, along its longest side? (mm)",
+    "width": "How wide is it? (mm)",
+    "height": "How tall is it? (mm)",
+    "depth": "How deep is it? (mm)",
+    "diameter": "What diameter does it need? (mm)",
+    "thickness": "How thick is the material or wall? (mm)",
+    "wall": "How thick is the wall? (mm)",
+    "hole": "What hole diameter do the fasteners need? (mm)",
+    "holes": "What hole diameter do the fasteners need, and how many? (mm)",
+    "load": "What load must it carry? (N or kg)",
+    "force": "What force acts on it, and in which direction? (N)",
+    "body_dimension": "What are the main outside dimensions — length, width and height? (mm)",
+    "percentile": "Which body size should it fit: which percentile of users?",
+    "table_source": "Which standard table should the sizes come from (for example a chair or bicycle standard)?",
+    "material": "Which material should it be made from?",
+    "process": "Which process should make it (laser cut sheet, welded tube, 3D print…)?",
+    "rider_height": "How tall is the rider? (cm)",
+    "wheel": "What wheel size should it use? (inch or mm)",
+}
+
+
+def question_for(m: dict) -> str:
+    """One engineer sentence for a missing size: the writer's own question, else a written one for that key."""
+    q = str((m or {}).get("question") or "").strip()
+    k = str((m or {}).get("k") or "").strip()
+    if q and q.lower() not in (k.lower(), "") and not re.fullmatch(r"[a-z0-9_]+", q):
+        return q
+    low = k.lower()
+    if low in _QUESTION:
+        return _QUESTION[low]
+    for key, text in _QUESTION.items():
+        if key in low or low in key:
+            return text
+    label = low.replace("_", " ").strip()
+    return f"What value should I use for the {label}? (give it with its unit)" if label else "What size should I use? (give it with its unit)"
+
+
 def design(message: str, context: dict | None = None, provider: str | None = None,
            reply_language: str | None = None, generate_fn=None, deadline: float | None = None) -> dict:
     """The ladder. -> {ok, cad, answer, fidelity, validated, target_check, not_checked, read_by, attempts}.
@@ -257,9 +297,12 @@ def design(message: str, context: dict | None = None, provider: str | None = Non
         full = {"ok": False, "cad": None, "answer": str(e), "attempts": [], "read_by": None}
     except Exception as e:                         # a fault is not a reason to return nothing
         full = {"ok": False, "cad": None, "answer": f"{type(e).__name__}: {e}", "attempts": [], "read_by": None}
-    if full.get("ok") and full.get("cad"):
+    # A `cad` without code (or with missing sizes) carries NO geometry: it must not be finished as a design, and the
+    # answer must not carry a fidelity at all. The questions are the ones the writer asked, in engineer words.
+    if full.get("ok") and full.get("cad") and (full["cad"].get("code") or not full["cad"].get("missing")):
         return _finish(full, "full", tc)
     reason = _reason(full)
+    simple = None
 
     left = None if deadline is None else deadline - time.time()
     if deadline is None or left > 20:
@@ -269,10 +312,18 @@ def design(message: str, context: dict | None = None, provider: str | None = Non
             simple = {"ok": False, "cad": None, "answer": "", "attempts": []}
         except Exception:
             simple = {"ok": False, "cad": None, "answer": "", "attempts": []}
-        if simple.get("ok") and simple.get("cad"):
+        if (simple or {}).get("ok") and simple.get("cad") and (simple["cad"].get("code") or not simple["cad"].get("missing")):
             out = _finish(simple, "simplified", tc)
             out["answer"] = _headline("simplified", reason) + "\n" + (out.get("answer") or "")
             return out
+
+    # The questions to carry back are the full attempt's own missing sizes; when that attempt failed without naming
+    # any (no code, a cut-off answer), the simplified attempt's questions are the ones the engineer can answer. This
+    # is computed AFTER the simplified attempt: before it, `simple` does not exist and its questions were never used.
+    asked = full
+    if not (isinstance((full or {}).get("cad"), dict) and full["cad"].get("missing")) and (simple or {}).get("cad"):
+        asked = simple
+    missing = [m for m in (((asked or {}).get("cad") or {}).get("missing") or []) if isinstance(m, dict)][:3]
 
     cad = placeholder_cad(message)
     if cad is not None:
@@ -283,9 +334,12 @@ def design(message: str, context: dict | None = None, provider: str | None = Non
         out["answer"] = _headline("placeholder", reason) + "\n" + _placeholder_answer(cad)
         return out
 
-    return {"ok": False, "cad": None, "answer": ask_sizes(reason), "read_by": None,
-            "attempts": (full or {}).get("attempts") or [], "fidelity": None, "validated": False,
-            "target_check": tc, "detail": reason, "not_checked": [], "missing_sizes": True}
+    out = {"ok": False, "cad": None, "answer": ask_sizes(reason), "read_by": None,
+           "attempts": (full or {}).get("attempts") or [], "fidelity": None, "validated": False,
+           "target_check": tc, "detail": reason, "not_checked": [], "missing_sizes": True}
+    if missing:
+        out["missing"] = [{"k": str(m.get("k") or ""), "question": question_for(m)} for m in missing]
+    return out
 
 
 def _finish(result: dict, fidelity: str, tc: dict | None) -> dict:
