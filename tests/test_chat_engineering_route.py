@@ -7,6 +7,8 @@ reader was asked for JSON while the right answer was prose.
 """
 import pathlib
 
+import pytest
+
 import llm
 
 
@@ -27,6 +29,11 @@ def test_engineering_evidence_goes_to_the_discussion_path(monkeypatch):
 
 
 def test_a_message_without_evidence_still_uses_the_requirements_reader(monkeypatch):
+    """The first message of a gearbox design has no requirements yet, and it must still be read as one.
+
+    Found live: "15 kW gearbox ratio 8" (the message that starts the gearbox flow) was answered by the
+    general reader, so no power or ratio was ever read and the MVP gearbox flow broke.
+    """
     seen = {}
 
     def fake_call(provider, system, user, max_tokens=500, timeout=None):
@@ -36,6 +43,56 @@ def test_a_message_without_evidence_still_uses_the_requirements_reader(monkeypat
     monkeypatch.setattr(llm, "call_provider", fake_call)
     llm.interpret("claude", "15 kW gearbox ratio 8")
     assert seen["system"] == llm.SYSTEM
+
+
+@pytest.mark.parametrize("sentence", [
+    "15 kW gearbox ratio 8",
+    "gearbox 5 kW 1500 rpm",
+    "design a speed reducer, 4 kW at 1450 rpm",
+    "desain roda gigi reduksi 2 tingkat",
+])
+def test_a_sentence_that_names_a_gearbox_gets_the_gearbox_reader(monkeypatch, sentence):
+    seen = {}
+
+    def fake_call(provider, system, user, max_tokens=500, timeout=None):
+        seen["system"] = system
+        return '{"intent": "set_params", "params": {}, "answer": "ok"}', "stub-model"
+
+    monkeypatch.setattr(llm, "call_provider", fake_call)
+    llm.interpret("claude", sentence)
+    assert seen["system"] == llm.SYSTEM, sentence
+
+
+@pytest.mark.parametrize("sentence", [
+    "design snow plow for pickup",
+    "buatkan kursi lipat dari kayu",
+    "add: replaceable cutting edge",
+])
+def test_a_message_about_another_object_keeps_the_general_reader(monkeypatch, sentence):
+    """No gearbox is named, so power / RPM / ratio is never asked of a snow plow, a chair or a cutting edge."""
+    seen = {}
+
+    def fake_call(provider, system, user, max_tokens=500, timeout=None):
+        seen["system"] = system
+        return '{"intent": "other", "answer": "ok", "actions": []}', "stub-model"
+
+    monkeypatch.setattr(llm, "call_provider", fake_call)
+    llm.interpret("claude", sentence, context={"brief": {"object": "snow plow", "kind": "assembly"}})
+    assert seen["system"] == llm.GENERAL_SYSTEM, sentence
+    assert seen["system"] != llm.SYSTEM, sentence
+
+
+def test_an_open_gearbox_still_uses_the_requirements_reader(monkeypatch):
+    seen = {}
+
+    def fake_call(provider, system, user, max_tokens=500, timeout=None):
+        seen["system"] = system
+        return '{"intent": "set_params", "params": {"gear_ratio": 8}, "answer": "ok"}', "stub-model"
+
+    monkeypatch.setattr(llm, "call_provider", fake_call)
+    res = llm.interpret("claude", "ratio 8", current={"power_kw": 15.0})
+    assert seen["system"] == llm.SYSTEM
+    assert res["params"]["gear_ratio"] == 8
 
 
 def test_the_bench_route_wins_over_the_library_and_cad_paths():

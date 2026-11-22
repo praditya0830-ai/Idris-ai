@@ -791,6 +791,9 @@ class Handler(BaseHTTPRequestHandler):
             # the reader filled some fields but asked nothing while the brief is still open: the fixed questions
             return _brief_fallback(b, miss, kind, lang, berr)
         b = {**b, "asked": True}
+        if w.get("suggestions"):
+            # the chips are kept in the brief, so a click can be matched by id on the next turn
+            b["suggested"] = [{"id": s["id"], "text": s["text"]} for s in w["suggestions"]][:3]
         return {"continue": False, "brief": b, "out": B.brief_answer(b, w, kind, lang)}
 
     def _chat_assembly(self, msg: str, ctx, provider=None, reply_language=None) -> dict:
@@ -1182,6 +1185,32 @@ class Handler(BaseHTTPRequestHandler):
                 rl = params.get("reply_language")
                 has_gearbox = bool(params.get("current") or params.get("variants"))
                 from physics import parts_library as plib
+                # v0.40.3 (doc 2, "the brief forgets the topic"): while a brief is open and its design has not
+                # started, THIS message is a brief answer first. It is merged into the brief and the brief writes the
+                # next question; the router is never asked, so a free answer ("pick up truck, electric actuator,
+                # straight blade") cannot be read as a gearbox requirement. Two exceptions keep it a conversation: a
+                # Studio chip fills a feature (or records a decline) with no AI, and a general engineering question is
+                # answered as chat with the brief sent back untouched.
+                import brief as _BRIEF
+                open_brief = _BRIEF.is_open(ctx)
+                bt = (_BRIEF.turn(open_brief, msg, ctx)
+                      if open_brief and not (gear_ctx or cad_ctx or eng_ctx) else {"action": "none"})
+                brief_turn = False
+                if bt["action"] == "chip":
+                    ctx = {**(ctx or {}), "brief": _BRIEF.merge(open_brief, bt["merge"], msg)}
+                    brief_turn = True                 # the brief asks its next question in the block below
+                elif bt["action"] == "chat":
+                    # answered as an engineer; the brief is not touched and travels back whole, so the next message
+                    # still continues it instead of starting from scratch
+                    res = llm.discuss(params.get("provider"), msg, params.get("current"), params.get("variants"),
+                                      params.get("selected"), {**(ctx or {}), "brief": open_brief}, rl)
+                    res.update({"brief": open_brief, "brief_turn": True,
+                                "route": {"route": "brief", "of": None,
+                                          "reason": "a question while the brief is open, the brief is kept"}})
+                    _send(200, res)
+                    return
+                elif bt["action"] == "answer":
+                    brief_turn = True
                 # Bagian E: a plan is already in the context, and this message answers it. Nothing starts here:
                 # without context.assembly_confirm the reply is the plan and the question "Start?", so a costly
                 # part-by-part job never begins on its own.
@@ -1192,7 +1221,6 @@ class Handler(BaseHTTPRequestHandler):
                 hit = None
                 # v0.40: a brief that is ready and an explicit "start" wins over the router: the design path gets the
                 # decided brief, not a fresh reading of the sentence "3" or "ya".
-                import brief as _BRIEF
                 resumed = None
                 if not (gear_ctx or cad_ctx or eng_ctx):
                     try:
@@ -1210,6 +1238,11 @@ class Handler(BaseHTTPRequestHandler):
                     routed = {"route": "assembly" if resumed["kind"] == "assembly" else "free_design",
                               "kind": resumed["kind"], "library_id": None, "query": {}, "concepts": [],
                               "reason": "design brief", "read_by": "design brief"}
+                elif brief_turn:
+                    # an open brief, and this message answers it: no route is read, no keyword rule decides
+                    routed = {"route": "brief", "kind": (open_brief or {}).get("kind") or "part", "brief": {},
+                              "library_id": None, "query": {}, "concepts": [],
+                              "reason": "an open brief: this message answers it", "read_by": "design brief (open)"}
                 elif not (gear_ctx or cad_ctx or eng_ctx):
                     try:
                         import cad_router
@@ -1225,7 +1258,7 @@ class Handler(BaseHTTPRequestHandler):
                 if routed and routed.get("route") == "brief":
                     br = self._chat_brief(msg, ctx, routed, params.get("provider"), rl)
                     if not br.get("continue"):
-                        _send(200, br["out"])
+                        _send(200, {**br["out"], "brief_turn": True} if brief_turn else br["out"])
                         return
                     ctx = dict(ctx or {})
                     ctx["brief"] = br["brief"]
