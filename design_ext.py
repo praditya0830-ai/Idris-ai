@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 import cad_fallback
 
-POST_ROUTES: tuple = ()
+POST_ROUTES: tuple = ("/references/design",)
 
 
 def handle_get(path: str):
@@ -29,4 +29,21 @@ def handle_get(path: str):
 
 
 def handle_post(base: str, params: dict):
-    return None
+    """POST /references/design {brief, project_id} -> 3-6 reference cards for stage 2 (v0.41, doc A8).
+
+    No AI call: the cards are cut from the search snippets, so the step spends nothing from ai_budget. A missing
+    provider, a 402 or an empty answer comes back as one honest line with `ok: false`, never as a silent success.
+    """
+    if str(base or "").split("?")[0].rstrip("/") != "/references/design":
+        return None
+    from research import design_refs
+    brief_in = params.get("brief") if isinstance(params.get("brief"), dict) else {}
+    if not brief_in and isinstance(params.get("message"), str):
+        brief_in = {"object": params["message"][:120]}
+    try:
+        r = design_refs.run(brief_in, params.get("project_id"))
+    except Exception as e:                      # a search outage must never break the design path
+        return 200, {"success": False, "ok": False, "cards": [], "queries": [], "patterns": [],
+                     "proposal": "", "steps": [], "mode": "none",
+                     "error": f"reference search failed: {type(e).__name__}: {e}"[:200]}
+    return 200, {"success": True, **r}

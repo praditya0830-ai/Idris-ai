@@ -237,8 +237,10 @@ def _clean_questions(raw, lang: str) -> list:
             if label:
                 opts.append({"label": label, "note": note})
         if text and len(opts) >= 2:
+            # A4b: every question carries the stage it belongs to, so the Studio shows it with the stage and the
+            # colleague layer never asks a stage-5 question during the brief
             out.append({"id": str(q.get("id") or f"q{len(out) + 1}")[:24], "text": text, "options": opts,
-                        "allow_free_text": True})
+                        "allow_free_text": True, "stage": 1})
     return out
 
 
@@ -452,7 +454,7 @@ def fallback_questions(b: dict, miss: list = None, lang: str = "en") -> dict:
     for k in list(miss if miss is not None else missing(b))[:3]:
         text, opts = table.get(k, table["purpose"])
         out.append({"id": f"fallback_{k}", "text": text, "options": [{"label": a, "note": n} for a, n in opts],
-                    "allow_free_text": True, "fallback": True})
+                    "allow_free_text": True, "fallback": True, "stage": 1})
     return {"understanding": "", "brief": {}, "questions": out, "suggestions": [],
             "read_by": "fallback questions (no AI)"}
 
