@@ -149,3 +149,15 @@ def test_the_endpoint_answers_with_the_whole_stage():
     assert code == 200 and body["success"] is True
     assert body["ok"] is True and body["welds"] and body["bom"]
     assert body["notes"] and "conservative bound" in body["notes"][0]
+
+
+def test_the_endpoint_does_not_move_a_part_unless_the_engineer_says_fix():
+    """The HTTP default is the honest one: a proposal comes back, the part stays where the engineer put it."""
+    through = {**TUBE, "shape": {**TUBE["shape"], "at": [-600, 0, 6]}}
+    code, body = design_ext.handle_post("/join/plan", {"parts": [BLADE, PLATE, through]})
+    assert code == 200 and body["success"] is True
+    assert body["ok"] is False and body["fixes"] == []
+    assert body["proposed_fixes"] and all(p["part"] == "push tube" for p in body["proposed_fixes"])
+    assert all(p["accepted"] is False for p in body["proposed_fixes"])
+    code, body = design_ext.handle_post("/join/plan", {"parts": [BLADE, PLATE, through], "fix": True})
+    assert body["ok"] is True and body["fixes"]
