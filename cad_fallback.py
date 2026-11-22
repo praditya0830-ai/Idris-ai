@@ -302,10 +302,7 @@ def design(message: str, context: dict | None = None, provider: str | None = Non
     if full.get("ok") and full.get("cad") and (full["cad"].get("code") or not full["cad"].get("missing")):
         return _finish(full, "full", tc)
     reason = _reason(full)
-    asked = full
-    if not (isinstance((full or {}).get("cad"), dict) and full["cad"].get("missing")) and locals().get("simple"):
-        asked = simple
-    missing = [m for m in (((asked or {}).get("cad") or {}).get("missing") or []) if isinstance(m, dict)][:3]
+    simple = None
 
     left = None if deadline is None else deadline - time.time()
     if deadline is None or left > 20:
@@ -315,10 +312,18 @@ def design(message: str, context: dict | None = None, provider: str | None = Non
             simple = {"ok": False, "cad": None, "answer": "", "attempts": []}
         except Exception:
             simple = {"ok": False, "cad": None, "answer": "", "attempts": []}
-        if simple.get("ok") and simple.get("cad") and (simple["cad"].get("code") or not simple["cad"].get("missing")):
+        if (simple or {}).get("ok") and simple.get("cad") and (simple["cad"].get("code") or not simple["cad"].get("missing")):
             out = _finish(simple, "simplified", tc)
             out["answer"] = _headline("simplified", reason) + "\n" + (out.get("answer") or "")
             return out
+
+    # The questions to carry back are the full attempt's own missing sizes; when that attempt failed without naming
+    # any (no code, a cut-off answer), the simplified attempt's questions are the ones the engineer can answer. This
+    # is computed AFTER the simplified attempt: before it, `simple` does not exist and its questions were never used.
+    asked = full
+    if not (isinstance((full or {}).get("cad"), dict) and full["cad"].get("missing")) and (simple or {}).get("cad"):
+        asked = simple
+    missing = [m for m in (((asked or {}).get("cad") or {}).get("missing") or []) if isinstance(m, dict)][:3]
 
     cad = placeholder_cad(message)
     if cad is not None:

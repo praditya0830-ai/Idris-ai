@@ -1134,7 +1134,11 @@ class Handler(BaseHTTPRequestHandler):
                 import cad_router as _CR
                 ctx_reset = _CR.topic_reset(msg, ctx)
                 if ctx_reset:
-                    ctx = {}
+                    # The old project is kept in `context_reset.previous`, so nothing is thrown away silently; only the
+                    # design blocks are dropped. A gearbox or engineering context runs on its own track and is never
+                    # deleted by a new topic (review of PR #31, item 5).
+                    keep = ("engineering", "advice", "pending_question", "given", "references")
+                    ctx = {k: ctx[k] for k in keep if isinstance(ctx, dict) and k in ctx}
 
                 def _send(code, out):
                     try:

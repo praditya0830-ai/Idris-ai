@@ -91,10 +91,80 @@ def test_a_size_answer_is_not_a_new_topic():
     assert cad_router.topic_reset("everything", ctx) is None
 
 
-def test_a_product_after_a_part_starts_clean_with_a_reason():
+def test_a_product_after_a_part_keeps_the_open_part():
+    # Review of PR #31, item 5: a context that cannot be read as a product is never dropped. The part stays open and
+    # the sentence is answered on top of it.
     ctx = {"current_cad": {"request": "bracket untuk bearing 6205"}}
-    r = cad_router.topic_reset("design a plane concept", ctx)
-    assert r and r["from"] == "bracket untuk bearing 6205" and r["to"] == "airplane"
+    assert cad_router.topic_reset("design a plane concept", ctx) is None
+
+
+# ---------------------------------------------------------------- review of PR #31: the product reader is narrow
+def test_a_gearbox_is_not_dropped_by_a_sentence_about_a_motor_part():
+    ctx = {"current_cad": {"request": "gearbox housing 200 mm"}}
+    assert cad_router.topic_reset("tambah dudukan motor listrik", ctx) is None
+
+
+def test_a_reset_keeps_the_old_project_instead_of_discarding_it():
+    ctx = {"pending_cad": {"request": "sepeda untuk pengendara 170 cm", "missing": [{"k": "wheel"}]}}
+    r = cad_router.topic_reset("buat meja", ctx)
+    assert r and r["to"] == "table"
+    assert r["previous"]["from"] == "pending_cad"
+    assert r["previous"]["request"] == "sepeda untuk pengendara 170 cm"
+    assert r["previous"]["missing"] == ["wheel"]
+
+
+@pytest.mark.parametrize("sentence", [
+    "gearbox untuk motor listrik 5 kW",
+    "pasang dudukan motor",
+    "motor mount plate 100 mm",
+    "motor listrik 3 kW untuk pompa",
+    "ambil ukuran dari ISO table",
+    "ISO table",
+    "standard table for M8 bolts",
+    "tabel ISO untuk baut",
+    "from the table",
+    "table source",
+    "sketch on the top plane",
+    "xy plane sketch",
+    "sketch on front plane",
+    "top plane",
+    "cart wheel bracket",
+    "drone arm 200 mm",
+    "chair leg",
+    "bicycle frame 540 mm",
+    "drone mount plate 100 mm",
+])
+def test_a_part_a_table_or_a_plane_is_never_a_product(sentence):
+    assert cad_router.product_of(sentence) is None, sentence
+
+
+@pytest.mark.parametrize("sentence,product", [
+    ("design sepeda gunung", "bicycle"),
+    ("buat pesawat", "airplane"),
+    ("design a drone", "drone"),
+    ("sepeda motor 150 cc", "motorcycle"),
+    ("motor bebek 110 cc", "motorcycle"),
+    ("design a plane concept", "airplane"),
+    ("design a table 1200 mm", "table"),
+    ("buat meja kerja 1200 mm", "table"),
+    ("robot arm 600 mm", "robot"),
+])
+def test_the_product_the_sentence_really_asks_for(sentence, product):
+    assert cad_router.product_of(sentence) == product
+
+
+def test_a_missing_size_from_the_simplified_attempt_is_asked(monkeypatch):
+    """Review of PR #31, item 6: the questions were computed before `simple` existed, so they never travelled."""
+    def fake_generate(message, context, provider, reply_language):
+        if "Simplest valid version" in message:
+            return {"ok": True, "cad": {"title": "Bicycle", "code": None, "params": [],
+                                        "missing": [{"k": "wheel"}]}, "answer": "Sizes?", "read_by": "fake"}
+        return {"ok": False, "cad": None, "answer": "the answer was cut off", "attempts": []}
+    monkeypatch.setattr(cad_fallback, "placeholder_cad", lambda msg: None)
+    out = cad_fallback.design("buatkan design konsep sepeda", {}, None, None, generate_fn=fake_generate)
+    assert out["cad"] is None and out["fidelity"] is None
+    assert [m["k"] for m in out["missing"]] == ["wheel"]
+    assert "wheel" in out["missing"][0]["question"].lower()
 
 
 # --------------------------------------------------------------------------------------------- no geometry, no fidelity
