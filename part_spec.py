@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import re
 
+import sheet_features
 from physics import catalog
 
 WORDS_N = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "eight": 8, "ten": 10}
@@ -62,10 +63,14 @@ TEMPLATE_WORDS = (
 
 
 def template_hint(text: str) -> str:
-    """Which template the words name; 'plate' when they name none (the ladder's safest shape)."""
-    t = " " + str(text or "").lower() + " "
+    """Which template the words name; 'plate' when they name none (the ladder's safest shape).
+
+    Words are matched whole: 'bos' (bushing) must not fire on 'emboss', and 'siku' must not fire on a longer word,
+    or a sheet-metal part is read as a turned one and the wrong template is chosen.
+    """
+    t = " " + re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip() + " "
     for name, words in TEMPLATE_WORDS:
-        if any(w in t for w in words):
+        if any(" " + re.sub(r"[^a-z0-9]+", " ", w).strip() + " " in t for w in words):
             return name
     return "plate"
 
@@ -171,10 +176,15 @@ def from_message(message: str, context: dict | None = None) -> dict:
         take("step_length_mm", mstep.group(2))
         rest = rest[:mstep.start()] + " " * (mstep.end() - mstep.start()) + rest[mstep.end():]
 
+    # a forming tool's D x depth is the punch, not the part: it is masked so the pair rule cannot read it as a size,
+    # but neither number becomes the part's diameter or length
+    forming = any(w in text for w in ("emboss", "lance", "louvre", "louver", "forming tool", "timbul"))
     # Ø first: `Ø120 x 10` must not be read as a plain `120 x 10` by the pair rule below
     dia_pairs = list(_DIA2.finditer(rest))
     for i, m in enumerate(dia_pairs):
-        if i == 0:
+        if forming:
+            pass
+        elif i == 0:
             take("diameter_mm", m.group(1))
             if hint == "flange":
                 take("thickness_mm", m.group(2))
@@ -259,17 +269,26 @@ def from_message(message: str, context: dict | None = None) -> dict:
     if fillet is not None and fillet > 0:
         numbers.append({"k": "fillet_mm", "value": fillet, "unit": "mm", "source": "you"})
 
+    # folds and punches: read here as well, because a hem or a jog is a size the engineer typed and a formula on it
+    sheet = sheet_features.parse(raw, dims) if dims else {}
+    for row in sheet.get("numbers") or []:
+        if not any(n.get("k") == row.get("k") for n in numbers):
+            numbers.append(row)
+
     if not dims:
         return {}
     tpl = hint
     if not template_ready(tpl, dims) and template_ready("plate", dims) and tpl not in ("plate", "plate_pocket"):
         tpl = "plate"
-    name = {"plate": "Plate", "plate_pocket": "Plate with pocket", "bracket_l": "L bracket",
+    name = ("Sheet metal part" if sheet.get("features") and tpl == "plate" else
+            {"plate": "Plate", "plate_pocket": "Plate with pocket", "bracket_l": "L bracket",
             "channel": "Channel bracket", "gusset": "Gusset", "flange": "Flange", "shaft_step": "Stepped shaft",
-            "tube": "Tube", "housing": "Housing"}.get(tpl, "Part")
+             "tube": "Tube", "housing": "Housing"}.get(tpl, "Part"))
     return {"id": _slug(name + " " + raw[:24]), "name": name, "template": tpl,
             "shape_class": _shape_class(tpl, text), "numbers": numbers, "holes": holes,
-            "fillet_mm": fillet, "dims": dims, "read_by": "part_spec (deterministic parser)"}
+            "fillet_mm": fillet, "dims": dims, "read_by": "part_spec (deterministic parser)",
+            "sheet_features": sheet if (sheet.get("features") or sheet.get("questions")) else None,
+            "questions": sheet.get("questions") or []}
 
 
 def from_plan(part: dict, plan: dict | None = None) -> dict:

@@ -126,6 +126,22 @@ try:
           and [x["type"] for x in (r.get("cad") or {}).get("feature_tree") or []] == ["sketch", "revolve"])
 
     SEEN.clear()
+    # S19: the sheet-metal folds that used to be refused are steps now, and they come out of the same chat door with
+    # no part_spec injected. The base flange carries t and R, so the hem and the jog never guess them.
+    s, r = chat({"message": "sheet metal tray 200x120x2 mm with a 12 mm hem on the +X edge, "
+                            "a jog rise 15 mm at 100 mm, and an emboss \u00d816 x 3 mm deep"})
+    tree = ((r.get("cad") or {}).get("feature_tree")) or []
+    check("sheet: rung features", s == 200 and r.get("rung") == "features")
+    check("sheet: base flange, hem, jog, emboss as editable steps",
+          [x["type"] for x in tree] == ["smbase", "hem", "jog", "form"])
+    base = next((x.get("p") for x in tree if x.get("type") == "smbase"), {})
+    check("sheet: the base flange carries t and R for the folds", base.get("t") == 2 and base.get("R") == 2)
+    check("sheet: the hem and the jog keep the sizes the engineer typed",
+          any(x.get("type") == "hem" and x["p"].get("F") == 12 for x in tree)
+          and any(x.get("type") == "jog" and x["p"].get("h") == 15 for x in tree))
+    check("sheet: the provider was never asked for code", answers() == [])
+
+    SEEN.clear()
     # A free-form request also has to reach the ladder (the Studio's own door, current_cad), so this checks the
     # ladder, not routing. "snow plow moldboard" is answered by the parts library before this point - a parametric
     # welded part, which is a better answer than code - so the double-curved case here is a fairing.

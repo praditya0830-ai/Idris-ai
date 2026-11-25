@@ -25,12 +25,21 @@ from __future__ import annotations
 
 import math
 
-STEP_ORDER = {"sketch": 0, "push": 1, "revolve": 1, "hole": 2, "edge": 3, "repeat": 3, "wall": 3}
+import sheet_features
+
+# The stage a step belongs to. Sheet-metal steps join the same order: the base flange is the additive step, the folds
+# and the punch are dress-up, and the analysis steps (motion, sizes, curvature) run last and change no geometry.
+STEP_ORDER = {"sketch": 0, "push": 1, "revolve": 1, "smbase": 1, "surfbound": 1,
+              "hole": 2, "edge": 3, "repeat": 3, "wall": 3,
+              "smedge": 3, "smmiter": 3, "hem": 3, "jog": 3, "form": 3, "weldtrim": 3,
+              "motion": 4, "sizes": 4, "curv": 4}
 ALLOWED = tuple(STEP_ORDER)
 
 # feature names the Studio's buildPart understands for these steps; kept in one place so the two sides can be compared
 STUDIO_TYPES = {"sketch": "sketch", "push": "push", "revolve": "revolve", "hole": "hole", "edge": "edge",
-                "repeat": "repeat", "wall": "wall"}
+                "repeat": "repeat", "wall": "wall", "smbase": "smbase", "smedge": "smedge",
+                "smmiter": "smmiter", "hem": "hem", "jog": "jog", "form": "form", "weldtrim": "weldtrim",
+                "motion": "motion", "sizes": "sizes", "curv": "curv", "surfbound": "surfbound"}
 
 # values that describe the recipe rather than the part (an angle, a side count); any other number must be one the
 # engineer gave, or the recipe is refused with the number named
@@ -193,8 +202,39 @@ def pocket_steps(n: dict, holes: list, fillet=None) -> list:
     return steps
 
 
+def sheet_steps(n: dict, feats: list, material: str = "steel", R: float | None = None) -> list:
+    """A sheet part: the base flange, then the folds and punches the engineer asked for, in tab order.
+
+    Thickness and radius live on the base flange (the Studio's sheet-metal steps read them from there), so a hem or a
+    jog never has to guess them and every later step stands on the same plate.
+    """
+    L, W, T = n.get("length_mm"), n.get("width_mm"), n.get("thickness_mm")
+    if not (L and W and T and L > 0 and W > 0 and T > 0):
+        return []
+    steps = [_step("base", "smbase", L=float(L), W=float(W), t=float(T),
+                   R=float(R if R is not None else T), material=material, k=0)]
+    for i, ft in enumerate(feats or [], 1):
+        if not isinstance(ft, dict) or not ft.get("type"):
+            return []
+        # built directly: a forming tool's own `kind` field would collide with _step's positional argument
+        steps.append({"id": str(ft.get("id") or f"{ft['type']}{i}"), "type": str(ft["type"]),
+                      "p": {k: v for k, v in (ft.get("p") or {}).items() if v is not None}})
+    if len(steps) < 2:
+        return []
+    return steps
+
+
+def boundary_steps(n: dict, sketch_pts: list | None = None) -> list:
+    """A boundary surface: one closed sketch of exactly four curves, then the surface through all four."""
+    pts = sketch_pts if sketch_pts and len(sketch_pts) == 4 else None
+    if not pts:
+        return []
+    return [_step("edges", "sketch", prof="ents", ents=_ents(pts), plane="XZ", at="value", off=0, u=0, v=0),
+            _step("patch", "surfbound", sketch="edges", t=0, solid="sheet")]
+
+
 def template_for(shape_class: str, numbers: dict, holes: list | None = None, fillet=None,
-                 hint: str | None = None) -> dict | None:
+                 hint: str | None = None, sheet: dict | None = None) -> dict | None:
     """-> a recipe {title, shape_class, steps, template} or None when no known-good template fits this shape.
 
     `hint` names the template the engineer's words asked for (part_spec.template_hint); the shape class stays the
@@ -203,6 +243,14 @@ def template_for(shape_class: str, numbers: dict, holes: list | None = None, fil
     cls = str(shape_class or "prismatic").lower()
     n = numbers or {}
     tpl = str(hint or "").lower()
+    # a sheet part with folds or a punch: the base flange carries t and R, and the features follow it
+    if isinstance(sheet, dict) and sheet.get("features") and cls in ("sheet", "prismatic", "revolve"):
+        feats = [x for x in sheet["features"] if isinstance(x, dict) and x.get("ok", True)]
+        steps = sheet_steps(n, feats, str(sheet.get("material") or "steel"), sheet.get("R"))
+        if steps:
+            return {"title": "Sheet metal part", "shape_class": cls, "steps": steps,
+                    "template": "sheet_features", "origin": "template"}
+        return None                              # a fold with a size missing: ask, never draw it with a guess
     built = {"bracket_l": lambda: bracket_l_steps(n, fillet),
              "channel": lambda: channel_steps(n, fillet),
              "gusset": lambda: gusset_steps(n, fillet),
@@ -285,6 +333,84 @@ def validate(recipe: dict | None, numbers: dict | None = None) -> tuple:
             t = _num(p.get("t"))
             if not (t and t > 0):
                 errors.append(f"wall '{sid}' needs a thickness")
+        elif kind == "smbase":
+            L, W, T = _num(p.get("L")), _num(p.get("W")), _num(p.get("t"))
+            if not (L and W and T and L > 0 and W > 0 and T > 0):
+                errors.append(f"base flange '{sid}' needs a length, a width and a thickness")
+            elif _num(p.get("R")) is not None and _num(p.get("R")) < 0:
+                errors.append(f"base flange '{sid}': the inside radius cannot be negative")
+            solid = True
+        elif kind in ("hem", "jog", "form", "smedge", "smmiter"):
+            sh = _sheet_before(steps, sid)
+            if not solid or not sh:
+                errors.append(f"{kind} '{sid}' needs a Base Flange before it")
+                continue
+            t, r, L, W = sh
+            if kind == "hem":
+                f_leg = _num(p.get("F"))
+                if not (f_leg and f_leg > 0):
+                    errors.append(f"hem '{sid}' needs a leg length")
+                else:
+                    ok, why = sheet_features.check_hem(t, r, f_leg, L, W)
+                    if not ok:
+                        errors.append(f"hem '{sid}': {why}")
+            elif kind == "jog":
+                d, h = _num(p.get("d")), _num(p.get("h"))
+                if not (d and h):
+                    errors.append(f"jog '{sid}' needs the jog line and the rise")
+                else:
+                    ok, why = sheet_features.check_jog(t, r, d, h, L)
+                    if not ok:
+                        errors.append(f"jog '{sid}': {why}")
+            elif kind == "form":
+                D, dep = _num(p.get("D")), _num(p.get("depth"))
+                if not (D and dep):
+                    errors.append(f"forming tool '{sid}' needs a diameter and a depth")
+                else:
+                    ok, why = sheet_features.check_form(D, dep, _num(p.get("x")) or 0.0,
+                                                        _num(p.get("y")) or 0.0, L, W)
+                    if not ok:
+                        errors.append(f"forming tool '{sid}': {why}")
+            else:
+                if not (_num(p.get("F")) and _num(p.get("F")) > 0):
+                    errors.append(f"{kind} '{sid}' needs a flange length")
+        elif kind == "surfbound":
+            ref = str(p.get("sketch") or "")
+            if ref and ref not in seen:
+                errors.append(f"boundary surface '{sid}' points at sketch '{ref}', which does not exist before it")
+            elif ref:
+                sk = (seen.get(ref) or {}).get("p") or {}
+                ents = sk.get("ents") or []
+                if str(sk.get("prof")) != "ents" or len(ents) != 4:
+                    errors.append(f"boundary surface '{sid}' takes four boundary curves: sketch '{ref}' has "
+                                  f"{len(ents) if str(sk.get('prof')) == 'ents' else 0}")
+        elif kind == "weldtrim":
+            if not solid:
+                errors.append(f"Trim/Extend '{sid}' has no body to cut")
+            ref = str(p.get("sketch") or "")
+            if not ref or ref not in seen:
+                errors.append(f"Trim/Extend '{sid}' needs the sketch whose line runs the cutter")
+            if not str(p.get("profile") or "").strip():
+                errors.append(f"Trim/Extend '{sid}' needs the cutter profile")
+        elif kind == "motion":
+            ang, steps_n = _num(p.get("angle")), _num(p.get("steps"))
+            if not (ang and 0 < ang <= 360):
+                errors.append(f"motion study '{sid}' needs a travel angle above 0 and at most 360 degrees")
+            if not (steps_n and 2 <= steps_n <= 24):
+                errors.append(f"motion study '{sid}' needs 2 to 24 steps")
+            if not solid:
+                errors.append(f"motion study '{sid}' has no part to move")
+        elif kind == "sizes":
+            ref = str(p.get("step") or "")
+            if not ref or ref not in seen:
+                errors.append(f"size edit '{sid}' points at a step that does not exist: '{ref}'")
+            if not str(p.get("param") or "").strip():
+                errors.append(f"size edit '{sid}' needs the size to change")
+            if not (_num(p.get("value")) and _num(p.get("value")) > 0):
+                errors.append(f"size edit '{sid}' needs a value above 0")
+        elif kind == "curv":
+            if not solid:
+                errors.append(f"curvature '{sid}' has no surface to measure")
         elif kind == "edge":
             r = _num(p.get("r"))
             if not (r and r > 0):
@@ -298,6 +424,20 @@ def validate(recipe: dict | None, numbers: dict | None = None) -> tuple:
 def allowed_steps() -> tuple:
     """The types this build validates. A caller can compare it with the Studio's feature list."""
     return ALLOWED
+
+
+def _sheet_before(steps, sid: str):
+    """-> (t, R, L, W) from the base flange the step stands on, or None."""
+    for s in steps:
+        if isinstance(s, dict) and s.get("id") == sid:
+            break
+        if isinstance(s, dict) and s.get("type") == "smbase":
+            p = s.get("p") or {}
+            t, L, W = _num(p.get("t")), _num(p.get("L")), _num(p.get("W"))
+            r = _num(p.get("R"))
+            if t and L and W:
+                return (t, r if r is not None else t, L, W)
+    return None
 
 
 def _closed_profile(p: dict) -> tuple:
@@ -414,8 +554,18 @@ Step types and their parameters:
   wall     p: {t, open: top|bottom}
   edge     p: {mode: fillet|chamfer, r, which: vertical|top|bottom|all}
   repeat   p: {kind: line|circle|mirror, count, dx, dy, cx, cy, plane}
+  smbase   p: {L, W, t, R, material, k}                      sheet-metal base flange (the plate)
+  hem      p: {edge: x+|x-|y+|y-, F}                        180 degree fold at an edge; needs an smbase
+  jog      p: {d, h}                                       two 90 degree bends at the line x = d; needs an smbase
+  form     p: {kind: emboss|lance, D, depth, x, y}         forming tool (punch) on the sheet; needs an smbase
+  surfbound p: {sketch, t, solid: sheet|solid}             boundary surface through a sketch of exactly four curves
+  weldtrim p: {sketch, profile, extend}                     cut a member with another member's profile
+  motion   p: {axis: X|Y|Z, angle, steps, px, py, pz}      swept envelope of the travel (changes no geometry)
+  sizes    p: {step, param, value}                          edit one size of an earlier step and rebuild
+  curv     p: {kind: curv|zebra}                            curvature map / isophote bands of the body
 
-Order: sketch -> push/revolve -> hole -> wall/edge/repeat. A sketch may appear again later (a pocket needs one).
+Order: sketch -> push/revolve/smbase -> hole -> wall/edge/repeat/hem/jog/form, then motion/sizes/curv last.
+A sketch may appear again later (a pocket needs one).
 Every number must be one of the numbers the engineer gave; do not add sizes of your own and do not round them.
 Only 0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 30, 45, 60, 90, 180, 270 and 360 may appear without being a given size.
 Use millimetres. Keep the sketch profile closed and keep holes inside the face."""

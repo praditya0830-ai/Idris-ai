@@ -32,7 +32,8 @@ _WORDS = (
                   "free-form", "organic", "sculpted", "bodyshell", "body shell", "spoiler", "propeller", "impeller",
                   "turbine blade", "helmet", "saddle", "nose cone", "shell curve")),
     ("sheet", ("sheet metal", "sheet-metal", "bent plate", "flange plate", "bracket from sheet", "press brake",
-               "bending", "flat pattern")),
+               "bending", "flat pattern", "hem", "jog", "emboss", "lance", "louvre", "louver", "forming tool",
+               "lipat tepi", "tekuk")),
     ("frame", ("frame", "rangka", "truss", "chassis", "tube frame", "weldment", "weld frame")),
     ("revolve", ("shaft", "poros", "bushing", "bos", "pulley", "sleeve", "spacer", "collar", "flange disc",
                  "turned part", "cylinder", "silinder", "tube", "tabung")),
@@ -175,7 +176,8 @@ def design(message: str, context: dict | None = None, provider=None, reply_langu
             rec = recipe_fn(spec, numbers, cls)
         else:
             rec = feature_recipe.template_for(cls["shape_class"], numbers["flat"], spec.get("holes"),
-                                              spec.get("fillet_mm"), hint=spec.get("template"))
+                                              spec.get("fillet_mm"), hint=spec.get("template"),
+                                              sheet=spec.get("sheet_features"))
         if rec:
             ok, errs = feature_recipe.validate(rec, numbers["flat"])
             if ok:

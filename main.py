@@ -1400,7 +1400,15 @@ class Handler(BaseHTTPRequestHandler):
                                                                   "suggest": r.get("suggest")},
                                           "provider": "IDRIS library", "language": "en", "route": routed})
                     return
-                if cad_ctx or (not gear_ctx and not eng_ctx and not is_prim and is_obj):
+                # S19: a sheet-metal request names folds (hem, jog, forming tool), and the engineer layer can read the
+                # same sentence as a formula question ("15 mm rise", "3 mm deep"). What was asked for is the part, so
+                # for those words the CAD door wins instead of answering the arithmetic and building nothing.
+                try:
+                    import sheet_features as _SF
+                    _sheet_chk = bool(_SF.feature_words(str(params.get("message") or msg)))
+                except Exception:
+                    _sheet_chk = False
+                if cad_ctx or (not gear_ctx and not is_prim and is_obj and (not eng_ctx or _sheet_chk)):
                     concepts = (routed or {}).get("concepts") or []
                     decision = _concept_decision(routed, ctx, concept_count)      # UI v66 B
                     if decision == "ask":
