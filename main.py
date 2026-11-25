@@ -1147,7 +1147,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 from physics.simple_part import looks_like_part_request
                 import cad_codegen
+                import chat_trace as _CT
                 msg = str(params.get("message") or "")[:llm.MAX_MSG]
+                # What this turn really does, in the order it happens. Every answer below carries it; a step that
+                # never ran is not in the list, so the Studio never draws a pretend thinking process.
+                trace = _CT.Trace()
+                trace.add(_CT.STEP_READ, f'"{str(params.get("message") or "")[:160]}"', "the message")
+                _plain_send = self._send_json
+                self._send_json = lambda code, payload: _plain_send(code, _CT.attach(payload, trace))
                 # A new sentence about a different product must not inherit the open design (a table, then a plane).
                 # Only a sentence that NAMES a product can reset; "make it lighter" and "80 mm" are about the design
                 # that is open. The reason travels back as `context_reset` so the Studio can say "New design started".
@@ -1198,6 +1205,11 @@ class Handler(BaseHTTPRequestHandler):
                 open_brief = _BRIEF.is_open(ctx)
                 bt = (_BRIEF.turn(open_brief, msg, ctx)
                       if open_brief and not (gear_ctx or cad_ctx or eng_ctx) else {"action": "none"})
+                trace.add(_CT.STEP_BRIEF,
+                          (f'open brief: {str(open_brief.get("object") or "the project")[:60]}, '
+                           f'{"ready to design" if open_brief.get("ready") else "still asking"}')
+                          if isinstance(open_brief, dict) else
+                          "no open brief: this turn is read from the message alone", "brief.py")
                 brief_turn = False
                 if bt["action"] == "chip":
                     ctx = {**(ctx or {}), "brief": _BRIEF.merge(open_brief, bt["merge"], msg)}
@@ -1210,6 +1222,8 @@ class Handler(BaseHTTPRequestHandler):
                     res.update({"brief": open_brief, "brief_turn": True,
                                 "route": {"route": "brief", "of": None,
                                           "reason": "a question while the brief is open, the brief is kept"}})
+                    trace.add(_CT.STEP_ROUTE, 'route "brief" · a question while the brief is open; the brief is kept',
+                              "brief.py")
                     _send(200, res)
                     return
                 elif bt["action"] == "answer":
@@ -1219,6 +1233,8 @@ class Handler(BaseHTTPRequestHandler):
                 # part-by-part job never begins on its own.
                 if (isinstance(ctx, dict) and isinstance(ctx.get("assembly_plan"), dict)
                         and _assembly_confirming(msg, ctx.get("assembly_plan"))):
+                    trace.add(_CT.STEP_ROUTE, 'route "assembly" · this message answers the part-by-part plan',
+                              "assembly")
                     _send(200, self._chat_assembly(msg, ctx, params.get("provider"), rl))
                     return
                 hit = None
@@ -1256,11 +1272,19 @@ class Handler(BaseHTTPRequestHandler):
                 # the reader is off or gave nothing usable: a whole product still never becomes one solid
                 if not routed and not (gear_ctx or cad_ctx or eng_ctx):
                     routed = _CR.product_route(msg, None) or routed
+                _route_name = (routed or {}).get("route") if isinstance(routed, dict) else None
+                trace.add(_CT.STEP_ROUTE,
+                          (f'route "{_route_name}" · {str((routed or {}).get("reason") or "the reader gave no reason")[:140]}'
+                           if _route_name else
+                           "no design route: this message is answered as a conversation"),
+                          str((routed or {}).get("read_by") or "cad_router")[:80])
                 # Bagian 1.1 (v0.40): the router said the sentence is not enough to start. The brief is written by
                 # the engineer's next answers; no code, no planner, no job is started here.
                 if routed and routed.get("route") == "brief":
                     br = self._chat_brief(msg, ctx, routed, params.get("provider"), rl)
                     if not br.get("continue"):
+                        trace.add(_CT.STEP_ROUTE, 'route "brief" · the brief asks for the next answer; no design yet',
+                                  "brief.py")
                         _send(200, {**br["out"], "brief_turn": True} if brief_turn else br["out"])
                         return
                     ctx = dict(ctx or {})
@@ -1276,6 +1300,8 @@ class Handler(BaseHTTPRequestHandler):
                 if routed and routed.get("route") == "assembly":
                     out = self._chat_assembly(msg, ctx, params.get("provider"), rl)
                     out["route"] = routed
+                    trace.add(_CT.STEP_ROUTE, 'route "assembly" · the message names a whole product, so IDRIS plans it',
+                              "assembly")
                     _send(200, out)
                     return
                 # v0.36.2: a formula question is still looked up while a design is open; only a request that
@@ -1291,6 +1317,11 @@ class Handler(BaseHTTPRequestHandler):
                     refs = _REF.for_chat(msg, eng, params.get("provider"), (routed or {}).get("route"),
                                          design_change=design_change)
                     _ref = _REF if refs is not None else None
+                    if isinstance(refs, dict):
+                        _items = refs.get("items") if isinstance(refs.get("items"), list) else []
+                        trace.add(_CT.STEP_REFERENCES,
+                                  f'mode "{refs.get("mode") or "-"}" · {len(_items)} item(s) · query "{msg[:80]}"',
+                                  "/references/design")
                     if refs and refs.get("block"):
                         ctx = dict(ctx or {})
                         ctx["references"] = refs["block"]
@@ -1343,6 +1374,7 @@ class Handler(BaseHTTPRequestHandler):
                                           "suggest": r.get("suggest"), "fallback": "custom_cad"}
                         if out.get("cad"):
                             out["cad"]["kind"] = "functional"
+                        _CT.record_build(trace, out)
                         _send(200, out)
                         return
                     cad = r.get("cad")
@@ -1388,6 +1420,7 @@ class Handler(BaseHTTPRequestHandler):
                         out = self._chat_concepts(msg, concepts, params.get("provider"), rl, count=concept_count)
                     else:
                         out = self._chat_cad(msg, ctx, params.get("provider"), rl)
+                    _CT.record_build(trace, out)
                     if routed:
                         out["route"] = routed
                     if ctx and isinstance(ctx.get("brief"), dict):
