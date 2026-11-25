@@ -891,7 +891,15 @@ class Handler(BaseHTTPRequestHandler):
         (`/chat`, `/cad/try`) reads the same contract and the answer always says what happened to the hint.
         """
         import design_ladder
+        import part_spec
         ctx, _sf = _clean_shape_family(ctx)
+        # A1: the sizes in the engineer's own sentence become the spec the ladder builds from. Without this the
+        # feature rung only ever saw an empty part_spec, so a plate with four holes fell to AI code every time.
+        ctx = dict(ctx or {})
+        if not isinstance(ctx.get("part_spec"), dict):
+            spec = part_spec.from_message(msg, ctx)
+            if spec:
+                ctx["part_spec"] = spec
         base = {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None}
         try:
@@ -911,6 +919,8 @@ class Handler(BaseHTTPRequestHandler):
                 "missing": r.get("missing") or [], "fidelity": fidelity, "rung": r.get("rung"),
                 "design_report": r.get("report"), "preview_cad": (r.get("preview") or {}).get("cad"),
                 "numbers": r.get("numbers") or [], "design_shape_class": r.get("shape_class"),
+                "recipe": r.get("recipe"), "part_spec": ctx.get("part_spec"),
+                "features_error": r.get("features_error"),
                 "cad_attempts": r.get("attempts") or [],
                 "validated": bool(r.get("validated")), "target_check": r.get("target_check"),
                 "shape_family": _shape_family_reply(ctx),          # UI v65: accepted, or why it was dropped

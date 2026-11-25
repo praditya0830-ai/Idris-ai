@@ -80,11 +80,15 @@ def _record_part_time(seconds: float) -> None:
     _AVG["total"] += max(0.1, float(seconds))
 
 
-def _designer(prompt: str, provider=None) -> dict:
-    """One part through the design ladder. Bagian F's ladder when it is in this build, else the full path."""
+def _designer(prompt: str, provider=None, context=None) -> dict:
+    """One part through the design ladder. Bagian F's ladder when it is in this build, else the full path.
+
+    `context` carries the part_spec read from the plan (Tahap A1), so a part of an assembly is built from its own
+    numbers by the feature rung instead of starting life as AI code.
+    """
     try:
         import cad_fallback
-        return cad_fallback.design(prompt, None, provider)
+        return cad_fallback.design(prompt, context, provider)
     except ImportError:                    # F not merged yet: the full path only, and it says so
         import cad_codegen
         r = cad_codegen.generate(prompt, {}, provider, None)
@@ -93,6 +97,17 @@ def _designer(prompt: str, provider=None) -> dict:
     except llm.LLMError as e:
         return {"ok": False, "cad": None, "answer": str(e), "fidelity": None, "validated": False,
                 "not_checked": []}
+
+
+def _takes_context(fn) -> bool:
+    """A designer written before this change takes two arguments; its part simply gets no spec."""
+    try:
+        import inspect
+        params = list(inspect.signature(fn).parameters.values())
+        return len([x for x in params
+                    if x.kind in (x.POSITIONAL_ONLY, x.POSITIONAL_OR_KEYWORD)]) >= 3
+    except (TypeError, ValueError):
+        return False
 
 
 def design_parts(plan: dict, designer=None, provider=None, on_event=None) -> tuple:
@@ -117,8 +132,14 @@ def design_parts(plan: dict, designer=None, provider=None, on_event=None) -> tup
         if on_event:
             on_event("design", f"Designing {p['name']}", p["id"])
         t0 = time.time()
+        import part_spec
+        spec = part_spec.from_plan(p, plan)
+        pctx = {"part_spec": spec, "assembly_part": p.get("id")} if spec else None
         try:
-            r = designer(assembly_plan.part_prompt(plan, p), provider) or {}
+            if _takes_context(designer):
+                r = designer(assembly_plan.part_prompt(plan, p), provider, pctx) or {}
+            else:
+                r = designer(assembly_plan.part_prompt(plan, p), provider) or {}
         except Exception as e:                     # one broken part must not stop the assembly
             traceback.print_exc()
             r = {"ok": False, "cad": None, "answer": f"{type(e).__name__}: {e}"}
