@@ -6,6 +6,10 @@ GET  /assembly/design/<job_id>                                        -> status,
 POST /assembly/job/<job_id>/review  {"action": "approve"|"redesign"} -> the review gate: nothing is placed or
                                       assembled until every part is seen and approved (or skipped, which is recorded)
 
+The gate is opt-in: POST /assembly/design runs the old flow (status done, assembly placed) unless it carries
+"review_gate": true, which is what the Studio review panel will send. A gate that nobody can answer would leave
+the Studio as it is today polling a job that never reaches done.
+
 Parts are designed one at a time on purpose (one AI call per part, a small server): each part gets its own
 needs and the interface sizes fixed in the skeleton, so two parts that meet never disagree. Each part goes
 through the Bagian F ladder when cad_fallback is in this build, so a part that fails still becomes geometry
@@ -27,11 +31,14 @@ import assembly_plan
 import llm
 
 JOB_TTL_S = 3600
+REVIEW_TTL_S = 24 * 3600                # a review nobody answered is dropped; it would otherwise sit in memory
 REVIEW_STATUS = "awaiting_review"      # every part is designed, nothing is assembled until a human says so
+REVIEW_EXPIRED_ERROR = "review expired after 24 h, start the assembly again"
 REVIEW_ACTIONS = ("approve", "redesign")
 DEFAULT_MAX_JOBS = 1                    # review item 3: one assembly designs parts at a time by default
 QUEUE_MAX = 2                           # a job that would be the third one waiting is refused (503), not queued
 _JOBS: dict = {}
+_EXPIRED: dict = {}                     # job ids whose review ran out, so a GET can say why instead of "unknown"
 _LOCK = threading.Lock()
 _AVG = {"n": 0, "total": 0.0}          # running average design time of a part, in seconds
 _RUNNING = {"n": 0}
@@ -53,6 +60,25 @@ def running_jobs() -> int:
 def queued_jobs() -> int:
     with _LOCK:
         return sum(1 for j in _JOBS.values() if j.get("status") == "queued")
+
+
+def _is_expired(job: dict, now: float) -> bool:
+    """A job that has waited at the gate longer than REVIEW_TTL_S is stale: nobody is going to answer it."""
+    return (job.get("status") == REVIEW_STATUS and job.get("review_since") is not None
+            and now - job["review_since"] > REVIEW_TTL_S)
+
+
+def _expire_reviews(now: float) -> None:
+    """Drop stale gate jobs and remember why (review WAJIB 2). The caller holds _LOCK."""
+    for old, j in list(_JOBS.items()):
+        if _is_expired(j, now):
+            _JOBS.pop(old, None)
+            _EXPIRED[old] = now
+
+
+def review_expired(job_id: str) -> bool:
+    """True when this job was dropped because its review was never answered."""
+    return job_id in _EXPIRED
 
 
 def _acquire_slot() -> None:
@@ -247,6 +273,7 @@ def _job_public(job: dict) -> dict:
     return {"success": True, "job_id": job["id"], "status": job["status"], "request": job["request"],
             "plan": job["plan"], "parts": job["parts"], "assembly": job.get("assembly"),
             "review": job.get("review"), "skipped": job.get("skipped") or [],
+            "review_gate": bool(job.get("review_gate")),
             "events": job["events"][-40:], "elapsed_s": elapsed,
             "eta_s": round(len(remaining) * average_s(), 1), "seconds_per_part": average_s(),
             "not_checked": [NOT_CHECKED],
@@ -268,11 +295,12 @@ def run_job(job: dict, designer=None, provider=None) -> None:
                                       on_event=lambda step, msg, pid=None: job["events"].append(
                                           {"t": round(time.time(), 2), "step": step, "message": msg, "part": pid}))
             job["parts"] = parts
-            if any(p.get("status") != "standard" for p in parts):
+            if job.get("review_gate") and any(p.get("status") != "standard" for p in parts):
                 # The gate: every part is designed, nothing is assembled yet. The assembly is built on approve,
                 # so a failed part cannot be quietly placed into a rack of parts nobody looked at.
                 with _LOCK:
                     job["review"] = review_of(job)
+                    job["review_since"] = time.time()
                     job["status"] = REVIEW_STATUS
                 job["events"].append({"t": round(time.time(), 2), "step": "review",
                                       "message": ("Every part is designed. Review them before assembly: "
@@ -287,19 +315,29 @@ def run_job(job: dict, designer=None, provider=None) -> None:
         _release_slot()
 
 
-def start_job(request: str, plan: dict, provider=None, designer=None):
-    """-> job_id, or None when the queue is full (the route answers 503; nothing is designed)."""
+def start_job(request: str, plan: dict, provider=None, designer=None, review_gate: bool = False):
+    """-> job_id, or None when the queue is full (the route answers 503; nothing is designed).
+
+    review_gate=False keeps the flow the live Studio already polls (status done + assembly); the gate is opt-in
+    until the Studio review panel is in production.
+    """
     if queued_jobs() >= QUEUE_MAX:
         return None
     job_id = uuid.uuid4().hex[:12]
     job = {"id": job_id, "request": request, "plan": plan, "parts": [], "events": [], "status": "queued",
            "started": time.time(), "finished": None, "error": None, "assembly": None, "stopped": None,
-           "provider": provider, "designer": designer, "review": None, "skipped": [], "redesigns": []}
+           "provider": provider, "designer": designer, "review": None, "skipped": [], "redesigns": [],
+           "review_gate": bool(review_gate), "review_since": None}
     with _LOCK:
+        now = time.time()
         _JOBS[job_id] = job
+        _expire_reviews(now)
         for old, j in list(_JOBS.items()):
-            if j.get("finished") and time.time() - j["finished"] > JOB_TTL_S:
+            if j.get("finished") and now - j["finished"] > JOB_TTL_S:
                 _JOBS.pop(old, None)
+        for old, t in list(_EXPIRED.items()):
+            if now - t > JOB_TTL_S:
+                _EXPIRED.pop(old, None)
     t = threading.Thread(target=run_job, args=(job, designer, provider), daemon=True)
     t.start()
     return job_id
@@ -307,6 +345,7 @@ def start_job(request: str, plan: dict, provider=None, designer=None):
 
 def _job(job_id: str):
     with _LOCK:
+        _expire_reviews(time.time())
         return _JOBS.get(job_id)
 
 
@@ -333,11 +372,18 @@ def _clean_changes(changes) -> tuple:
     return dims, None
 
 
+def _unknown_job(job_id: str) -> dict:
+    """404 body: an expired review says so, because "unknown job" would send the engineer looking for a bug."""
+    if review_expired(job_id):
+        return {"success": False, "expired": True, "error": REVIEW_EXPIRED_ERROR}
+    return {"success": False, "error": f"unknown assembly job '{job_id[:40]}' (jobs are kept one hour)"}
+
+
 def review_job(job_id: str, params: dict):
-    """The gate's door: approve (and assemble) or redesign one part and come back to the gate."""
+    """The gate's door: approve (and assemble) at once; a redesign answers 202 and comes back to the gate."""
     job = _job(job_id)
     if job is None:
-        return 404, {"success": False, "error": f"unknown assembly job '{job_id[:40]}' (jobs are kept one hour)"}
+        return 404, _unknown_job(job_id)
     action = str(params.get("action") or "").strip().lower()
     if action not in REVIEW_ACTIONS:
         return 400, {"success": False, "error": "action must be \"approve\" or \"redesign\""}
@@ -390,42 +436,63 @@ def review_job(job_id: str, params: dict):
         ppart["sources"] = {**(ppart.get("sources") if isinstance(ppart.get("sources"), dict) else {}),
                             **{k: "you" for k in dims}}
         job["status"] = "redesigning"
-    provider = job.get("provider")
-    designer = job.get("designer") or _designer
-    spec = None
-    try:
-        import part_spec
-        spec = part_spec.from_plan(ppart, job["plan"])
-    except Exception:
-        spec = None
-    ctx = {"part_spec": spec, "assembly_part": part_id} if spec else None
-    part.update(status="designing", error=None, repaired=False)
-    t0 = time.time()
-    try:
-        if _takes_context(designer):
-            r = designer(assembly_plan.part_prompt(job["plan"], ppart), provider, ctx) or {}
-        else:
-            r = designer(assembly_plan.part_prompt(job["plan"], ppart), provider) or {}
-    except Exception as e:                     # a broken redesign returns to the gate with the reason
-        traceback.print_exc()
-        r = {"ok": False, "cad": None, "answer": f"{type(e).__name__}: {e}"}
-    _record_part_time(time.time() - t0)
-    cad = r.get("cad") if isinstance(r.get("cad"), dict) else None
-    if r.get("ok") and cad:
-        part.update(status="done", fidelity=r.get("fidelity") or "full", cad=cad)
-    else:
-        part.update(status="failed", fidelity=r.get("fidelity"), cad=cad, repaired=False,
-                    error=r.get("answer") or "the part could not be redesigned")
-    with _LOCK:
-        job["redesigns"].append({"part_id": part_id, "changes": dims, "source": "you",
-                                  "rung": _rung_of(part), "error": part.get("error")})
-        job["review"] = review_of(job)
-        job["status"] = REVIEW_STATUS
+        part.update(status="designing", error=None, repaired=False)
         job["events"].append({"t": round(time.time(), 2), "step": "review",
-                              "message": (f"{part.get('name') or part_id} redesigned with "
-                                          + ", ".join(f"{k} = {v:g} mm" for k, v in dims.items())
-                                          + "; back at the review gate"), "part": part_id})
-    return 200, _job_public(job)
+                              "message": (f"Redesigning {part.get('name') or part_id} with the engineer's sizes"),
+                              "part": part_id})
+    # Review WAJIB 3: the design runs off the request thread, in its own assembly slot, so a slow designer cannot
+    # hang the HTTP call and a hand redesign cannot race an assembly that is already spending AI money.
+    threading.Thread(target=_redesign_worker,
+                     args=(job, part, ppart, part_id, dims, job.get("designer") or _designer,
+                           job.get("provider")),
+                     daemon=True).start()
+    return 202, {**_job_public(job),
+                 "how_to_continue": f"poll GET /assembly/design/{job_id} until status is {REVIEW_STATUS}"}
+
+
+def _redesign_worker(job: dict, part: dict, ppart: dict, part_id: str, dims: dict, designer, provider) -> None:
+    """Redesign one part with the engineer's sizes, then put the job back at the gate.
+
+    It waits for an assembly slot like a whole job does: what spends AI money is the number of designs running
+    at once, and a redesign is a design.
+    """
+    _acquire_slot()
+    try:
+        spec = None
+        try:
+            import part_spec
+            spec = part_spec.from_plan(ppart, job["plan"])
+        except Exception:
+            spec = None
+        ctx = {"part_spec": spec, "assembly_part": part_id} if spec else None
+        t0 = time.time()
+        try:
+            if _takes_context(designer):
+                r = designer(assembly_plan.part_prompt(job["plan"], ppart), provider, ctx) or {}
+            else:
+                r = designer(assembly_plan.part_prompt(job["plan"], ppart), provider) or {}
+        except Exception as e:                 # a broken redesign returns to the gate with the reason
+            traceback.print_exc()
+            r = {"ok": False, "cad": None, "answer": f"{type(e).__name__}: {e}"}
+        _record_part_time(time.time() - t0)
+        cad = r.get("cad") if isinstance(r.get("cad"), dict) else None
+        if r.get("ok") and cad:
+            part.update(status="done", fidelity=r.get("fidelity") or "full", cad=cad)
+        else:
+            part.update(status="failed", fidelity=r.get("fidelity"), cad=cad, repaired=False,
+                        error=r.get("answer") or "the part could not be redesigned")
+        with _LOCK:
+            job["redesigns"].append({"part_id": part_id, "changes": dims, "source": "you",
+                                      "rung": _rung_of(part), "error": part.get("error")})
+            job["review"] = review_of(job)
+            job["status"] = REVIEW_STATUS
+            job["review_since"] = time.time()
+            job["events"].append({"t": round(time.time(), 2), "step": "review",
+                                  "message": (f"{part.get('name') or part_id} redesigned with "
+                                              + ", ".join(f"{k} = {v:g} mm" for k, v in dims.items())
+                                              + "; back at the review gate"), "part": part_id})
+    finally:
+        _release_slot()
 
 
 # ------------------------------------------------------------------ routes
@@ -442,7 +509,7 @@ def handle_get(path: str):
         return None
     st = status(job_id)
     if st is None:
-        return 404, {"success": False, "error": f"unknown assembly job '{job_id[:40]}' (jobs are kept one hour)"}
+        return 404, _unknown_job(job_id)
     return 200, st
 
 
@@ -484,7 +551,8 @@ def handle_post(base: str, params: dict):
                          "how_to_continue": "send the same request with \"confirm\": [the ids you accept], or "
                                             "send the plan again with a source for each size (user, "
                                             "standard: <name>, default: <reason>)"}
-        job_id = start_job(request, plan, params.get("provider"))
+        job_id = start_job(request, plan, params.get("provider"),
+                           review_gate=bool(params.get("review_gate")))
         if job_id is None:
             return 503, {"success": False, "error": "The assembly queue is full. Please retry in a minute.",
                          "running": running_jobs(), "max_jobs": max_jobs(), "queued": queued_jobs()}
