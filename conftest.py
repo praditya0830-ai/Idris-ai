@@ -11,4 +11,6 @@ collect_ignore = [
     "tests/test_chat.py",
     "tests/test_validation.py",
     "tests/test_waitlist.py",
+    # the same shape: starts main.py, posts to /chat and exits with its own status
+    "tests/test_design_features_e2e.py",
 ]

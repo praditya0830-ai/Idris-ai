@@ -101,8 +101,33 @@ def test_the_bench_route_wins_over_the_library_and_cad_paths():
     # every early return that could answer instead of the bench must be gated by eng_ctx
     assert "if not (gear_ctx or cad_ctx or eng_ctx):" in src
     assert "elif not (gear_ctx or eng_ctx or (ctx and isinstance(ctx.get(\"cad_error\"), dict))):" in src
-    assert "if cad_ctx or (not gear_ctx and not eng_ctx and not is_prim and is_obj):" in src
+    # the S19 sheet override is not an exception to that rule: a sheet feature word only opens the CAD door when the
+    # message asks for the part, so a "berapa ..." sentence with engineering context still reaches the bench
+    assert "if _cad_door_wins(cad_ctx, gear_ctx, is_prim, is_obj, eng_ctx, _sheet_build):" in src
+    assert "_sheet_build = _sheet_request_wants_a_part(" in src
+    assert ("return bool(cad_ctx or (not gear_ctx and not is_prim and is_obj "
+            "and (not eng_ctx or sheet_build)))") in src
     assert "if not gear_ctx and not eng_ctx and is_prim:" in src
+
+
+def test_a_sheet_metal_question_with_engineering_context_stays_on_the_bench():
+    """"berapa bend allowance hem pelat 2 mm R2 K 0.44?" names a sheet feature but asks for a number.
+
+    Found in review: the S19 override let any hem/jog/flange word beat eng_ctx, so the question was answered by
+    building a part instead of the bench. The bench has to keep it, and nothing may be built.
+    """
+    import main
+    sentence = "berapa bend allowance hem pelat 2 mm R2 K 0.44?"
+    assert main._sheet_request_wants_a_part(sentence) is False
+    assert main._cad_door_wins(False, False, False, True, True, main._sheet_request_wants_a_part(sentence)) is False
+
+
+def test_a_sheet_metal_design_request_with_engineering_context_builds_the_part():
+    """The other side of the same gate: asking for the part still goes to the CAD features."""
+    import main
+    sentence = "buat bracket sheet metal 2 mm dengan hem dan jog"
+    assert main._sheet_request_wants_a_part(sentence) is True
+    assert main._cad_door_wins(False, False, False, True, True, main._sheet_request_wants_a_part(sentence)) is True
 
 
 def test_the_chat_response_carries_the_review_the_model_saw():

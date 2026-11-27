@@ -19,6 +19,7 @@ number: it becomes a question. Nothing here estimates silently.
 from __future__ import annotations
 
 import json
+import os
 
 import feature_recipe
 
@@ -31,7 +32,8 @@ _WORDS = (
                   "free-form", "organic", "sculpted", "bodyshell", "body shell", "spoiler", "propeller", "impeller",
                   "turbine blade", "helmet", "saddle", "nose cone", "shell curve")),
     ("sheet", ("sheet metal", "sheet-metal", "bent plate", "flange plate", "bracket from sheet", "press brake",
-               "bending", "flat pattern")),
+               "bending", "flat pattern", "hem", "jog", "emboss", "lance", "louvre", "louver", "forming tool",
+               "lipat tepi", "tekuk")),
     ("frame", ("frame", "rangka", "truss", "chassis", "tube frame", "weldment", "weld frame")),
     ("revolve", ("shaft", "poros", "bushing", "bos", "pulley", "sleeve", "spacer", "collar", "flange disc",
                  "turned part", "cylinder", "silinder", "tube", "tabung")),
@@ -112,16 +114,34 @@ def _source_rows(numbers: list) -> dict:
 
 def _features_result(spec: dict, cls: dict, recipe: dict, numbers: dict, message: str) -> dict:
     title = str(spec.get("name") or recipe.get("title") or "Part")[:80]
+    origin = str(recipe.get("origin") or "template")
+    tpl = recipe.get("template")
+    how = ("the known-good template" if origin == "template" else "an AI-written recipe")
     cad = {"title": title, "kind": str(spec.get("kind") or "functional"), "process": spec.get("process"),
            "material": str(spec.get("material") or "steel"), "params": [], "code": None,
            "feature_tree": recipe["steps"], "read_by": "IDRIS feature recipe (validated)",
-           "numbers": numbers["numbers"], "sources": _source_rows(numbers["numbers"]), "missing": []}
+           "numbers": numbers["numbers"], "sources": _source_rows(numbers["numbers"]), "missing": [],
+           "shape_class": cls["shape_class"], "feature_template": tpl, "feature_origin": origin,
+           "feature_title": str(recipe.get("title") or title)[:80],
+           "recipe": {"title": str(recipe.get("title") or title)[:80], "origin": origin, "template": tpl,
+                      "steps": len(recipe["steps"]), "attempts": recipe.get("attempts")}}
     return {"ok": True, "rung": "features", "fidelity": "features", "cad": cad, "read_by": cad["read_by"],
             "numbers": numbers["numbers"], "questions": numbers["questions"], "report": None,
             "validated": False, "not_checked": list(_NOT_CHECKED),
-            "shape_class": cls,
-            "answer": (f"{len(recipe['steps'])} feature steps for {title}, from the sizes you gave. Every step is "
-                       f"editable; the feature tree shows where each number came from.")}
+            "shape_class": cls, "recipe": cad["recipe"],
+            "answer": (f"{len(recipe['steps'])} feature steps for {title}, from the sizes you gave ({how}). Every "
+                       f"step is editable; the feature tree shows where each number came from.")}
+
+
+def _recipe_ai_allowed() -> bool:
+    """The AI recipe rung runs only when a provider is configured, and can be turned off with IDRIS_RECIPE_AI=0."""
+    if os.environ.get("IDRIS_RECIPE_AI", "1").strip() == "0":
+        return False
+    try:
+        import llm
+        return bool(llm.provider_order())
+    except Exception:
+        return False
 
 
 def _report(spec: dict, cls: dict, message: str, tried: list, numbers: dict, suggestion: str) -> dict:
@@ -156,16 +176,29 @@ def design(message: str, context: dict | None = None, provider=None, reply_langu
             rec = recipe_fn(spec, numbers, cls)
         else:
             rec = feature_recipe.template_for(cls["shape_class"], numbers["flat"], spec.get("holes"),
-                                              spec.get("fillet_mm"))
+                                              spec.get("fillet_mm"), hint=spec.get("template"),
+                                              sheet=spec.get("sheet_features"))
         if rec:
             ok, errs = feature_recipe.validate(rec, numbers["flat"])
             if ok:
                 return _features_result(spec, cls, rec, numbers, message)
             tried.append({"rung": "features", "error": "; ".join(errs)[:500]})
         else:
-            tried.append({"rung": "features", "error": ("no known-good template fits this shape"
-                                                       if cls["shape_class"] != "freeform"
-                                                       else "free-form shapes skip the feature rung")})
+            tried.append({"rung": "features", "error": "no known-good template fits this shape"})
+        # 1c (A2): no template, or the one that fits was refused -> the AI writes a recipe in the same vocabulary,
+        # checked here before any kernel call. Code stays the next rung, not the default.
+        if not recipe_fn and _recipe_ai_allowed():
+            got = feature_recipe.ai_recipe(message, numbers["flat"], spec, cls["shape_class"], provider=provider,
+                                           deadline=deadline)
+            if got.get("steps"):
+                ok, errs = feature_recipe.validate(got, numbers["flat"])
+                if ok:
+                    return _features_result(spec, cls, got, numbers, message)
+                tried.append({"rung": "features", "error": ("the AI recipe was refused: "
+                                                             + "; ".join(errs))[:500]})
+            else:
+                tried.append({"rung": "features", "error": ("the AI recipe was refused: "
+                                                             + str(got.get("error") or "no steps"))[:300]})
     else:
         tried.append({"rung": "features", "error": "free-form shape: the ladder starts with code on purpose"})
 

@@ -215,6 +215,30 @@ def _concept_count(raw):
     return (n, None) if 1 <= n <= 10 else (None, msg)
 
 
+def _sheet_request_wants_a_part(text) -> bool:
+    """A sheet-metal word (hem, jog, forming tool) only sends the message to CAD when it asks for a part.
+
+    "buat bracket 2 mm dengan hem dan jog" and "sheet metal tray 200x120x2 with a 12 mm hem" ask for the part;
+    "berapa bend allowance hem pelat 2 mm R2 K 0.44?" names the same feature but asks for a number, and numbers are
+    the bench's job.
+    """
+    try:
+        import sheet_features as _SF
+        t = str(text or "")
+        return bool(_SF.feature_words(t) and _SF.wants_part(t))
+    except Exception:                          # noqa: BLE001
+        return False
+
+
+def _cad_door_wins(cad_ctx, gear_ctx, is_prim, is_obj, eng_ctx, sheet_build) -> bool:
+    """Does the chat answer by building CAD, or does it hand the message to the bench first?
+
+    The bench wins every computable question. Over an engineering reading (eng_ctx) the CAD door only opens when the
+    message itself asks for a sheet-metal part to be built (sheet_build), not when it asks for the arithmetic.
+    """
+    return bool(cad_ctx or (not gear_ctx and not is_prim and is_obj and (not eng_ctx or sheet_build)))
+
+
 def _ask_concept_count(routed) -> dict:
     """The question before any code is written (UI v66 B): the number of concepts, not a design yet.
 
@@ -891,7 +915,15 @@ class Handler(BaseHTTPRequestHandler):
         (`/chat`, `/cad/try`) reads the same contract and the answer always says what happened to the hint.
         """
         import design_ladder
+        import part_spec
         ctx, _sf = _clean_shape_family(ctx)
+        # A1: the sizes in the engineer's own sentence become the spec the ladder builds from. Without this the
+        # feature rung only ever saw an empty part_spec, so a plate with four holes fell to AI code every time.
+        ctx = dict(ctx or {})
+        if not isinstance(ctx.get("part_spec"), dict):
+            spec = part_spec.from_message(msg, ctx)
+            if spec:
+                ctx["part_spec"] = spec
         base = {"success": True, "intent": "discuss", "actions": [], "params": {}, "rejected": [], "select": None,
                 "compare": None}
         try:
@@ -911,6 +943,8 @@ class Handler(BaseHTTPRequestHandler):
                 "missing": r.get("missing") or [], "fidelity": fidelity, "rung": r.get("rung"),
                 "design_report": r.get("report"), "preview_cad": (r.get("preview") or {}).get("cad"),
                 "numbers": r.get("numbers") or [], "design_shape_class": r.get("shape_class"),
+                "recipe": r.get("recipe"), "part_spec": ctx.get("part_spec"),
+                "features_error": r.get("features_error"),
                 "cad_attempts": r.get("attempts") or [],
                 "validated": bool(r.get("validated")), "target_check": r.get("target_check"),
                 "shape_family": _shape_family_reply(ctx),          # UI v65: accepted, or why it was dropped
@@ -1390,7 +1424,12 @@ class Handler(BaseHTTPRequestHandler):
                                                                   "suggest": r.get("suggest")},
                                           "provider": "IDRIS library", "language": "en", "route": routed})
                     return
-                if cad_ctx or (not gear_ctx and not eng_ctx and not is_prim and is_obj):
+                # S19: a sheet-metal request names folds (hem, jog, forming tool), and the engineer layer can read the
+                # same sentence as a formula question ("15 mm rise", "3 mm deep"). The CAD door wins only when the
+                # sentence asks for the part; when it asks for the arithmetic ("berapa bend allowance hem ...") the
+                # bench keeps the message and no part is built around the answer.
+                _sheet_build = _sheet_request_wants_a_part(str(params.get("message") or msg))
+                if _cad_door_wins(cad_ctx, gear_ctx, is_prim, is_obj, eng_ctx, _sheet_build):
                     concepts = (routed or {}).get("concepts") or []
                     decision = _concept_decision(routed, ctx, concept_count)      # UI v66 B
                     if decision == "ask":
