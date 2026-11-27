@@ -39,6 +39,29 @@ def feature_words(text: str) -> list:
     return [name for name, words in _WORDS if any(w in t for w in words)]
 
 
+# A feature word alone does not ask for a part: "berapa bend allowance hem pelat 2 mm R2 K 0.44?" names the hem
+# and asks for a number, and a number belongs to the bench. A sentence that asks for no number is a part request
+# ("sheet metal tray 200x120x2 with a 12 mm hem"), and so is any sentence with a design verb in it; only the
+# calculation keeps the message on the bench.
+BUILD_VERBS = ("design", "make", "build", "create", "model", "buat", "buatkan", "bikin", "bikinin", "desain",
+               "rancang", "rancangkan", "modelkan", "gambar", "draw")
+CALC_WORDS = ("berapa", "how much", "how many", "what is", "what's", "calculate", "hitung", "compute",
+              "rumus", "formula")
+
+
+def wants_part(text: str) -> bool:
+    """Does the sentence ask for the part to be built, instead of asking for a number?
+
+    A design verb asks for the part even when a size is mentioned ("buat bracket 2 mm dengan hem dan jog"); without
+    a design verb, a sentence that asks for no number is still a part ("sheet metal tray 200x120x2 with a hem"),
+    while "berapa bend allowance hem pelat 2 mm R2" asks for the arithmetic and stays on the bench.
+    """
+    t = " " + str(text or "").lower() + " "
+    verb = any(re.search(rf"(?<!\w){re.escape(v)}(?!\w)", t) for v in BUILD_VERBS)
+    calc = any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", t) for w in CALC_WORDS)
+    return bool(not calc or verb)
+
+
 def bend_allowance(theta_deg: float, r: float, k: float, t: float) -> float:
     return math.radians(float(theta_deg)) * (float(r) + float(k) * float(t))
 
