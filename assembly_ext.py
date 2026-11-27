@@ -3,6 +3,8 @@
 POST /assembly/plan    {"request": "whole bicycle 170 cm, 700c"}      -> plan, estimate, questions (no job yet)
 POST /assembly/design  {"request": ..., "plan": <confirmed plan>}     -> job_id, estimate
 GET  /assembly/design/<job_id>                                        -> status, parts, eta_s, elapsed_s, assembly
+POST /assembly/job/<job_id>/review  {"action": "approve"|"redesign"} -> the review gate: nothing is placed or
+                                      assembled until every part is seen and approved (or skipped, which is recorded)
 
 Parts are designed one at a time on purpose (one AI call per part, a small server): each part gets its own
 needs and the interface sizes fixed in the skeleton, so two parts that meet never disagree. Each part goes
@@ -25,6 +27,8 @@ import assembly_plan
 import llm
 
 JOB_TTL_S = 3600
+REVIEW_STATUS = "awaiting_review"      # every part is designed, nothing is assembled until a human says so
+REVIEW_ACTIONS = ("approve", "redesign")
 DEFAULT_MAX_JOBS = 1                    # review item 3: one assembly designs parts at a time by default
 QUEUE_MAX = 2                           # a job that would be the third one waiting is refused (503), not queued
 _JOBS: dict = {}
@@ -184,11 +188,65 @@ def assembly_of(plan: dict, parts: list) -> dict:
             "not_checked": NOT_CHECKED}
 
 
+def _rung_of(part: dict) -> str:
+    """Which rung really produced this part: features, code, failed — or standard (bought, not designed)."""
+    if part.get("status") == "standard":
+        return "standard"
+    if part.get("status") == "failed":
+        return "failed"
+    cad = part.get("cad") if isinstance(part.get("cad"), dict) else {}
+    if cad.get("feature_tree"):
+        return "features"
+    if cad.get("code"):
+        return "code"
+    return "failed"
+
+
+def _plan_part(plan: dict, part_id: str) -> dict:
+    for p in plan.get("parts") or []:
+        if p.get("id") == part_id:
+            return p
+    return {}
+
+
+def _part_review(plan: dict, part: dict) -> dict:
+    """One part as the engineer sees it at the gate: rung, the sizes with their source, the assumptions, the report."""
+    import part_spec
+    ppart = _plan_part(plan, part.get("id"))
+    spec = part_spec.from_plan(ppart, plan) if ppart else {}
+    rung = _rung_of(part)
+    out = {"id": part["id"], "name": part.get("name"), "qty": part.get("qty", 1), "rung": rung,
+           "dims": [{"k": n.get("k"), "value": n.get("value"), "unit": n.get("unit"),
+                     "source": n.get("source"), "method": n.get("method")}
+                    for n in (spec.get("numbers") or [])][:8],
+           "assumptions": [str(a) for a in (ppart.get("assumptions") or [])][:6],
+           "questions": [str(q.get("question") or q.get("k")) for q in (spec.get("questions") or [])][:4],
+           "failed_report": None}
+    if rung == "failed":
+        out["failed_report"] = {"error": part.get("error") or "the part could not be designed",
+                                "repaired": bool(part.get("repaired"))}
+    return out
+
+
+def review_of(job: dict) -> dict:
+    """The gate payload: one row per part, and the list of failed parts that still block assembly."""
+    skipped = list(job.get("skipped") or [])
+    rows = [_part_review(job.get("plan") or {}, p) for p in job.get("parts") or []]
+    blocked = [r["id"] for r in rows if r["rung"] == "failed" and r["id"] not in skipped]
+    return {"parts": rows, "blocked": blocked, "can_assemble": not blocked, "skipped": skipped,
+            "redesigns": job.get("redesigns") or [],
+            "note": "No part is placed and the assembly is not built until this review is approved.",
+            "how_to_continue": ("POST /assembly/job/<job_id>/review with action approve (add \"skip\": [part ids] "
+                                "to accept a failed part, which is written into the report), or action "
+                                "redesign with part_id and changes {\"dims\": {\"length_mm\": 130}}")}
+
+
 def _job_public(job: dict) -> dict:
     elapsed = round((job.get("finished") or time.time()) - job["started"], 1)
     remaining = [p for p in job["parts"] if p["status"] in ("queued", "designing")]
     return {"success": True, "job_id": job["id"], "status": job["status"], "request": job["request"],
             "plan": job["plan"], "parts": job["parts"], "assembly": job.get("assembly"),
+            "review": job.get("review"), "skipped": job.get("skipped") or [],
             "events": job["events"][-40:], "elapsed_s": elapsed,
             "eta_s": round(len(remaining) * average_s(), 1), "seconds_per_part": average_s(),
             "not_checked": [NOT_CHECKED],
@@ -209,7 +267,19 @@ def run_job(job: dict, designer=None, provider=None) -> None:
             parts, asm = design_parts(job["plan"], designer, provider,
                                       on_event=lambda step, msg, pid=None: job["events"].append(
                                           {"t": round(time.time(), 2), "step": step, "message": msg, "part": pid}))
-            job.update(parts=parts, assembly=asm, status="done", finished=time.time(), stopped=ai_budget.gate())
+            job["parts"] = parts
+            if any(p.get("status") != "standard" for p in parts):
+                # The gate: every part is designed, nothing is assembled yet. The assembly is built on approve,
+                # so a failed part cannot be quietly placed into a rack of parts nobody looked at.
+                with _LOCK:
+                    job["review"] = review_of(job)
+                    job["status"] = REVIEW_STATUS
+                job["events"].append({"t": round(time.time(), 2), "step": "review",
+                                      "message": ("Every part is designed. Review them before assembly: "
+                                                  + ("all parts are ready" if job["review"]["can_assemble"]
+                                                     else "blocked by " + ", ".join(job["review"]["blocked"])))})
+            else:
+                job.update(assembly=asm, status="done", finished=time.time(), stopped=ai_budget.gate())
         except Exception as e:
             traceback.print_exc()
             job.update(status="failed", error=f"{type(e).__name__}: {e}", finished=time.time())
@@ -223,7 +293,8 @@ def start_job(request: str, plan: dict, provider=None, designer=None):
         return None
     job_id = uuid.uuid4().hex[:12]
     job = {"id": job_id, "request": request, "plan": plan, "parts": [], "events": [], "status": "queued",
-           "started": time.time(), "finished": None, "error": None, "assembly": None, "stopped": None}
+           "started": time.time(), "finished": None, "error": None, "assembly": None, "stopped": None,
+           "provider": provider, "designer": designer, "review": None, "skipped": [], "redesigns": []}
     with _LOCK:
         _JOBS[job_id] = job
         for old, j in list(_JOBS.items()):
@@ -234,10 +305,127 @@ def start_job(request: str, plan: dict, provider=None, designer=None):
     return job_id
 
 
-def status(job_id: str):
+def _job(job_id: str):
     with _LOCK:
-        job = _JOBS.get(job_id)
+        return _JOBS.get(job_id)
+
+
+def status(job_id: str):
+    job = _job(job_id)
     return None if job is None else _job_public(job)
+
+
+def _clean_changes(changes) -> tuple:
+    """-> (dims, error). A changed size is a number the engineer stands behind, so it is sourced \"you\"."""
+    raw = changes if isinstance(changes, dict) else {}
+    flat = raw.get("dims") if isinstance(raw.get("dims"), dict) else raw
+    source = str(raw.get("source") or "you").strip()
+    if source != "you":
+        return {}, f"a size changed by hand is sourced \"you\", not '{source}'"
+    dims = {}
+    for k, v in (flat or {}).items():
+        if str(k) in ("source", "dims"):
+            continue
+        try:
+            dims[str(k)] = float(v)
+        except (TypeError, ValueError):
+            return {}, f"{k} is not a number: '{v}'"
+    return dims, None
+
+
+def review_job(job_id: str, params: dict):
+    """The gate's door: approve (and assemble) or redesign one part and come back to the gate."""
+    job = _job(job_id)
+    if job is None:
+        return 404, {"success": False, "error": f"unknown assembly job '{job_id[:40]}' (jobs are kept one hour)"}
+    action = str(params.get("action") or "").strip().lower()
+    if action not in REVIEW_ACTIONS:
+        return 400, {"success": False, "error": "action must be \"approve\" or \"redesign\""}
+    with _LOCK:
+        if job.get("status") != REVIEW_STATUS:
+            return 409, {"success": False, "error": f"the job is {job.get('status')}, not {REVIEW_STATUS}",
+                         "status": job.get("status")}
+        skip = params.get("skip") or []
+        if isinstance(skip, str):
+            skip = [skip]
+        skip = [str(s) for s in skip]
+        known = {p["id"] for p in job.get("parts") or []}
+        unknown = [s for s in skip if s not in known]
+        if unknown:
+            return 400, {"success": False, "error": "skip names a part this job does not have",
+                         "unknown": unknown}
+        job["skipped"] = sorted(set(job.get("skipped") or []) | set(skip))
+        review = review_of(job)
+        if action == "approve":
+            if review["blocked"]:
+                return 409, {"success": False, "blocked": review["blocked"], "review": review,
+                             "error": ("These parts failed and were not skipped: "
+                                       + ", ".join(review["blocked"])
+                                       + ". Redesign them, or approve again with \"skip\": [their ids] to "
+                                         "accept them and record that in the report.")}
+            job["status"] = "assembling"
+            job["assembly"] = assembly_of(job["plan"], job["parts"])
+            job["finished"] = time.time()
+            job["status"] = "done"
+            job["stopped"] = ai_budget.gate()
+            job["review"] = review_of(job)
+            job["events"].append({"t": round(time.time(), 2), "step": "review",
+                                  "message": "Approved: the parts are placed and the assembly is built"
+                                             + (f"; skipped {', '.join(job['skipped'])}" if job["skipped"] else "")})
+            return 200, _job_public(job)
+        # redesign: one part, with the engineer's own sizes, then back to the gate
+        part_id = str(params.get("part_id") or "").strip()
+        part = next((p for p in job.get("parts") or [] if p["id"] == part_id), None)
+        if part is None:
+            return 400, {"success": False, "error": "part_id is required and must name a part of this job"}
+        ppart = _plan_part(job["plan"], part_id)
+        if ppart.get("standard"):
+            return 400, {"success": False, "error": f"{part_id} is a standard part: it is bought, not redesigned"}
+        dims, err = _clean_changes(params.get("changes"))
+        if err:
+            return 400, {"success": False, "error": err}
+        if not dims:
+            return 400, {"success": False, "error": "changes must carry at least one size to redesign with"}
+        ppart["dims"] = {**(ppart.get("dims") if isinstance(ppart.get("dims"), dict) else {}), **dims}
+        ppart["sources"] = {**(ppart.get("sources") if isinstance(ppart.get("sources"), dict) else {}),
+                            **{k: "you" for k in dims}}
+        job["status"] = "redesigning"
+    provider = job.get("provider")
+    designer = job.get("designer") or _designer
+    spec = None
+    try:
+        import part_spec
+        spec = part_spec.from_plan(ppart, job["plan"])
+    except Exception:
+        spec = None
+    ctx = {"part_spec": spec, "assembly_part": part_id} if spec else None
+    part.update(status="designing", error=None, repaired=False)
+    t0 = time.time()
+    try:
+        if _takes_context(designer):
+            r = designer(assembly_plan.part_prompt(job["plan"], ppart), provider, ctx) or {}
+        else:
+            r = designer(assembly_plan.part_prompt(job["plan"], ppart), provider) or {}
+    except Exception as e:                     # a broken redesign returns to the gate with the reason
+        traceback.print_exc()
+        r = {"ok": False, "cad": None, "answer": f"{type(e).__name__}: {e}"}
+    _record_part_time(time.time() - t0)
+    cad = r.get("cad") if isinstance(r.get("cad"), dict) else None
+    if r.get("ok") and cad:
+        part.update(status="done", fidelity=r.get("fidelity") or "full", cad=cad)
+    else:
+        part.update(status="failed", fidelity=r.get("fidelity"), cad=cad, repaired=False,
+                    error=r.get("answer") or "the part could not be redesigned")
+    with _LOCK:
+        job["redesigns"].append({"part_id": part_id, "changes": dims, "source": "you",
+                                  "rung": _rung_of(part), "error": part.get("error")})
+        job["review"] = review_of(job)
+        job["status"] = REVIEW_STATUS
+        job["events"].append({"t": round(time.time(), 2), "step": "review",
+                              "message": (f"{part.get('name') or part_id} redesigned with "
+                                          + ", ".join(f"{k} = {v:g} mm" for k, v in dims.items())
+                                          + "; back at the review gate"), "part": part_id})
+    return 200, _job_public(job)
 
 
 # ------------------------------------------------------------------ routes
@@ -246,9 +434,12 @@ POST_ROUTES = ("/assembly/plan", "/assembly/design")
 
 def handle_get(path: str):
     p = path.split("?")[0].rstrip("/")
-    if not p.startswith("/assembly/design/"):
+    if p.startswith("/assembly/job/"):
+        job_id = p[len("/assembly/job/"):]
+    elif p.startswith("/assembly/design/"):
+        job_id = p[len("/assembly/design/"):]
+    else:
         return None
-    job_id = p[len("/assembly/design/"):]
     st = status(job_id)
     if st is None:
         return 404, {"success": False, "error": f"unknown assembly job '{job_id[:40]}' (jobs are kept one hour)"}
@@ -256,6 +447,9 @@ def handle_get(path: str):
 
 
 def handle_post(base: str, params: dict):
+    p = str(base or "").rstrip("/")
+    if p.startswith("/assembly/job/") and p.endswith("/review"):
+        return review_job(p[len("/assembly/job/"):-len("/review")], params)
     if base == "/assembly/plan":
         request = str(params.get("request") or "").strip()
         if not request:
