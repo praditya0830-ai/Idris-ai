@@ -45,9 +45,15 @@ def is_design_feedback(base: str) -> bool:
     return p.startswith("/design/job/") and p.endswith("/feedback")
 
 
+def is_assembly_review(base: str) -> bool:
+    """True for /assembly/job/<id>/review: the review gate before a job assembles anything."""
+    p = str(base or "").rstrip("/")
+    return p.startswith("/assembly/job/") and p.endswith("/review")
+
+
 def known_post(base: str) -> bool:
     """True when one of the modules answers this POST path: main.py's route gate asks this first."""
-    if is_design_feedback(base):
+    if is_design_feedback(base) or is_assembly_review(base):
         return True
     for m in _mods():
         if base in tuple(getattr(m, "POST_ROUTES", ())):
@@ -70,6 +76,9 @@ def handle_post(base: str, params: dict):
     if is_design_feedback(base):
         import design_job                  # the job owns its feedback route
         return design_job.handle_feedback(base, params)
+    if is_assembly_review(base):
+        import assembly_ext                # the assembly job owns its review gate
+        return assembly_ext.handle_post(base, params)
     for m in _mods():
         fn = getattr(m, "handle_post", None)
         if fn is None:
