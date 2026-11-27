@@ -160,7 +160,7 @@ def test_a_failed_part_with_code_is_repaired_and_flagged():
 # ------------------------------------------------------------------ E3/E4b: the job and the estimate
 def test_the_job_reports_status_parts_and_eta():
     plan, _ = assembly_plan.validate(BICYCLE)
-    job_id = assembly_ext.start_job("whole bicycle", plan, designer=_ok_design)
+    job_id = assembly_ext.start_job("whole bicycle", plan, designer=_ok_design, review_gate=True)
     deadline = time.time() + 10
     st = assembly_ext.status(job_id)
     while st and st["status"] in ("queued", "running") and time.time() < deadline:
