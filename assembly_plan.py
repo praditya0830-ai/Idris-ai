@@ -142,12 +142,20 @@ def validate(raw: dict) -> tuple:
         # v0.43 (design ladder 1b): the shape class travels with the part, so the assembly designer reads the
         # plan's own classification instead of guessing it from the name. Unknown text -> None (classified later).
         shape_class = str(p.get("shape_class") or "").strip().lower()
+        # The review gate (Batch 1) reads the sizes the planner wrote, with their source, and the assumptions it
+        # made. They travel with the part instead of being dropped here, so the gate shows what the plan stands on.
+        dims = {str(k)[:40]: float(v) for k, v in (p.get("dims") or {}).items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)} if isinstance(p.get("dims"), dict) else {}
+        dim_sources = {str(k)[:40]: str(v)[:120] for k, v in (p.get("sources") or {}).items()
+                       if isinstance(v, (str, int, float))} if isinstance(p.get("sources"), dict) else {}
         parts.append({"id": pid, "name": str(p.get("name") or pid)[:80],
                       "role": str(p.get("role") or "")[:200],
                       "qty": int(qty) if qty and qty >= 1 else 1,
                       "needs": [str(n)[:80] for n in (p.get("needs") or [])][:8],
                       "shape_class": shape_class if shape_class in ("prismatic", "freeform", "revolve", "sheet",
                                                                   "frame") else None,
+                      "dims": dims, "sources": dim_sources,
+                      "assumptions": [str(a)[:200] for a in (p.get("assumptions") or [])][:6],
                       "standard": bool(p.get("standard"))})
     if not parts:
         errs.append("the plan has no usable part")
