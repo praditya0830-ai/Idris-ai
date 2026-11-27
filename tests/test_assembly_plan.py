@@ -166,12 +166,16 @@ def test_the_job_reports_status_parts_and_eta():
     while st and st["status"] in ("queued", "running") and time.time() < deadline:
         time.sleep(0.05)
         st = assembly_ext.status(job_id)
-    assert st["status"] == "done"
+    # Batch 1: a job stops at the review gate, and the assembly is placed only after approve.
+    assert st["status"] == "awaiting_review"
     assert st["eta_s"] == 0.0
     assert st["elapsed_s"] >= 0
     assert len(st["parts"]) == 4
-    assert st["assembly"]["parts"]
+    assert st["assembly"] is None and st["review"]["parts"]
     assert st["not_checked"]
+    code, out = assembly_ext.handle_post(f"/assembly/job/{job_id}/review", {"action": "approve"})
+    assert code == 200 and out["status"] == "done"
+    assert out["assembly"]["parts"]
 
 
 def test_an_unknown_job_is_a_404_not_a_crash():
