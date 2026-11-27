@@ -104,9 +104,9 @@ def test_one_assembly_designs_parts_at_a_time_and_the_next_ones_wait(monkeypatch
 
     plan, errs = assembly_plan.validate(_raw())
     assert not errs
-    first = assembly_ext.start_job("assembly one", plan, designer=designer)
+    first = assembly_ext.start_job("assembly one", plan, designer=designer, review_gate=True)
     assert started.wait(5), "the first job must be designing"
-    second = assembly_ext.start_job("assembly two", plan, designer=designer)
+    second = assembly_ext.start_job("assembly two", plan, designer=designer, review_gate=True)
     time.sleep(0.2)
     try:
         assert assembly_ext.status(first)["status"] in ("running", "awaiting_review", "done")
@@ -130,7 +130,7 @@ def test_a_third_waiting_assembly_is_refused_with_503(monkeypatch):
         return _ok(prompt, provider)
 
     plan, _ = assembly_plan.validate(_raw())
-    first = assembly_ext.start_job("one", plan, designer=designer)
+    first = assembly_ext.start_job("one", plan, designer=designer, review_gate=True)
     assert started.wait(5)
     assembly_ext.start_job("two", plan, designer=designer)
     assembly_ext.start_job("three", plan, designer=designer)        # two are waiting now
