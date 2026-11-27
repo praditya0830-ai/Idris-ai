@@ -45,14 +45,54 @@ def test_the_wall_is_almost_the_only_resistance_when_convection_is_very_large():
     assert abs(o["temperature_C"]["cold_surface"] - 20.0) < 0.6
 
 
+# The four ranges printed in Incropera et al., 6th ed., Table 1.1 (typical h, W/m2K). Anything else in H_TABLE
+# is a number with Incropera's name on it that Incropera does not print — the audit's WAJIB 4.
+TABLE_11 = {
+    "air_natural": (2.0, 25.0),        # free convection, gases
+    "liquid_natural": (50.0, 1000.0),  # free convection, liquids
+    "air_forced": (25.0, 250.0),       # forced convection, gases
+    "liquid_forced": (100.0, 20000.0),  # forced convection, liquids
+}
+
+
+def test_every_h_table_row_is_a_range_printed_in_table_1_1():
+    from solvers.thermal_lumped import H_TABLE
+    assert set(H_TABLE) == set(TABLE_11)
+    for name, (lo, hi) in TABLE_11.items():
+        got_lo, got_hi, src = H_TABLE[name]
+        assert (got_lo, got_hi) == (lo, hi), name
+        assert "Incropera" in src and "Table 1.1" in src
+    assert "oil_forced" not in H_TABLE, "Table 1.1 has no oil row, so Incropera's name cannot be on one"
+    assert "water_forced" not in H_TABLE, "the table says liquids (100-20,000), not water 100-15,000"
+
+
 def test_h_from_a_table_is_named_with_its_source_and_its_limit():
     o = _run(h_hot_W_m2K=None, h_cold_W_m2K=None, correlation_hot="air_natural",
              correlation_cold="air_natural")
     assert o["h_hot_source"].startswith("table: air_natural") and "Incropera" in o["h_hot_source"]
-    assert math.isclose(o["h_hot_W_m2K"], math.sqrt(5.0 * 25.0), abs_tol=0.01)
+    assert "geometric mean" in o["h_hot_source"] and "2-25" in o["h_hot_source"]
+    assert math.isclose(o["h_hot_W_m2K"], math.sqrt(2.0 * 25.0), abs_tol=0.01)
     r = registry.run("thermal_lumped", {**WALL, "h_hot_W_m2K": None, "h_cold_W_m2K": None,
                                        "correlation_hot": "air_natural", "correlation_cold": "air_natural"})
-    assert any("middle of a published range" in w for w in r["warnings"])
+    assert any("geometric mean" in w for w in r["warnings"])
+
+
+def test_one_h_from_the_engineer_and_one_from_the_table_still_warns():
+    """The old condition (h_hot or h_cold given) silenced the warning whenever only one side was a table."""
+    r = registry.run("thermal_lumped", {**WALL, "h_hot_W_m2K": 42.0, "h_cold_W_m2K": None,
+                                       "correlation_cold": "liquid_forced"})
+    assert r["ok"], r.get("errors")
+    o = r["outputs"]
+    assert o["h_hot_W_m2K"] == 42.0 and o["h_hot_source"] == "you"
+    assert math.isclose(o["h_cold_W_m2K"], math.sqrt(100.0 * 20000.0), abs_tol=0.01)
+    assert any("geometric mean" in w and "h_cold" in w for w in r["warnings"])
+    assert any("This is a 1D lumped model" in w for w in r["warnings"])
+
+
+def test_two_h_values_from_the_engineer_need_no_table_warning():
+    r = registry.run("thermal_lumped", WALL)
+    assert r["ok"]
+    assert not any("published table" in w for w in r["warnings"])
 
 
 def test_the_reply_says_it_is_one_dimensional_and_not_fea():

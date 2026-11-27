@@ -9,26 +9,35 @@ reply (`fidelity` and `not_checked`); what it does give is exact for the model i
 from which the two surface temperatures follow. Benchmarked against that closed form (the same formula an
 engineer checks by hand), and against pure conduction when the convection coefficients are very large.
 
-h comes from the engineer, or from a named correlation the user picks (natural convection in air, forced air,
-water) — each carries its source and its range of validity, and the reply repeats both.
+h comes from the engineer, or from a named range the user picks (free or forced convection, gases or liquids).
+Each entry is the range printed in Incropera's Table 1.1, with its source; the solver uses the geometric mean of
+that range (sqrt(lo*hi)), not an arithmetic middle, and the reply says so on every side that came from the table.
 """
 import math
 
 from ace_core import SolverSpec, Benchmark, Check, register
 
-# A small, sourced table of convection coefficients. Values are order-of-magnitude ranges from Incropera &
-# DeWitt, Fundamentals of Heat and Mass Transfer, Table 1.1 (typical values of h, W/m2K). The solver uses the
-# middle of the stated range and says so; an engineer's own h always wins.
+# The four rows of Incropera et al., Fundamentals of Heat and Mass Transfer, 6th ed., Table 1.1 (typical values
+# of the convection coefficient h, W/m2K). Nothing here is interpolated or invented: each range is the printed
+# one, and the solver uses its geometric mean. An engineer's own h always wins over a table row.
 H_TABLE = {
-    "air_natural": (5.0, 25.0, "Incropera & DeWitt, Table 1.1: free convection, gases, 5-25 W/m2K"),
-    "air_forced": (25.0, 250.0, "Incropera & DeWitt, Table 1.1: forced convection, gases, 25-250 W/m2K"),
-    "water_forced": (100.0, 15000.0, "Incropera & DeWitt, Table 1.1: forced convection, water, 100-15000 W/m2K"),
-    "oil_forced": (50.0, 3000.0, "Incropera & DeWitt, Table 1.1: forced convection, oils, 50-3000 W/m2K"),
+    "air_natural": (2.0, 25.0,
+                    "Incropera et al., Fundamentals of Heat and Mass Transfer, 6th ed., Table 1.1: "
+                    "free convection, gases, 2-25 W/m2K"),
+    "liquid_natural": (50.0, 1000.0,
+                       "Incropera et al., Fundamentals of Heat and Mass Transfer, 6th ed., Table 1.1: "
+                       "free convection, liquids, 50-1000 W/m2K"),
+    "air_forced": (25.0, 250.0,
+                   "Incropera et al., Fundamentals of Heat and Mass Transfer, 6th ed., Table 1.1: "
+                   "forced convection, gases, 25-250 W/m2K"),
+    "liquid_forced": (100.0, 20000.0,
+                      "Incropera et al., Fundamentals of Heat and Mass Transfer, 6th ed., Table 1.1: "
+                      "forced convection, liquids, 100-20,000 W/m2K"),
 }
 
 
 def _h(name: str, own: float | None, which: str) -> tuple:
-    """-> (h, source). The engineer's number wins; a named correlation gives the middle of its stated range."""
+    """-> (h, source). The engineer's number wins; a named range gives the geometric mean of that range."""
     if own is not None:
         if own <= 0:
             raise ValueError(f"{which}_W_m2K must be positive")
@@ -37,7 +46,18 @@ def _h(name: str, own: float | None, which: str) -> tuple:
     if key not in H_TABLE:
         raise ValueError(f"give {which}_W_m2K, or name a correlation: {sorted(H_TABLE)}")
     lo, hi, src = H_TABLE[key]
-    return math.sqrt(lo * hi), f"table: {key} (mid-range {math.sqrt(lo * hi):.1f} of {lo:g}-{hi:g}) — {src}"
+    return math.sqrt(lo * hi), (f"table: {key} (geometric mean of the range {lo:g}-{hi:g}, "
+                                f"{math.sqrt(lo * hi):.1f} W/m2K) — {src}")
+
+
+def _table_warnings(src_hot: str, src_cold: str) -> list:
+    """The warning follows each side on its own: one h from the engineer used to hide the other side's table."""
+    from_table = [name for name, src in (("h_hot", src_hot), ("h_cold", src_cold)) if src != "you"]
+    if not from_table:
+        return []
+    return [f"{' and '.join(from_table)} came from a published table (the geometric mean of its stated range), "
+            "not a computed coefficient: give your own h when the flow is known (a range is only an "
+            "order-of-magnitude answer)."]
 
 
 def run(p):
@@ -88,9 +108,7 @@ def run(p):
                           "cold_surface": round(t_cold_surface, 3), "cold_fluid": t_cold},
         "method": "q = dT / (1/(h_hot A) + L/(k A) + 1/(h_cold A)); surface temperatures from the same "
                   "series resistance (Incropera & DeWitt, chapters 3 and 1)",
-        "warnings": [] if p.get("h_hot_W_m2K") or p.get("h_cold_W_m2K") else
-                    ["h is the middle of a published range, not a computed coefficient: give your own h "
-                     "when the flow is known (a correlation is an order-of-magnitude answer)."],
+        "warnings": _table_warnings(src_hot, src_cold),
         "not_checked": ["3D temperature field, hot spots and gradients inside the part (needs the FEA worker)",
                         "radiation, contact resistance between layers, temperature-dependent k and h",
                         "transient warm-up and cool-down",
@@ -106,7 +124,7 @@ register(SolverSpec(
             "with the two surface temperatures and every resistance shown. Labelled 'lumped / 1D, not 3D FEA'.",
     method="Series thermal resistance: q = dT / (1/(h_hot A) + L/(k A) + 1/(h_cold A)) "
            "(Incropera & DeWitt, Fundamentals of Heat and Mass Transfer, ch. 3); h from the engineer or the "
-           "mid-range of a published table (ch. 1, Table 1.1)",
+           "geometric mean of a published Table 1.1 range (ch. 1)",
     schema={
         "thickness_mm": {"type": "number", "exclusive_min": 0, "max": 10000, "unit": "mm", "required": True},
         "surface_area_m2": {"type": "number", "exclusive_min": 0, "max": 1e6, "unit": "m2", "required": True},
@@ -142,7 +160,7 @@ register(SolverSpec(
     limitations=["steady state only; no transient warm-up",
                  "flat wall only: no fins, cylinders, or 3D shape effects",
                  "radiation, contact resistance and temperature-dependent properties are not modelled",
-                 "h is an input or the middle of a published range, not a computed coefficient"],
+                 "h is an input or the geometric mean of a published Table 1.1 range, not a computed coefficient"],
     example={"thickness_mm": 10.0, "surface_area_m2": 0.05, "k_W_mK": 50.0, "T_hot_C": 120.0,
              "T_cold_C": 20.0, "correlation_hot": "air_natural", "correlation_cold": "air_natural"},
 ))
