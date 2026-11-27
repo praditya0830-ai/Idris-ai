@@ -19,6 +19,7 @@ from . import modal_part      # noqa: F401  (P2a: modal analysis of any part)
 from . import buckling_beam   # noqa: F401  (P2b: eigen-buckling of a slender member)
 from . import pipe_flow       # noqa: F401  (P2e: pipe flow, Darcy-Weisbach + Colebrook)
 from . import dfm_part        # noqa: F401  (P3: DFM of any part from its mesh)
+from . import thermal_lumped  # noqa: F401  (Batch 3: 1D wall + convection, labelled not-3D-FEA)
 
 try:                                    # new in v0.33; a fault here must not take the other solvers down
     from . import shell_plate   # noqa: F401
