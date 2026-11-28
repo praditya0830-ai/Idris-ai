@@ -43,7 +43,9 @@ jobs:
             tests/test_review_and_gear.py \
             tests/test_chat_engineering_route.py \
             tests/test_design_ladder.py \
-            tests/test_feature_recipe.py
+            tests/test_feature_recipe.py \
+            tests/test_fea_worker.py \
+            tests/test_fea3d_client.py
 
   full:
     name: Full suite (manual)
@@ -59,3 +61,29 @@ jobs:
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: pytest
+
+  fea-worker:
+    name: FEA worker container (/health, /capabilities)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the worker image
+        run: docker build -f fea_worker/Dockerfile -t idris-fea:ci .
+      # FEA_RUN_BENCHMARKS=0 keeps this smoke build short: capabilities then honestly
+      # report validated:false, which is exactly what the probe below expects.
+      - name: Start the container and probe it
+        run: |
+          docker run -d --name fea -e FEA_WORKER_TOKEN=ci-token -e FEA_RUN_BENCHMARKS=0 -p 8080:8080 idris-fea:ci
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/health && break || sleep 2; done
+          curl -fsS http://127.0.0.1:8080/health | tee /tmp/health.json
+          curl -fsS -H "Authorization: Bearer ci-token" http://127.0.0.1:8080/capabilities | tee /tmp/caps.json
+          python3 - <<'EOF'
+          import json
+          caps = json.load(open("/tmp/caps.json"))
+          assert caps["worker"] == "idris-fea", caps
+          assert "analyses" in caps and "limits" in caps
+          assert json.load(open("/tmp/health.json"))["ok"] is True
+          print("capabilities ok:", sorted(caps["analyses"]))
+          EOF
+          docker logs fea
