@@ -9,6 +9,7 @@
     POST /fea                  -> housing FEA in the UI team's job format (see analysis.py)
     GET  /fea/<job_id>         -> job status / result
     POST /modal, /cfd, /review -> same job format (GET /<endpoint>/<job_id>)
+    GET  /fea3d/capabilities   -> 3D FEA worker (CalculiX + gmsh) capabilities, or why it is not deployed
 
 Returns (status_code, dict) or None if the path is not an ACE path.
 """
@@ -77,6 +78,11 @@ def handle_get(path):
     if path == "/selfcheck":
         from . import selfcheck
         return selfcheck.page(query)
+    if path.startswith("/fea3d/"):
+        import fea3d            # Cloud Run worker (CalculiX + gmsh); an absent worker is a reason, not a 500
+        res = fea3d.handle_get(path)
+        if res is not None:
+            return res
     if path.startswith("/verify/"):
         name = path[len("/verify/"):]
         if registry.get(name) is None:
