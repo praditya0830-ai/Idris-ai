@@ -104,19 +104,19 @@ def test_one_assembly_designs_parts_at_a_time_and_the_next_ones_wait(monkeypatch
 
     plan, errs = assembly_plan.validate(_raw())
     assert not errs
-    first = assembly_ext.start_job("assembly one", plan, designer=designer)
+    first = assembly_ext.start_job("assembly one", plan, designer=designer, review_gate=True)
     assert started.wait(5), "the first job must be designing"
-    second = assembly_ext.start_job("assembly two", plan, designer=designer)
+    second = assembly_ext.start_job("assembly two", plan, designer=designer, review_gate=True)
     time.sleep(0.2)
     try:
-        assert assembly_ext.status(first)["status"] in ("running", "done")
+        assert assembly_ext.status(first)["status"] in ("running", "awaiting_review", "done")
         assert assembly_ext.status(second)["status"] == "queued", "the second job waits for the free slot"
     finally:
         gate.set()
     deadline = time.time() + 10
     while time.time() < deadline and assembly_ext.status(second)["status"] in ("queued", "running"):
         time.sleep(0.05)
-    assert assembly_ext.status(second)["status"] == "done"
+    assert assembly_ext.status(second)["status"] == "awaiting_review"   # Batch 1: the gate, then assembly
     assert assembly_ext.running_jobs() == 0, "the slot is handed back"
 
 
@@ -130,7 +130,7 @@ def test_a_third_waiting_assembly_is_refused_with_503(monkeypatch):
         return _ok(prompt, provider)
 
     plan, _ = assembly_plan.validate(_raw())
-    first = assembly_ext.start_job("one", plan, designer=designer)
+    first = assembly_ext.start_job("one", plan, designer=designer, review_gate=True)
     assert started.wait(5)
     assembly_ext.start_job("two", plan, designer=designer)
     assembly_ext.start_job("three", plan, designer=designer)        # two are waiting now
@@ -146,7 +146,7 @@ def test_a_third_waiting_assembly_is_refused_with_503(monkeypatch):
         if time.time() > deadline:
             break
         time.sleep(0.05)
-    assert assembly_ext.status(first)["status"] == "done"
+    assert assembly_ext.status(first)["status"] == "awaiting_review"
 
 
 # ------------------------------------------------------------------ item 4: a number needs a source
